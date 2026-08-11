@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import sqlite3
 from pathlib import Path
 
@@ -126,19 +127,40 @@ def apply_migrations(db_path: Path) -> None:
     """Apply schema migrations to workflows database."""
     db_path.parent.mkdir(parents=True, exist_ok=True)
     
-    with sqlite3.connect(db_path) as conn:
+    checksum = hashlib.sha256(SCHEMA_SQL.encode("utf-8")).hexdigest()
+    conn = sqlite3.connect(db_path, timeout=30.0)
+    try:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA foreign_keys=ON")
         conn.execute("PRAGMA synchronous=NORMAL")
-        
-        cursor = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='schema_migrations'")
+
+        cursor = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='schema_migrations'"
+        )
         if not cursor.fetchone():
             conn.executescript(SCHEMA_SQL)
             conn.execute(
-                "INSERT INTO schema_migrations (version, checksum, applied_at) VALUES (?, ?, datetime('now'))",
-                (SCHEMA_VERSION, "initial", )
+                "INSERT INTO schema_migrations (version, checksum, applied_at)"
+                " VALUES (?, ?, datetime('now'))",
+                (SCHEMA_VERSION, checksum),
             )
             conn.commit()
+            return
+
+        row = conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()
+        applied = int(row[0]) if row and row[0] is not None else 0
+        if applied > SCHEMA_VERSION:
+            raise RuntimeError(
+                f"workflow database schema version {applied} is newer than supported"
+                f" version {SCHEMA_VERSION}"
+            )
+        # Same version: keep DDL idempotent so a partially created database heals.
+        conn.executescript(SCHEMA_SQL)
+        conn.commit()
+    finally:
+        # Windows keeps a file handle until the connection is closed, which would
+        # break temporary-directory cleanup and workspace discard.
+        conn.close()
 
 
 __all__ = ["SCHEMA_VERSION", "SCHEMA_SQL", "apply_migrations"]

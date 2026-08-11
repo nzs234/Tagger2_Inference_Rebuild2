@@ -76,11 +76,11 @@ class WorkflowPreflightService:
                         )
                         try:
                             output_path.relative_to(source_path)
-                            errors.append("Output path cannot be inside source path")
+                            errors.append("Output path overlaps source path: output is inside source")
                         except ValueError:
                             try:
                                 source_path.relative_to(output_path)
-                                errors.append("Source path cannot be inside output path")
+                                errors.append("Output path overlaps source path: source is inside output")
                             except ValueError:
                                 pass  # No overlap
                 

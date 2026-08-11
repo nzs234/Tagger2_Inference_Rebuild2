@@ -8,7 +8,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Literal
 
@@ -195,9 +195,17 @@ class WorkflowJobConfigV1:
     compatibility_mode: bool = True
     schema_version: int = WORKFLOW_CONFIG_VERSION
 
+    def to_dict(self) -> dict[str, Any]:
+        """Return a JSON-serializable snapshot of this configuration."""
+        return asdict(self)
+
     def config_hash(self) -> str:
-        """Compute configuration hash for change detection."""
-        return sha256_json(self.__dict__)
+        """Compute configuration hash for change detection.
+
+        ``asdict`` flattens nested path references so the digest stays stable
+        and JSON-serializable; hashing ``__dict__`` would fail on dataclasses.
+        """
+        return sha256_json(self.to_dict())
 
 
 __all__ = [
