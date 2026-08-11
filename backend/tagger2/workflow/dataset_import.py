@@ -15,7 +15,7 @@ from typing import Iterator, Literal
 
 from PIL import Image, ImageOps
 
-from .raw_e621 import RawE621Annotation, RawE621JsonError, parse_raw_e621_annotation
+from .raw_e621 import RawE621JsonError, parse_raw_e621_annotation
 
 # Frozen to the source project's compatible set; GIF/TIFF/AVIF are intentionally excluded.
 SUPPORTED_EXTENSIONS: dict[str, str] = {

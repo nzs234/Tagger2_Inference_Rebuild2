@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Any
 
 from ..security import PathAllowlist, PathNotAllowedError
-from .contracts import WorkflowJobConfigV1, WorkflowPathRef
+from .contracts import WorkflowJobConfigV1
 from .resources import WorkflowResourceCatalog
 
 

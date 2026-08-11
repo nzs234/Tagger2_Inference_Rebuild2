@@ -4,13 +4,13 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from pathlib import Path
 
 from ..security import PathAllowlist, PathNotAllowedError
-from .contracts import WorkflowJobConfigV1, WorkflowPathRef
+from .contracts import WorkflowJobConfigV1
 from .db import WorkflowDatabase, default_workflow_database_path
 from .preflight import WorkflowPreflightError, WorkflowPreflightService
 from .resources import WorkflowResourceCatalog
