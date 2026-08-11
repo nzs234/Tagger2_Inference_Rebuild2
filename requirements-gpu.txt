@@ -1,0 +1,6 @@
+# NVIDIA CUDA 13.0 source manifest. Install requirements-gpu.lock in deployments.
+--extra-index-url https://download.pytorch.org/whl/cu130
+torch==2.10.0+cu130
+torchvision==0.25.0+cu130
+onnxruntime-gpu>=1.18,<2
+timm>=1.0,<2

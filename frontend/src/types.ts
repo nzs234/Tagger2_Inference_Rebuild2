@@ -1,0 +1,329 @@
+export type AppPage = 'workbench' | 'video-prompts' | 'batch' | 'providers' | 'models' | 'settings'
+export type JobMode = 'local' | 'online'
+export type JobState =
+  | 'queued'
+  | 'running'
+  | 'paused'
+  | 'cancelling'
+  | 'cancelled'
+  | 'succeeded'
+  | 'failed'
+  | 'interrupted'
+
+export type QueueState = 'ready' | 'uploading' | 'queued' | 'processing' | 'done' | 'error'
+
+export interface TagItem {
+  text: string
+  category: string
+  score?: number | null
+  source: string
+  model_id: string
+}
+
+export interface AnimaPayload {
+  quality: string[]
+  count: string
+  character: string
+  series: string
+  artist: string
+  appearance: string[]
+  tags: string[]
+  environment: string[]
+  nl: string
+}
+
+export interface Artifact {
+  kind: 'json' | 'txt' | 'log' | string
+  name: string
+  path?: string
+  download_url?: string
+}
+
+export interface ImageResult {
+  image_id: string
+  file_name: string
+  status: 'succeeded' | 'failed' | 'skipped' | string
+  model_id?: string | null
+  tags: TagItem[]
+  caption?: string | null
+  anima?: AnimaPayload | null
+  artifacts: Artifact[]
+  warnings: string[]
+  timing: Record<string, number>
+  model_results?: ModelResult[]
+  error?: string | null
+}
+
+export interface ModelResult {
+  model_id: string
+  model_name: string
+  tags: TagItem[]
+}
+
+export interface JobEvent {
+  seq: number
+  job_id: string
+  state: JobState
+  phase: string
+  processed: number
+  total: number
+  succeeded: number
+  skipped: number
+  failed: number
+  current_item?: string | null
+  rate?: number | null
+  eta?: number | null
+  error?: string | null
+}
+
+export interface JobSummary extends JobEvent {
+  id: string
+  mode: JobMode
+  hybrid?: boolean
+  created_at: string
+  updated_at?: string
+  provider_id?: string | null
+  model_ids?: string[]
+}
+
+export interface JobListResponse {
+  items: JobSummary[]
+  total: number
+}
+
+export interface JobResultsResponse {
+  items: ImageResult[]
+  total: number
+}
+
+export interface UploadResponse {
+  upload_id: string
+  files: Array<{ id: string; name: string; size: number }>
+}
+
+export interface ScanItem {
+  id?: string
+  relative_path: string
+  file_name: string
+  size?: number
+  modified_at?: string
+}
+
+export interface ScanResponse {
+  scan_id?: string
+  items: ScanItem[]
+  total: number
+  next_cursor?: string | null
+}
+
+export interface RootInfo {
+  id: string
+  name: string
+  kind: 'input' | 'output' | 'model' | string
+  path_hint?: string
+  writable?: boolean
+}
+
+export interface ModelProfile {
+  id: string
+  name: string
+  backend: 'pytorch' | 'onnx' | 'safetensors' | string
+  architecture?: string
+  input_size?: number | number[]
+  loaded: boolean
+  device?: string | null
+  memory_mb?: number | null
+  threshold?: number
+  thresholds?: Record<string, number>
+  preset_thresholds?: Record<string, number>
+  threshold_source?: 'model' | 'custom'
+  trusted_pickle?: boolean
+  adapters?: Array<{ id: string; name: string; type: string; enabled: boolean; weight: number }>
+  classifiers?: string[]
+  status?: string
+}
+
+export interface ModelDownload {
+  id: string
+  repo_id: string
+  revision?: string | null
+  status: 'queued' | 'running' | 'succeeded' | 'failed'
+  phase: 'queued' | 'downloading' | 'registering' | 'completed' | 'interrupted' | string
+  model_ids: string[]
+  loaded_model_ids: string[]
+  load_errors: string[]
+  error?: string | null
+  created_at: string
+  updated_at: string
+}
+
+export interface ClassifierIssue {
+  classifier: 'aesthetic' | string
+  code: string
+  message: string
+  retryable: boolean
+}
+
+export interface ClassifierProfile {
+  id: 'aesthetic'
+  enabled: boolean
+  loaded: boolean
+  error?: ClassifierIssue | null
+}
+
+export type ProviderKind = 'custom' | 'gemini' | 'openai' | 'claude' | 'lmstudio' | 'antigravity'
+export type ProviderProtocol = 'openai' | 'gemini' | 'claude'
+
+export interface ProviderProfile {
+  id: string
+  name: string
+  kind: ProviderKind
+  protocol: ProviderProtocol
+  base_url: string
+  primary_model: string
+  fallback_model?: string | null
+  temperature: number
+  top_p: number
+  top_k?: number | null
+  max_tokens: number
+  timeout_seconds: number
+  retries: number
+  configured: boolean
+  key_hint?: string | null
+  enabled?: boolean
+  last_test?: { ok: boolean; message: string; at: string } | null
+}
+
+export interface RuntimeSettings {
+  input_root_id?: string
+  output_root_id?: string
+  default_mode: JobMode
+  default_threshold: number
+  default_json: boolean
+  default_txt: boolean
+  bind_host: string
+  lan_enabled: boolean
+  access_token_configured: boolean
+  production: boolean
+  max_upload_mb: number
+  max_image_pixels: number
+}
+
+export interface QueueItem {
+  id: string
+  file: File
+  previewUrl: string
+  state: QueueState
+  progress: number
+  result?: ImageResult
+  error?: string
+}
+
+export interface ApiErrorEnvelope {
+  code: string
+  message: string
+  fields?: Record<string, string[]>
+  request_id?: string
+  retryable?: boolean
+}
+
+export interface CreateJobRequest {
+  mode: JobMode
+  hybrid?: boolean
+  source:
+    | { type: 'upload'; upload_id: string }
+    | { type: 'scan'; root_id: string; relative_path: string; recursive: boolean; patterns?: string[] }
+  output?: {
+    root_id?: string
+    relative_path?: string
+    json: boolean
+    txt: boolean
+    txt_include_tags?: boolean
+    replace_underscores?: boolean
+    include_rating?: boolean
+    escape_parentheses?: boolean
+    conflict: 'validate-skip' | 'overwrite' | 'rename'
+  }
+  provider_id?: string
+  provider_model?: string
+  model_ids?: string[]
+  thresholds?: Record<string, number | Record<string, number>>
+  classifiers?: Array<'aesthetic'>
+  separate_models?: boolean
+  tag_prompt?: string
+  nl_prompt?: string
+  json_prompt?: string
+  online_response?: 'json' | 'nl' | 'nl_tags'
+  online_concurrency?: number
+}
+
+export interface PromptDefaults {
+  tag_prompt: string
+  nl_prompt: string
+  json_prompt: string
+}
+
+export type VideoPromptLanguage = 'both' | 'zh' | 'en'
+
+export type VideoPromptMode = 'ref2va' | 'fl2va'
+export type H3BasePromptMode = 't2va' | 'i2va' | 'l2va' | 'fl2va'
+export type Fl2vaSingleImageRole = 'first' | 'last'
+
+export interface BilingualText {
+  zh: string
+  en: string
+}
+
+export type H3VisualRetention = 'fully_preserved' | 'partially_preserved' | 'attribute_transfer' | 'weak_reference'
+
+export interface H3SubjectDefinition extends BilingualText {
+  subject_number: number
+  picture_number: number
+}
+
+export interface H3RetentionAnalysis extends BilingualText {
+  subject_number: number
+  shot_number: number
+  visual_retention: H3VisualRetention
+}
+
+export interface H3Shot extends BilingualText {
+  shot_number: number
+  cut_time_seconds: number | null
+}
+
+export interface Ref2vaPromptPackage {
+  change_summary_zh: string
+  subject_definitions: H3SubjectDefinition[]
+  summary: BilingualText
+  retention_analysis: H3RetentionAnalysis[]
+  detailed_description: {
+    overview: BilingualText
+    shots: H3Shot[]
+  }
+  overall_soundscape: BilingualText
+  non_diegetic_music: BilingualText
+  assumptions_zh: string[]
+}
+
+export interface Fl2vaPromptPackage {
+  change_summary_zh: string
+  base_mode: H3BasePromptMode
+  reference_alignment: BilingualText | null
+  integrated_multimodal_description: BilingualText
+  overall_soundscape: BilingualText
+  non_diegetic_music: BilingualText
+  assumptions_zh: string[]
+}
+
+export type VideoPromptPackage = Ref2vaPromptPackage | Fl2vaPromptPackage
+
+export interface VideoPromptRevision {
+  id: string
+  version: number
+  mode: VideoPromptMode
+  parent_revision_id?: string
+  instruction: string
+  package: VideoPromptPackage
+  created_at: string
+}

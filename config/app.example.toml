@@ -1,0 +1,29 @@
+[server]
+host = "127.0.0.1"
+port = 20000
+lan_access = false
+access_token_env = "TAGGER2_ACCESS_TOKEN"
+debug = false
+
+[paths]
+cache_dir = "data_cache"
+data_dir = "data"
+upload_dir = "data/uploads"
+artifact_dir = "data/artifacts"
+log_dir = "data/logs"
+allowed_input_roots = []
+allowed_output_roots = []
+
+[limits]
+max_upload_bytes = 20971520
+max_pixels = 67108864
+max_online_edge = 2048
+max_batch_items = 100000
+max_online_concurrency = 16
+
+[runtime]
+max_loaded_models = 2
+gpu_concurrency = 1
+# Set a concrete MiB limit to enable model LRU eviction by memory budget.
+# model_memory_budget_mb = 16384
+allow_unsafe_pickle = false

@@ -1,0 +1,41 @@
+# Runtime and local data
+.venv/
+venv/
+data/
+logs/
+dist/
+.release_*/
+.release_smoke_*/
+*.zip
+*.db
+*.db-shm
+*.db-wal
+config/*.local.*
+secrets/
+
+# Model/cache binaries are provisioned separately
+models/*
+!models/.gitkeep
+data_cache/*
+!data_cache/.gitkeep
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+*.egg-info/
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+playwright-report/
+test-results/
+
+# Editors/OS
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini

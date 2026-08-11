@@ -1,0 +1,5 @@
+# Portable CPU source manifest. Install requirements-cpu.lock in deployments.
+torch>=2.5,<3
+torchvision>=0.20,<1
+onnxruntime>=1.18,<2
+timm>=1.0,<2
