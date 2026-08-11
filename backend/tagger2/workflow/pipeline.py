@@ -29,6 +29,7 @@ from .commit import (
 from .contracts import WorkflowJobConfigV1, canonical_json, utc_now
 from .dataset_import import ImportedSample, ImportResult, import_dataset
 from .replacement_index import load_replacement_rules
+from .stages.classify import ClassificationRules, classify_tags
 from .stages.caption import (
     CaptionStageReport,
     TagPredictor,
@@ -161,6 +162,7 @@ def run_offline_pipeline(
     tag_predictor: TagPredictor | None = None,
     policy_config: Any | None = None,
     token_counter: Any | None = None,
+    classification_rules: ClassificationRules | None = None,
 ) -> PipelineReport:
     """Run the deterministic offline vertical and commit its results.
 
@@ -252,6 +254,37 @@ def run_offline_pipeline(
                     tag.raw_tag for tag in result.tags
                 )
 
+
+    # Classify stage: map caption tags to nine-field structure
+    classified_projections: dict[str, dict[str, list[str]]] = {}
+    if classification_rules is not None:
+        # Build a combined tags source: prefer caption_tags, fallback to imported tags
+        tags_to_classify: dict[str, tuple[str, ...]] = {}
+        
+        # First, add imported tags for samples with tag_txt or raw_e621_json
+        for sample in imported.samples:
+            if sample.annotation_kind in ("tag_txt", "raw_e621_json") and sample.tags:
+                tags_to_classify[sample.relative_image_path] = sample.tags
+        
+        # Caption tags override imported tags
+        tags_to_classify.update(caption_tags)
+        
+        for relative_path, tags in tags_to_classify.items():
+            try:
+                projection = classify_tags(list(tags), classification_rules)
+                classified_projections[relative_path] = projection
+            except Exception as exc:
+                report.issues.append(
+                    StageIssue(
+                        sample_id=None,
+                        relative_image_path=relative_path,
+                        module_id="classify",
+                        code="classify_failed",
+                        message=str(exc),
+                    )
+                )
+                report.failed_samples += 1
+
     rules = {}
     if config.replace.get("enabled"):
         if replacement_index_path is None:
@@ -296,9 +329,25 @@ def run_offline_pipeline(
                 }
             else:
                 projection = build_projection(sample)
-                generated = caption_tags.get(sample.relative_image_path)
-                if generated:
-                    projection["tags"] = list(generated)
+                
+                # Use classified projection if available, otherwise fall back to raw tags
+                classified = classified_projections.get(sample.relative_image_path)
+                if classified:
+                    # Merge classified fields into projection
+                    projection["quality"] = classified.get("quality", [])
+                    # For raw_e621_json, preserve original character/artist from import
+                    if sample.annotation_kind == "raw_e621_json":
+                        # Remove character from tags to avoid collision
+                        tags = [t for t in classified.get("tags", []) if t != projection["character"]]
+                        projection["tags"] = tags
+                    else:
+                        projection["character"] = ",".join(classified.get("character", []))
+                        projection["tags"] = classified.get("tags", [])
+                    projection["appearance"] = classified.get("appearance", [])
+                    projection["environment"] = classified.get("environment", [])
+                elif caption_tags.get(sample.relative_image_path):
+                    # No classification rules, use raw caption tags
+                    projection["tags"] = list(caption_tags[sample.relative_image_path])
                 elif config.caption.get("enabled") and not sample.skip_caption:
                     # Caption was requested but produced nothing usable for this
                     # sample; its failure is already recorded as an issue.
@@ -529,3 +578,6 @@ def _safe_flat_txt(annotation: dict[str, Any], policy: CaptionDisplayPolicy) -> 
         return serialize_flat_txt(annotation, policy).decode("utf-8", "replace")
     except (FlatTextSerializationError, TypeError, ValueError):
         return ""
+
+
+
