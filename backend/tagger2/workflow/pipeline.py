@@ -28,6 +28,12 @@ from .commit import (
 from .contracts import WorkflowJobConfigV1, canonical_json, utc_now
 from .dataset_import import ImportedSample, ImportResult, import_dataset
 from .replacement_index import load_replacement_rules
+from .stages.caption import (
+    CaptionStageReport,
+    TagPredictor,
+    run_caption_stage,
+    settings_from_config,
+)
 from .stages.replacement import ReplacementError, ReplacementSummary, replace_projection
 
 NINE_FIELDS = (
@@ -68,6 +74,7 @@ class PipelineReport:
     skipped_samples: int = 0
     committed_files: int = 0
     replacement: dict[str, int] = field(default_factory=dict)
+    caption: dict[str, int] = field(default_factory=dict)
     issues: list[StageIssue] = field(default_factory=list)
     backup_path: str | None = None
     resource_fingerprints: dict[str, str] = field(default_factory=dict)
@@ -80,6 +87,7 @@ class PipelineReport:
             "skipped_samples": self.skipped_samples,
             "committed_files": self.committed_files,
             "replacement": dict(self.replacement),
+            "caption": dict(self.caption),
             "issues": [
                 {
                     "sample_id": issue.sample_id,
@@ -140,6 +148,7 @@ def run_offline_pipeline(
     workspace: Path,
     replacement_index_path: Path | None = None,
     resource_fingerprints: dict[str, str] | None = None,
+    tag_predictor: TagPredictor | None = None,
 ) -> PipelineReport:
     """Run the deterministic offline vertical and commit its results.
 
@@ -198,6 +207,39 @@ def run_offline_pipeline(
         encoding="utf-8",
     )
 
+    caption_tags: dict[str, tuple[str, ...]] = {}
+    if config.caption.get("enabled"):
+        if tag_predictor is None:
+            raise PipelineError("caption stage is enabled but no tag predictor was provided")
+        caption_report: CaptionStageReport = run_caption_stage(
+            imported.samples,
+            source_root=source_root,
+            predictor=tag_predictor,
+            settings=settings_from_config(config.caption),
+            model_id=str(config.caption.get("resource_id", "")),
+        )
+        report.caption = {
+            "captioned": caption_report.captioned,
+            "skipped": caption_report.skipped,
+            "failed": caption_report.failed,
+        }
+        for result in caption_report.results:
+            if result.error:
+                report.issues.append(
+                    StageIssue(
+                        sample_id=None,
+                        relative_image_path=result.relative_image_path,
+                        module_id="caption",
+                        code="caption_failed",
+                        message=result.error,
+                    )
+                )
+                report.failed_samples += 1
+            elif not result.skipped:
+                caption_tags[result.relative_image_path] = tuple(
+                    tag.raw_tag for tag in result.tags
+                )
+
     rules = {}
     if config.replace.get("enabled"):
         if replacement_index_path is None:
@@ -240,6 +282,13 @@ def run_offline_pipeline(
                 }
             else:
                 projection = build_projection(sample)
+                generated = caption_tags.get(sample.relative_image_path)
+                if generated:
+                    projection["tags"] = list(generated)
+                elif config.caption.get("enabled") and not sample.skip_caption:
+                    # Caption was requested but produced nothing usable for this
+                    # sample; its failure is already recorded as an issue.
+                    continue
 
             if rules:
                 projection, summary = replace_projection(projection, rules)
