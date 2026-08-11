@@ -62,8 +62,9 @@ def test_workflow_database():
         # Verify database file created
         assert db_path.exists()
         
-        # Create a job
-        job_id = db.create_job(
+        # Create a job; the workspace directory is reserved by the database.
+        workspace_root = Path(tmpdir) / "jobs"
+        job_id, workspace = db.create_job(
             config_json={"profile": "e621", "work_mode": "full_copy"},
             config_hash="test_hash_123",
             profile="e621",
@@ -71,11 +72,13 @@ def test_workflow_database():
             overwrite_mode="incremental",
             source_root_id="root1",
             output_root_id="root2",
-            workspace_path="/tmp/workspace/job123",
+            workspace_root=workspace_root,
         )
-        
+
         assert job_id
         assert len(job_id) == 32  # UUID hex
+        assert workspace == workspace_root / job_id
+        assert workspace.is_dir()
         
         # Get job
         job = db.get_job(job_id)
@@ -142,7 +145,7 @@ def test_workflow_resource_catalog():
         validation = catalog.validate_csv_resource(csv_path)
         assert validation["valid"] is True, validation["errors"]
         assert validation["line_count"] == 4
-        assert validation["action_counts"] == {"keep": 1, "replace": 2, "drop": 1}
+        assert validation["action_counts"] == {"keep": 1, "replace": 2, "drop": 1, "pass": 0}
         assert validation["pipe_replacement_count"] == 1
 
         manifest = catalog.import_resource(

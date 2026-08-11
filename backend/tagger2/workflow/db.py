@@ -51,10 +51,17 @@ class WorkflowDatabase:
         overwrite_mode: str,
         source_root_id: str,
         output_root_id: str | None,
-        workspace_path: str,
-    ) -> str:
-        """Create a new workflow job."""
+        workspace_root: Path,
+    ) -> tuple[str, Path]:
+        """Create a new workflow job and reserve its workspace directory.
+
+        The identifier is allocated first so the workspace path can be derived
+        from it, and the directory is created before the row is inserted so a
+        visible job always has a workspace on disk.
+        """
         job_id = uuid.uuid4().hex
+        workspace_path = Path(workspace_root) / job_id
+        workspace_path.mkdir(parents=True, exist_ok=False)
         now = utc_now()
         
         with self.connection() as conn:
@@ -70,12 +77,12 @@ class WorkflowDatabase:
                 (
                     job_id, 1, canonical_json(config_json), config_hash,
                     profile, work_mode, overwrite_mode,
-                    source_root_id, output_root_id, workspace_path,
+                    source_root_id, output_root_id, str(workspace_path),
                     "pending", now
                 )
             )
-        
-        return job_id
+
+        return job_id, workspace_path
 
     def get_job(self, job_id: str) -> dict[str, Any] | None:
         """Get job by ID."""

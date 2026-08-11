@@ -8,9 +8,9 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime, timezone
-from typing import Any, Literal
+from typing import Any, Literal, Mapping
 
 # Schema versions
 WORKFLOW_CONFIG_VERSION = 1
@@ -57,6 +57,25 @@ class WorkflowPathRef:
             raise ValueError("root_id cannot be empty")
         if "\x00" in self.relative_path:
             raise ValueError("relative_path cannot contain NUL")
+
+
+def _path_ref(value: Any, field_name: str) -> WorkflowPathRef:
+    """Coerce a decoded JSON object into a :class:`WorkflowPathRef`."""
+
+    if isinstance(value, WorkflowPathRef):
+        return value
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{field_name} must be an object with root_id and relative_path")
+    unknown = sorted(set(value) - {"root_id", "relative_path"})
+    if unknown:
+        raise ValueError(f"{field_name} has unknown fields: {', '.join(unknown)}")
+    root_id = value.get("root_id")
+    if not isinstance(root_id, str) or not root_id:
+        raise ValueError(f"{field_name}.root_id must be a non-empty string")
+    relative_path = value.get("relative_path", "")
+    if not isinstance(relative_path, str):
+        raise ValueError(f"{field_name}.relative_path must be a string")
+    return WorkflowPathRef(root_id=root_id, relative_path=relative_path)
 
 
 @dataclass(frozen=True)
@@ -194,6 +213,58 @@ class WorkflowJobConfigV1:
     
     compatibility_mode: bool = True
     schema_version: int = WORKFLOW_CONFIG_VERSION
+
+    @classmethod
+    def from_payload(cls, payload: Mapping[str, Any]) -> "WorkflowJobConfigV1":
+        """Build a config from a decoded JSON object.
+
+        Nested path references arrive as plain objects, so they are converted
+        explicitly; unknown top-level keys are rejected rather than ignored so a
+        typo in a client payload cannot silently disable a stage.
+        """
+
+        if not isinstance(payload, Mapping):
+            raise ValueError("job config must be an object")
+
+        known = {field_info.name for field_info in fields(cls)}
+        unknown = sorted(set(payload) - known)
+        if unknown:
+            raise ValueError(f"unknown job config fields: {', '.join(unknown)}")
+
+        values = dict(payload)
+
+        schema_version = values.get("schema_version", WORKFLOW_CONFIG_VERSION)
+        if schema_version != WORKFLOW_CONFIG_VERSION:
+            raise ValueError(
+                f"unsupported job config schema_version: {schema_version!r}"
+            )
+
+        if "source_root" not in values:
+            raise ValueError("job config requires source_root")
+        values["source_root"] = _path_ref(values["source_root"], "source_root")
+
+        output_root = values.get("output_root")
+        values["output_root"] = (
+            None if output_root is None else _path_ref(output_root, "output_root")
+        )
+
+        for section in (
+            "caption",
+            "classify",
+            "replace",
+            "ocr",
+            "nl",
+            "count_review",
+            "policy",
+            "token_budget",
+            "export",
+        ):
+            if section in values and not isinstance(values[section], Mapping):
+                raise ValueError(f"{section} must be an object")
+            if section in values:
+                values[section] = dict(values[section])
+
+        return cls(**values)
 
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-serializable snapshot of this configuration."""

@@ -121,14 +121,10 @@ class WorkflowResourceCatalog:
         from .replacement_index import validate_replacement_index
 
         report = validate_replacement_index(csv_path)
-        return {
-            "valid": report.valid,
-            "errors": report.errors,
-            "line_count": report.rule_count,
-            "action_counts": report.action_counts,
-            "pipe_replacement_count": report.pipe_replacement_count,
-            "truncated": report.truncated,
-        }
+        # Reuse the report's own projection so a new counter cannot be dropped here.
+        summary = report.as_dict()
+        summary["line_count"] = summary.pop("rule_count")
+        return summary
 
 
 __all__ = ["WorkflowResourceCatalog"]

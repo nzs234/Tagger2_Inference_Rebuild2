@@ -7,7 +7,9 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
-from ..security import PathAllowlist
+from pathlib import Path
+
+from ..security import PathAllowlist, PathNotAllowedError
 from .contracts import WorkflowJobConfigV1, WorkflowPathRef
 from .db import WorkflowDatabase, default_workflow_database_path
 from .preflight import WorkflowPreflightError, WorkflowPreflightService
@@ -43,20 +45,48 @@ class WorkflowJobStatusResponse(BaseModel):
     error: str | None
 
 
-class WorkflowResourceImportPreviewRequest(BaseModel):
-    """Request to preview resource import."""
-    source_path: str
+class WorkflowResourceImportRequest(BaseModel):
+    """Request to preview or apply a resource import.
+
+    The source file is addressed by root id + relative path so a client can never
+    name an arbitrary absolute path on the server.
+    """
+
+    root_id: str
+    relative_path: str
     resource_id: str
     category: str
 
 
 class WorkflowResourceImportPreviewResponse(BaseModel):
-    """Response for resource import preview."""
+    """Response for a resource import preview."""
+
     valid: bool
     errors: list[str]
     warnings: list[str]
-    line_count: int
+    rule_count: int
+    action_counts: dict[str, int]
+    passthrough_count: int
     fingerprint: str | None
+
+
+def _preflight_http_error(error: WorkflowPreflightError) -> HTTPException:
+    """Translate a preflight failure into a client error.
+
+    The reasons are folded into the message and ``fields`` because the
+    application error envelope only forwards code, message and fields.
+    """
+
+    errors = [str(item) for item in error.details.get("errors", [])]
+    message = error.message if not errors else f"{error.message}: " + "; ".join(errors)
+    return HTTPException(
+        status_code=400,
+        detail={
+            "code": error.code,
+            "message": message,
+            "fields": {"config": errors} if errors else None,
+        },
+    )
 
 
 def create_workflow_router(
@@ -67,10 +97,10 @@ def create_workflow_router(
     """Create workflow API router."""
     
     router = APIRouter(prefix="/api/v1/workflows", tags=["workflows"])
-    
+
     if database is None:
         database = WorkflowDatabase(default_workflow_database_path())
-    
+
     preflight_service = WorkflowPreflightService(allowlist, resource_catalog)
 
     @router.get("/capabilities")
@@ -105,102 +135,102 @@ def create_workflow_router(
             for r in resources
         ]
 
+    def _resolve_resource_source(request: WorkflowResourceImportRequest) -> Path:
+        try:
+            return allowlist.resolve(
+                request.root_id,
+                request.relative_path,
+                must_exist=True,
+                expect="file",
+            )
+        except PathNotAllowedError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail={"code": "path_not_allowed", "message": str(exc)},
+            ) from exc
+
     @router.post("/resources/import/preview")
     async def preview_resource_import(
-        request: WorkflowResourceImportPreviewRequest,
+        request: WorkflowResourceImportRequest,
     ) -> WorkflowResourceImportPreviewResponse:
-        """Preview resource import without applying."""
-        from pathlib import Path
-        
-        source_path = Path(request.source_path)
-        
-        if not source_path.exists():
-            raise HTTPException(status_code=404, detail="Source file not found")
-        
-        # Validate CSV if it's a replace resource
-        validation = resource_catalog.validate_csv_resource(source_path)
-        
-        fingerprint = None
-        if validation["valid"]:
-            fingerprint = resource_catalog.fingerprint_file(source_path)
-        
+        """Validate a resource file without importing it."""
+        source_path = _resolve_resource_source(request)
+        report = resource_catalog.validate_csv_resource(source_path)
+
+        warnings: list[str] = []
+        if report.get("truncated"):
+            warnings.append("error list truncated; fix the reported rows and re-run preview")
+        if resource_catalog.get_manifest(request.resource_id) is not None:
+            warnings.append(f"resource id already registered: {request.resource_id}")
+
         return WorkflowResourceImportPreviewResponse(
-            valid=validation["valid"],
-            errors=validation["errors"],
-            warnings=[],
-            line_count=validation["line_count"],
-            fingerprint=fingerprint,
+            valid=report["valid"],
+            errors=report["errors"],
+            warnings=warnings,
+            rule_count=report["line_count"],
+            action_counts=report.get("action_counts", {}),
+            passthrough_count=report.get("passthrough_count", 0),
+            fingerprint=(
+                resource_catalog.fingerprint_file(source_path) if report["valid"] else None
+            ),
         )
 
     @router.post("/resources/import/apply")
     async def apply_resource_import(
-        request: WorkflowResourceImportPreviewRequest,
+        request: WorkflowResourceImportRequest,
     ) -> dict[str, Any]:
-        """Import and register a resource."""
-        from pathlib import Path
-        
-        source_path = Path(request.source_path)
-        
-        if not source_path.exists():
-            raise HTTPException(status_code=404, detail="Source file not found")
-        
-        # Validate first
-        validation = resource_catalog.validate_csv_resource(source_path)
-        if not validation["valid"]:
+        """Import and register a resource after re-validating it."""
+        source_path = _resolve_resource_source(request)
+
+        report = resource_catalog.validate_csv_resource(source_path)
+        if not report["valid"]:
             raise HTTPException(
                 status_code=400,
-                detail={"code": "validation_failed", "errors": validation["errors"]}
+                detail={"code": "validation_failed", "errors": report["errors"]},
             )
-        
-        # Import resource
+
         manifest = resource_catalog.import_resource(
             source_path=source_path,
             resource_id=request.resource_id,
             category=request.category,
         )
-        
+
         return {
             "resource_id": manifest.resource_id,
             "fingerprint": manifest.resource_fingerprint,
             "category": manifest.category,
             "created_at": manifest.created_at,
+            "rule_count": report["line_count"],
         }
 
     @router.post("/jobs/preflight")
     async def preflight_job(config: dict[str, Any]) -> dict[str, Any]:
         """Validate job configuration before creation."""
         try:
-            job_config = WorkflowJobConfigV1(**config)
+            job_config = WorkflowJobConfigV1.from_payload(config)
             report = preflight_service.validate_config(job_config)
             return report
-        except WorkflowPreflightError as e:
+        except WorkflowPreflightError as exc:
+            raise _preflight_http_error(exc) from exc
+        except (TypeError, ValueError) as exc:
             raise HTTPException(
                 status_code=400,
-                detail={"code": e.code, "message": e.message, "details": e.details}
-            )
-        except Exception as e:
-            raise HTTPException(
-                status_code=400,
-                detail={"code": "invalid_config", "message": str(e)}
-            )
+                detail={"code": "invalid_config", "message": str(exc)},
+            ) from exc
 
     @router.post("/jobs", response_model=WorkflowJobCreateResponse)
     async def create_job(request: WorkflowJobCreateRequest) -> WorkflowJobCreateResponse:
         """Create a new workflow job."""
         try:
-            job_config = WorkflowJobConfigV1(**request.config)
+            job_config = WorkflowJobConfigV1.from_payload(request.config)
             
             # Run preflight validation
             preflight_service.validate_config(job_config)
             
-            # Create workspace directory
-            from ..config import get_settings
-            settings = get_settings()
-            workspace_root = settings.data_dir / "workflows" / "jobs"
+            workspace_root = database.db_path.parent / "jobs"
             workspace_root.mkdir(parents=True, exist_ok=True)
-            
-            # Create job in database
-            job_id = database.create_job(
+
+            job_id, _workspace = database.create_job(
                 config_json=request.config,
                 config_hash=job_config.config_hash(),
                 profile=job_config.profile,
@@ -208,21 +238,18 @@ def create_workflow_router(
                 overwrite_mode=job_config.overwrite_mode,
                 source_root_id=job_config.source_root.root_id,
                 output_root_id=job_config.output_root.root_id if job_config.output_root else None,
-                workspace_path=str(workspace_root / job_id),
+                workspace_root=workspace_root,
             )
             
             return WorkflowJobCreateResponse(job_id=job_id, status="pending")
         
-        except WorkflowPreflightError as e:
+        except WorkflowPreflightError as exc:
+            raise _preflight_http_error(exc) from exc
+        except (TypeError, ValueError) as exc:
             raise HTTPException(
                 status_code=400,
-                detail={"code": e.code, "message": e.message, "details": e.details}
-            )
-        except Exception as e:
-            raise HTTPException(
-                status_code=400,
-                detail={"code": "job_creation_failed", "message": str(e)}
-            )
+                detail={"code": "invalid_config", "message": str(exc)},
+            ) from exc
 
     @router.get("/jobs")
     async def list_jobs(limit: int = 100, offset: int = 0) -> list[dict[str, Any]]:

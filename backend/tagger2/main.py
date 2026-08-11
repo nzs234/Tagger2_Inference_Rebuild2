@@ -70,6 +70,9 @@ from .security import (
 )
 from .storage import JobItemRecord, JobRecord, SQLiteStorage, config_digest
 from .tag_output import format_local_tags
+from .workflow.api import create_workflow_router
+from .workflow.db import WorkflowDatabase
+from .workflow.resources import WorkflowResourceCatalog
 from .video_prompts import (
     build_video_prompt_system_prompt,
     build_video_prompt_user_message,
@@ -453,6 +456,11 @@ class Runtime:
         self.storage = SQLiteStorage(settings.database_path or data_dir / "tagger2.sqlite3")
         self._load_model_profiles()
         self.artifacts = ArtifactManager(self.storage)
+        # The workflow module owns an isolated database and resource library so
+        # the existing tagger2.sqlite3 and model assets are never rewritten.
+        workflow_dir = data_dir / "workflows"
+        self.workflow_resources = WorkflowResourceCatalog(workflow_dir / "resources")
+        self.workflow_database = WorkflowDatabase(workflow_dir / "workflows.sqlite3")
         self.secrets = CompositeSecretStore()
         self.providers: dict[str, Any] = {}
         self.provider_configs: dict[str, dict[str, Any]] = {}
@@ -2660,6 +2668,18 @@ def create_app(settings: AppConfig | None = None) -> FastAPI:
         data.pop("production", None)
         runtime.save_user_settings(data)
         return await get_settings()
+
+    # Dataset Workflow module.  Mounted before the SPA catch-all so the
+    # frontend route cannot shadow it, and behind the same authorize dependency
+    # as every other API route.
+    app.include_router(
+        create_workflow_router(
+            allowlist=runtime.allowlist,
+            resource_catalog=runtime.workflow_resources,
+            database=runtime.workflow_database,
+        ),
+        dependencies=[Depends(authorize)],
+    )
 
     frontend_dist = runtime.settings.project_root / "frontend" / "dist"
     if frontend_dist.is_dir():
