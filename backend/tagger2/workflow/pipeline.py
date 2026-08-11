@@ -190,25 +190,6 @@ def _parse_policy_config(config_arg: dict[str, Any] | "PolicyConfig") -> "Policy
     )
 
 
-    def _parse_coupled(data: dict[str, Any]) -> CoupledProbabilities:
-        return CoupledProbabilities(
-            dropNl=data.get("nlDropoutProbability", 0.0),
-            dropAppearance=data.get("appearanceDropoutProbability", 0.0),
-        )
-    
-    return PolicyConfig(
-        seed=config_dict["seed"],
-        artistEnabled=config_dict.get("artistEnabled", False),
-        artistDropoutProbability=config_dict.get("artistDropoutProbability", 0.0),
-        qualityEnabled=config_dict.get("qualityEnabled", False),
-        qualityDropoutProbability=config_dict.get("qualityDropoutProbability", 0.0),
-        appearanceNlEnabled=config_dict.get("appearanceNlEnabled", False),
-        solo=_parse_coupled(config_dict.get("solo", {})),
-        nonSolo=_parse_coupled(config_dict.get("nonSolo", {})),
-        unknown=_parse_coupled(config_dict.get("unknown", {})),
-    )
-
-
 def run_offline_pipeline(
     config: WorkflowJobConfigV1,
     *,
