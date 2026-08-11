@@ -45,6 +45,27 @@ class WorkflowJobStatusResponse(BaseModel):
     error: str | None
 
 
+class WorkflowCountResolveRequest(BaseModel):
+    """Record a reviewed count for one sample."""
+
+    sample_id: int
+    expected_version: int
+    count: str
+    source: str = "manual"
+
+
+class WorkflowCountResolveBatchRequest(BaseModel):
+    """Record several reviewed counts in one call."""
+
+    items: list[WorkflowCountResolveRequest]
+
+
+class WorkflowCountConfirmRequest(BaseModel):
+    """Explicitly confirm that count review is complete."""
+
+    confirmed: bool
+
+
 class WorkflowResourceImportRequest(BaseModel):
     """Request to preview or apply a resource import.
 
@@ -202,6 +223,120 @@ def create_workflow_router(
             "created_at": manifest.created_at,
             "rule_count": report["line_count"],
         }
+
+    def _count_store(job_id: str):
+        from .count_review import CountReviewStore
+
+        job = database.get_job(job_id)
+        if job is None:
+            raise HTTPException(
+                status_code=404,
+                detail={"code": "job_not_found", "message": f"unknown job: {job_id}"},
+            )
+        return CountReviewStore(database, job_id)
+
+    @router.get("/jobs/{job_id}/count-review")
+    async def list_count_review(
+        job_id: str,
+        limit: int = 50,
+        offset: int = 0,
+        pending_only: bool = False,
+    ) -> dict[str, Any]:
+        """Page through count decisions with the evidence a reviewer needs."""
+        store = _count_store(job_id)
+        return {
+            "items": store.page(limit=limit, offset=offset, pending_only=pending_only),
+            "pending": store.pending_count(),
+        }
+
+    @router.post("/jobs/{job_id}/count-review/resolve")
+    async def resolve_count_review(
+        job_id: str,
+        request: WorkflowCountResolveRequest,
+    ) -> dict[str, Any]:
+        """Record one reviewed count, rejecting a stale version."""
+        from .count_review import CountReviewConflictError, CountReviewError
+
+        store = _count_store(job_id)
+        try:
+            return store.resolve(
+                request.sample_id,
+                expected_version=request.expected_version,
+                count=request.count,
+                source=request.source,
+            )
+        except CountReviewConflictError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "count_review_conflict", "message": str(exc)},
+            ) from exc
+        except CountReviewError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail={"code": "count_review_invalid", "message": str(exc)},
+            ) from exc
+
+    @router.post("/jobs/{job_id}/count-review/resolve-batch")
+    async def resolve_count_review_batch(
+        job_id: str,
+        request: WorkflowCountResolveBatchRequest,
+    ) -> dict[str, Any]:
+        """Record several reviewed counts, stopping at the first rejection."""
+        from .count_review import CountReviewConflictError, CountReviewError
+
+        store = _count_store(job_id)
+        applied: list[dict[str, Any]] = []
+        for item in request.items:
+            try:
+                applied.append(
+                    store.resolve(
+                        item.sample_id,
+                        expected_version=item.expected_version,
+                        count=item.count,
+                        source=item.source,
+                    )
+                )
+            except CountReviewConflictError as exc:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "count_review_conflict",
+                        "message": str(exc),
+                        "fields": {"applied": [entry["sample_id"] for entry in applied]},
+                    },
+                ) from exc
+            except CountReviewError as exc:
+                raise HTTPException(
+                    status_code=400,
+                    detail={"code": "count_review_invalid", "message": str(exc)},
+                ) from exc
+        return {"applied": applied, "pending": store.pending_count()}
+
+    @router.post("/jobs/{job_id}/count-review/confirm")
+    async def confirm_count_review(
+        job_id: str,
+        request: WorkflowCountConfirmRequest,
+    ) -> dict[str, Any]:
+        """Gate export on an explicit confirmation with nothing left pending."""
+        from .count_review import CountReviewError
+
+        if not request.confirmed:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "code": "count_review_not_confirmed",
+                    "message": "explicit count review confirmation is required",
+                },
+            )
+        store = _count_store(job_id)
+        try:
+            store.assert_ready_for_export()
+        except CountReviewError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "count_review_incomplete", "message": str(exc)},
+            ) from exc
+        return {"job_id": job_id, "confirmed": True, "pending": 0}
 
     @router.post("/jobs/preflight")
     async def preflight_job(config: dict[str, Any]) -> dict[str, Any]:

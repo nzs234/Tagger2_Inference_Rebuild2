@@ -15,6 +15,7 @@ from typing import Any
 
 from .caption_format import (
     CaptionDisplayPolicy,
+    FlatTextSerializationError,
     normalize_json_bytes,
     serialize_flat_txt,
 )
@@ -34,6 +35,8 @@ from .stages.caption import (
     run_caption_stage,
     settings_from_config,
 )
+from .stages.policy import PolicyError, apply_policy
+from .stages.token_budget import TokenBudgetError, fit as fit_token_budget
 from .stages.replacement import ReplacementError, ReplacementSummary, replace_projection
 
 NINE_FIELDS = (
@@ -75,6 +78,8 @@ class PipelineReport:
     committed_files: int = 0
     replacement: dict[str, int] = field(default_factory=dict)
     caption: dict[str, int] = field(default_factory=dict)
+    policy: dict[str, int] = field(default_factory=dict)
+    token_budget: dict[str, int] = field(default_factory=dict)
     issues: list[StageIssue] = field(default_factory=list)
     backup_path: str | None = None
     resource_fingerprints: dict[str, str] = field(default_factory=dict)
@@ -88,6 +93,8 @@ class PipelineReport:
             "committed_files": self.committed_files,
             "replacement": dict(self.replacement),
             "caption": dict(self.caption),
+            "policy": dict(self.policy),
+            "token_budget": dict(self.token_budget),
             "issues": [
                 {
                     "sample_id": issue.sample_id,
@@ -149,6 +156,8 @@ def run_offline_pipeline(
     replacement_index_path: Path | None = None,
     resource_fingerprints: dict[str, str] | None = None,
     tag_predictor: TagPredictor | None = None,
+    policy_config: Any | None = None,
+    token_counter: Any | None = None,
 ) -> PipelineReport:
     """Run the deterministic offline vertical and commit its results.
 
@@ -262,6 +271,8 @@ def run_offline_pipeline(
     journal = CommitJournal(workspace / "commit_journal.jsonl")
     staged: list[StagedFile] = []
     totals = ReplacementSummary(0, 0, 0, 0)
+    policy_counts: dict[str, int] = {"artist_dropped": 0, "quality_dropped": 0}
+    budget_counts: dict[str, int] = {}
     export_format = str(config.export.get("format", "both"))
     if export_format not in {"json", "txt", "both"}:
         raise PipelineError(f"unsupported export format: {export_format!r}")
@@ -293,6 +304,96 @@ def run_offline_pipeline(
             if rules:
                 projection, summary = replace_projection(projection, rules)
                 totals = totals.merge(summary)
+
+            if policy_config is not None:
+                try:
+                    projection, decision = apply_policy(
+                        projection,
+                        annotation_key=sample.annotation_key,
+                        relative_image_path=sample.relative_image_path,
+                        config=policy_config,
+                        aesthetic_score=None,
+                    )
+                except PolicyError as exc:
+                    report.issues.append(
+                        StageIssue(
+                            sample_id=sample.sample_id,
+                            relative_image_path=sample.relative_image_path,
+                            module_id="policy",
+                            code="policy_failed",
+                            message=str(exc),
+                        )
+                    )
+                    report.failed_samples += 1
+                    continue
+                policy_counts["artist_dropped"] += int(decision.artistDropped)
+                policy_counts["quality_dropped"] += int(decision.qualityDropped)
+                policy_counts[decision.appearanceNlAction] = (
+                    policy_counts.get(decision.appearanceNlAction, 0) + 1
+                )
+
+            if token_counter is not None:
+                caption_format = {
+                    "replaceUnderscoresWithSpaces": policy.replace_underscores_with_spaces,
+                    "preserveEscapes": policy.preserve_escapes,
+                    "triggersEnabled": policy.triggers_enabled,
+                    "triggerTerms": list(policy.trigger_terms),
+                }
+                try:
+                    budget = fit_token_budget(
+                        projection,
+                        caption_format,
+                        int(config.token_budget.get("max_tokens", 225)),
+                        token_counter,
+                    )
+                except FlatTextSerializationError as exc:
+                    # Trimming reached an empty payload, which cannot be
+                    # serialized. That is an overflow needing a human decision.
+                    report.issues.append(
+                        StageIssue(
+                            sample_id=sample.sample_id,
+                            relative_image_path=sample.relative_image_path,
+                            module_id="token_budget",
+                            code="token_budget_overflow",
+                            message=(
+                                "caption cannot fit the token budget without"
+                                f" emptying the payload: {exc}"
+                            ),
+                        )
+                    )
+                    budget_counts["overflow"] = budget_counts.get("overflow", 0) + 1
+                    report.failed_samples += 1
+                    continue
+                except TokenBudgetError as exc:
+                    report.issues.append(
+                        StageIssue(
+                            sample_id=sample.sample_id,
+                            relative_image_path=sample.relative_image_path,
+                            module_id="token_budget",
+                            code="token_budget_failed",
+                            message=str(exc),
+                        )
+                    )
+                    report.failed_samples += 1
+                    continue
+                budget_counts[budget.status] = budget_counts.get(budget.status, 0) + 1
+                if budget.status == "overflow" or budget.annotation is None:
+                    # Overflow needs a human decision; never silently truncate.
+                    report.issues.append(
+                        StageIssue(
+                            sample_id=sample.sample_id,
+                            relative_image_path=sample.relative_image_path,
+                            module_id="token_budget",
+                            code="token_budget_overflow",
+                            message=(
+                                f"caption needs {budget.original_tokens} tokens and cannot fit"
+                                f" the budget even after trimming"
+                            ),
+                        )
+                    )
+                    report.failed_samples += 1
+                    continue
+                projection = dict(budget.annotation)
 
             normalization_format = "both" if export_format == "both" else (
                 "json" if export_format == "json" else "flat_txt"
@@ -342,6 +443,8 @@ def run_offline_pipeline(
             )
             report.failed_samples += 1
 
+    report.policy = dict(policy_counts)
+    report.token_budget = dict(budget_counts)
     report.replacement = {
         "replaced": totals.replaced,
         "dropped": totals.dropped,
