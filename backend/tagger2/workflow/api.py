@@ -259,6 +259,7 @@ def create_workflow_router(
     token_counter: Callable[[Sequence[str]], Sequence[int]] | None = None,
     model_registry: Any | None = None,
     inference_engine: Any | None = None,
+    storage: Any | None = None,
 ) -> APIRouter:
     """Create workflow API router.
 
@@ -420,6 +421,52 @@ def create_workflow_router(
                 except RuntimeError:
                     ocr_engine = None
 
+            # NL client if provider configured
+            nl_client = None
+            if config.nl.get("enabled"):
+                provider_id = str(config.nl.get("provider_id", ""))
+                if provider_id:
+                    from tagger2.providers import ProviderConfig, create_provider
+                    from .nl_adapter import ProviderNlAdapter
+                    
+                    assert storage is not None  # Type narrowing
+                    # Get provider profile from storage
+                    stored_profile = storage.get_provider_profile(provider_id)
+                    if stored_profile is None:
+                        raise ValueError(f"Provider {provider_id} not found")
+                    if not bool(stored_profile.get("enabled", True)):
+                        raise ValueError(f"Provider {provider_id} is disabled")
+                    
+                    # Build provider config
+                    cfg = dict(stored_profile.get("config") or {})
+                    cfg.update({
+                        "id": provider_id,
+                        "name": stored_profile.get("name"),
+                        "kind": stored_profile.get("kind"),
+                        "base_url": stored_profile.get("base_url")
+                    })
+                    cfg["model"] = cfg.pop("primary_model", cfg.get("model", ""))
+                    cfg["backup_model"] = cfg.pop("fallback_model", cfg.get("backup_model"))
+                    cfg["max_output_tokens"] = cfg.pop("max_tokens", cfg.get("max_output_tokens", 8192))
+                    
+                    # Get API keys from secret store
+                    secret_ref = stored_profile.get("secret_ref")
+                    keys = []
+                    if secret_ref:
+                        try:
+                            from tagger2.secrets import CompositeSecretStore
+                            secret_store = CompositeSecretStore()
+                            raw_keys = secret_store.get(secret_ref)
+                            if raw_keys:
+                                keys = [k.strip() for k in raw_keys.replace(",", "\n").split("\n") if k.strip()]
+                        except Exception:
+                            pass
+                    cfg["api_keys"] = tuple(keys)
+                    
+                    # Create provider instance
+                    provider = create_provider(ProviderConfig.from_mapping(cfg))
+                    nl_client = ProviderNlAdapter(provider)
+
             # Policy config converted to dataclass if enabled
             policy_config_arg = None
             if config.policy.get("enabled"):
@@ -443,6 +490,7 @@ def create_workflow_router(
                 policy_config=policy_config_arg,
                 token_counter=token_counter_arg,
                 ocr_engine=ocr_engine,
+                nl_client=nl_client,
             )
     
             # Persist the stage report so the UI can read per-stage counters

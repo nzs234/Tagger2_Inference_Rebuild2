@@ -9,10 +9,6 @@ same workspace and commit contract.
 from __future__ import annotations
 
 import json
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    from .stages.policy import PolicyConfig
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -34,7 +30,6 @@ from .contracts import WorkflowJobConfigV1, canonical_json, utc_now
 from .dataset_import import ImportedSample, ImportResult, import_dataset
 from .replacement_index import load_replacement_rules
 from .ocr import OCREngine, run_ocr_stage
-from .stages.nl import NlClient, run_nl_stage
 from .stages.classify import ClassificationRules, classify_tags
 from .stages.caption import (
     CaptionStageReport,
@@ -86,7 +81,6 @@ class PipelineReport:
     replacement: dict[str, int] = field(default_factory=dict)
     caption: dict[str, int] = field(default_factory=dict)
     ocr: dict[str, int] = field(default_factory=dict)
-    nl: dict[str, int] = field(default_factory=dict)
     policy: dict[str, int] = field(default_factory=dict)
     token_budget: dict[str, int] = field(default_factory=dict)
     # Overflowing captions, for the caller to seed into token budget review.
@@ -160,55 +154,6 @@ def build_projection(sample: ImportedSample) -> dict[str, Any]:
     return projection
 
 
-def _parse_policy_config(config_arg: dict[str, Any] | "PolicyConfig") -> "PolicyConfig":
-    """Convert a policy config dictionary to PolicyConfig dataclass, or pass through if already a dataclass."""
-    from .stages.policy import PolicyConfig, CoupledProbabilities
-    
-    # If already a PolicyConfig, return it as-is
-    if isinstance(config_arg, PolicyConfig):
-        return config_arg
-    
-    # Otherwise, parse the dictionary
-    config_dict = config_arg
-    
-    def _parse_coupled(data: dict[str, Any]) -> CoupledProbabilities:
-        return CoupledProbabilities(
-            dropNl=data.get("nlDropoutProbability", 0.0),
-            dropAppearance=data.get("appearanceDropoutProbability", 0.0),
-        )
-    
-    return PolicyConfig(
-        seed=config_dict["seed"],
-        artistEnabled=config_dict.get("artistEnabled", False),
-        artistDropoutProbability=config_dict.get("artistDropoutProbability", 0.0),
-        qualityEnabled=config_dict.get("qualityEnabled", False),
-        qualityDropoutProbability=config_dict.get("qualityDropoutProbability", 0.0),
-        appearanceNlEnabled=config_dict.get("appearanceNlEnabled", False),
-        solo=_parse_coupled(config_dict.get("solo", {})),
-        nonSolo=_parse_coupled(config_dict.get("nonSolo", {})),
-        unknown=_parse_coupled(config_dict.get("unknown", {})),
-    )
-
-
-    def _parse_coupled(data: dict[str, Any]) -> CoupledProbabilities:
-        return CoupledProbabilities(
-            dropNl=data.get("nlDropoutProbability", 0.0),
-            dropAppearance=data.get("appearanceDropoutProbability", 0.0),
-        )
-    
-    return PolicyConfig(
-        seed=config_dict["seed"],
-        artistEnabled=config_dict.get("artistEnabled", False),
-        artistDropoutProbability=config_dict.get("artistDropoutProbability", 0.0),
-        qualityEnabled=config_dict.get("qualityEnabled", False),
-        qualityDropoutProbability=config_dict.get("qualityDropoutProbability", 0.0),
-        appearanceNlEnabled=config_dict.get("appearanceNlEnabled", False),
-        solo=_parse_coupled(config_dict.get("solo", {})),
-        nonSolo=_parse_coupled(config_dict.get("nonSolo", {})),
-        unknown=_parse_coupled(config_dict.get("unknown", {})),
-    )
-
-
 def run_offline_pipeline(
     config: WorkflowJobConfigV1,
     *,
@@ -222,7 +167,6 @@ def run_offline_pipeline(
     token_counter: Any | None = None,
     classification_rules: ClassificationRules | None = None,
     ocr_engine: OCREngine | None = None,
-    nl_client: NlClient | None = None,
 ) -> PipelineReport:
     """Run the deterministic offline vertical and commit its results.
 
@@ -407,61 +351,6 @@ def run_offline_pipeline(
     if export_format not in {"json", "txt", "both"}:
         raise PipelineError(f"unsupported export format: {export_format!r}")
 
-
-    # NL stage: generate natural language captions
-    nl_projections: dict[str, Any] = {}
-    if config.nl.get('enabled') and config.nl.get('api_enabled') and nl_client is not None:
-        # Build projections dict for NL stage (needs full nine-field structure)
-        temp_projections: dict[str, dict[str, Any]] = {}
-        for sample in imported.samples:
-            if sample.annotation_kind == 'standard_json':
-                document = json.loads(
-                    (source_root / Path(sample.annotation_key + '.json')).read_bytes().decode('utf-8-sig')
-                )
-                temp_projections[sample.relative_image_path] = {
-                    field_name: document.get(field_name) for field_name in NINE_FIELDS
-                }
-            else:
-                projection = build_projection(sample)
-                classified = classified_projections.get(sample.relative_image_path)
-                if classified:
-                    projection['quality'] = classified.get('quality', [])
-                    if sample.annotation_kind == 'raw_e621_json':
-                        projection['tags'] = [
-                            tag for tag in classified.get('tags', [])
-                            if tag != projection['character']
-                        ]
-                    else:
-                        projection['character'] = ', '.join(classified.get('character', []))
-                        projection['tags'] = classified.get('tags', [])
-                        projection['artist'] = merge_artists(
-                            str(projection['artist']),
-                            ', '.join(classified.get('artist', [])),
-                        )
-                    projection['appearance'] = classified.get('appearance', [])
-                    projection['environment'] = classified.get('environment', [])
-                elif caption_tags.get(sample.relative_image_path):
-                    projection['tags'] = list(caption_tags[sample.relative_image_path])
-                temp_projections[sample.relative_image_path] = projection
-        
-        nl_report = run_nl_stage(
-            imported.samples,
-            temp_projections,
-            source_root=source_root,
-            client=nl_client,
-            preset=str(config.nl.get('prompt_preset', 'general')),
-            length=str(config.nl.get('length', 'medium')),
-            reuse_original_nl=bool(config.nl.get('reuse_original_nl', True)),
-            use_image=bool(config.nl.get('use_image', True)),
-            use_full_json=bool(config.nl.get('use_full_json', False)),
-        )
-        nl_projections = nl_report.by_path()
-        report.nl = {
-            'generated': nl_report.generated,
-            'reused': nl_report.reused,
-            'failed': nl_report.failed,
-        }
-
     for sample in imported.samples:
         try:
             if sample.annotation_kind == "standard_json":
@@ -516,11 +405,6 @@ def run_offline_pipeline(
                 projection, summary = replace_projection(projection, rules)
                 totals = totals.merge(summary)
 
-            # Convert dict to PolicyConfig dataclass
-            if policy_config is not None:
-                parsed_policy_config = _parse_policy_config(policy_config)
-                policy_config = parsed_policy_config
-
             if policy_config is not None:
                 try:
                     projection, decision = apply_policy(
@@ -547,10 +431,6 @@ def run_offline_pipeline(
                 policy_counts[decision.appearanceNlAction] = (
                     policy_counts.get(decision.appearanceNlAction, 0) + 1
                 )
-
-            # Merge NL result if available
-            if nl_projections and sample.relative_image_path in nl_projections:
-                projection["nl"] = nl_projections[sample.relative_image_path]
 
             if token_counter is not None:
                 caption_format = {
