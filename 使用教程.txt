@@ -1,0 +1,60 @@
+Tagger2 Inference Rebuild 中文使用说明
+=====================================
+
+【首次启动】
+
+1. 支持 Windows 10/11 64 位。请先完整解压，不要在压缩包内运行。
+2. 双击 setup.bat。目标电脑不需要安装 Python 或 Node.js。
+3. 程序固定使用项目内的 runtime\python.exe，不修改系统 PATH，也不影响电脑原有 Python。
+4. 启动脚本会自动检测 NVIDIA 显卡：检测到时安装 CUDA 依赖，否则安装 CPU 依赖。
+5. 首次运行需要联网下载机器学习依赖，下载量可能达到数 GB，请勿中途关闭窗口。
+6. 启动完成后访问 http://127.0.0.1:20000。
+
+【以后启动】
+
+依赖安装完成后双击 start.bat。setup.bat 也可重复运行；锁文件没有变化时不会重复安装全部依赖。
+
+【便携环境目录】
+
+runtime\python.exe             内置 Python
+runtime\Lib\site-packages     新安装的 Python 依赖
+models                         本地模型
+data_cache                     模型下载缓存
+data                           任务数据库、上传缓存和任务产物
+
+移动整个项目文件夹即可迁移；删除整个文件夹即可卸载，不会留下系统级 Python 环境。
+
+【本地模型】
+
+在“本地模型”页面输入 Hugging Face 模型网址下载，或将已有模型复制到 models 目录。模型下载后会尝试自动读取预处理配置和最佳阈值配置。
+
+【在线模型】
+
+在“在线模型”页面新建 Provider，填写 API 地址和 API Key，然后点击“获取可用模型”。API Key 不会包含在发布包中，每台电脑需要自行配置。
+
+【批量输出目录】
+
+原始图片文件夹：TXT/JSON 直接写在每张原图旁边。
+任务产物：文件集中保存在 data\artifacts。
+其他输出目录：保存到用户注册的可写目录，并按配置保留相对目录结构。
+
+【手动指定 CPU/CUDA】
+
+通常无需设置。需要覆盖自动检测时，在命令行执行：
+
+set TAGGER2_TORCH_VARIANT=cpu
+start.bat
+
+或：
+
+set TAGGER2_TORCH_VARIANT=cuda
+start.bat
+
+【常见问题】
+
+端口 20000 被占用：关闭旧的 Tagger2 窗口或占用该端口的程序后重试。
+首次下载失败：检查网络、代理、防火墙和磁盘空间，再运行 setup.bat。
+CUDA 无法启动：更新 NVIDIA 驱动，或强制使用 CPU 模式。
+页面打不开：确认启动窗口仍在运行，并访问 http://127.0.0.1:20000。
+
+分享程序时，不要分享包含 API Key、访问 Token、私人图片或任务数据库的数据文件。

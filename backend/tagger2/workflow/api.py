@@ -178,13 +178,21 @@ def create_workflow_router(
                 database.update_job(job_id, error_message=f"path not allowed: {exc}")
                 return
     
-            # TODO: wire up replacement_index, tag_predictor, policy_config, token_counter
-            # from resource catalog when resources are registered
+            # Wire up resources from catalog
+            replacement_index_path = None
+            if config.replace.get("enabled"):
+                # Use the designated e621 replacement index
+                replacement_index_path = resource_catalog.get_resource_path("e621-replacement-index-v1")
+                if replacement_index_path is None:
+                    raise ValueError("replace stage enabled but e621-replacement-index-v1 not found in catalog")
+            
+            # TODO: wire up tag_predictor, policy_config, token_counter when available
             report = run_offline_pipeline(
                 config,
                 source_root=source_path,
                 output_root=output_path,
                 workspace=workspace,
+                replacement_index_path=replacement_index_path,
             )
     
             # Seed count review if decisions exist
@@ -674,3 +682,4 @@ def create_workflow_router(
 
 
 __all__ = ["create_workflow_router"]
+
