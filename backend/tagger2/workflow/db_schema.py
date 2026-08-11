@@ -6,7 +6,7 @@ import hashlib
 import sqlite3
 from pathlib import Path
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -45,6 +45,12 @@ CREATE TABLE IF NOT EXISTS workflow_samples (
     relative_image_path TEXT NOT NULL,
     image_format TEXT NOT NULL CHECK(image_format IN ('jpeg', 'png', 'webp', 'bmp')),
     status TEXT NOT NULL CHECK(status IN ('pending', 'processing', 'completed', 'failed', 'skipped')),
+    -- Lease bookkeeping (schema v2): a sample claimed by a worker records who
+    -- holds it and when the claim expires, so an interrupted run is detectable
+    -- instead of leaving a sample stuck in 'processing' forever.
+    lease_owner TEXT,
+    lease_expires_at TEXT,
+    attempt_count INTEGER NOT NULL DEFAULT 0,
     current_module_id TEXT,
     error TEXT,
     created_at TEXT NOT NULL,
@@ -117,6 +123,7 @@ CREATE TABLE IF NOT EXISTS workflow_token_budget_review (
 );
 
 CREATE INDEX IF NOT EXISTS idx_workflow_samples_status ON workflow_samples(job_id, status);
+CREATE INDEX IF NOT EXISTS idx_workflow_samples_lease ON workflow_samples(job_id, lease_expires_at);
 CREATE INDEX IF NOT EXISTS idx_workflow_issues_job ON workflow_issues(job_id, severity, blocking);
 CREATE INDEX IF NOT EXISTS idx_workflow_count_review_status ON workflow_count_review(job_id, status);
 CREATE INDEX IF NOT EXISTS idx_workflow_token_review_status ON workflow_token_budget_review(job_id, status);
@@ -154,7 +161,36 @@ def apply_migrations(db_path: Path) -> None:
                 f"workflow database schema version {applied} is newer than supported"
                 f" version {SCHEMA_VERSION}"
             )
-        # Same version: keep DDL idempotent so a partially created database heals.
+
+        if applied < 2:
+            # v1 -> v2: add lease bookkeeping to existing sample rows. ALTER is
+            # used rather than a rebuild so existing job history is preserved.
+            # This connection has no row factory, so PRAGMA rows are plain
+            # tuples: (cid, name, type, notnull, dflt_value, pk).
+            existing = {
+                str(column[1])
+                for column in conn.execute("PRAGMA table_info(workflow_samples)").fetchall()
+            }
+            for column, ddl in (
+                ("lease_owner", "ALTER TABLE workflow_samples ADD COLUMN lease_owner TEXT"),
+                (
+                    "lease_expires_at",
+                    "ALTER TABLE workflow_samples ADD COLUMN lease_expires_at TEXT",
+                ),
+                (
+                    "attempt_count",
+                    "ALTER TABLE workflow_samples ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0",
+                ),
+            ):
+                if column not in existing:
+                    conn.execute(ddl)
+            conn.execute(
+                "INSERT INTO schema_migrations (version, checksum, applied_at)"
+                " VALUES (?, ?, datetime('now'))",
+                (2, checksum),
+            )
+
+        # Keep the remaining DDL idempotent so a partially created database heals.
         conn.executescript(SCHEMA_SQL)
         conn.commit()
     finally:

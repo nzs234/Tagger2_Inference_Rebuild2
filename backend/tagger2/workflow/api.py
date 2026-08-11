@@ -224,6 +224,56 @@ def create_workflow_router(
             "rule_count": report["line_count"],
         }
 
+    def _lifecycle(job_id: str):
+        from .lifecycle import JobLifecycle
+
+        job = database.get_job(job_id)
+        if job is None:
+            raise HTTPException(
+                status_code=404,
+                detail={"code": "job_not_found", "message": f"unknown job: {job_id}"},
+            )
+        return JobLifecycle(database, job_id), job
+
+    @router.post("/jobs/{job_id}/pause")
+    async def pause_job(job_id: str) -> dict[str, Any]:
+        """Pause a running job so it can be resumed later."""
+        from .lifecycle import LifecycleError
+
+        lifecycle, _job = _lifecycle(job_id)
+        try:
+            return {"job_id": job_id, "status": lifecycle.pause()}
+        except LifecycleError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "invalid_transition", "message": str(exc)},
+            ) from exc
+
+    @router.post("/jobs/{job_id}/resume")
+    async def resume_job(job_id: str) -> dict[str, Any]:
+        """Resume a paused job."""
+        from .lifecycle import LifecycleError
+
+        lifecycle, _job = _lifecycle(job_id)
+        try:
+            return {"job_id": job_id, "status": lifecycle.resume()}
+        except LifecycleError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "invalid_transition", "message": str(exc)},
+            ) from exc
+
+    @router.post("/jobs/{job_id}/repair")
+    async def repair_job(job_id: str) -> dict[str, Any]:
+        """Repair an interrupted run and report what recovery found."""
+        lifecycle, job = _lifecycle(job_id)
+        report = lifecycle.repair(Path(str(job["workspace_path"])))
+        return {
+            "job_id": job_id,
+            **report.as_dict(),
+            "resumable_samples": len(lifecycle.resumable_samples()),
+        }
+
     def _count_store(job_id: str):
         from .count_review import CountReviewStore
 

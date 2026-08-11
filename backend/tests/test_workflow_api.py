@@ -356,5 +356,36 @@ def test_count_review_unknown_job_is_404(workflow_client):
     assert response.status_code == 404
 
 
+def test_job_pause_resume_and_repair(workflow_client):
+    """Lifecycle transitions are enforced and repair reports journal state."""
+    client, root, _input_root = workflow_client
+    runtime = client.app.state.runtime
+    job_id = _seed_count_review(client, root, runtime)
+
+    # A pending job cannot be paused before it runs.
+    early = client.post(f"/api/v1/workflows/jobs/{job_id}/pause")
+    assert early.status_code == 409
+    assert early.json()["code"] == "invalid_transition"
+
+    assert client.post(f"/api/v1/workflows/jobs/{job_id}/resume").json()["status"] == "running"
+    assert client.post(f"/api/v1/workflows/jobs/{job_id}/pause").json()["status"] == "paused"
+    assert client.post(f"/api/v1/workflows/jobs/{job_id}/resume").json()["status"] == "running"
+
+    repaired = client.post(f"/api/v1/workflows/jobs/{job_id}/repair")
+    assert repaired.status_code == 200, repaired.text
+    body = repaired.json()
+    assert body["journal_state"] == "no_commit_attempted"
+    assert body["reclaimed_samples"] == 0
+    assert body["resumable_samples"] == 2
+    # Repair must not leak the workspace path.
+    assert str(root) not in repaired.text
+
+
+def test_lifecycle_unknown_job_is_404(workflow_client):
+    client, _root, _input_root = workflow_client
+    assert client.post("/api/v1/workflows/jobs/nope/pause").status_code == 404
+    assert client.post("/api/v1/workflows/jobs/nope/repair").status_code == 404
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
