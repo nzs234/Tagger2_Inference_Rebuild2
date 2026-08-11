@@ -3,10 +3,12 @@
 import json
 import os
 import tempfile
+import threading
 from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
+from PIL import Image
 
 
 @pytest.fixture()
@@ -531,6 +533,66 @@ def test_failed_job_reports_a_code_and_keeps_the_traceback_server_side(workflow_
     assert "Traceback" not in json.dumps(body)
     # The workspace path itself is never handed to the client.
     assert job["workspace_path"] not in json.dumps(body)
+
+
+def test_pipeline_does_not_run_on_the_event_loop(workflow_client, monkeypatch):
+    """The synchronous pipeline must execute off the event loop.
+
+    `run_offline_pipeline` imports the dataset, runs every stage and commits,
+    all synchronously. Executing it on the loop stalls every other endpoint for
+    the whole run, which is what made status and pause unusable during a real
+    job.
+
+    The discriminator is `asyncio.get_running_loop()`: called on the loop thread
+    it returns the loop, while a worker thread created by `asyncio.to_thread`
+    has no running loop and raises. Comparing thread ids would not work here,
+    because TestClient already drives the app from its own thread.
+    """
+    import asyncio
+
+    client, root, _input_root = workflow_client
+    observed: dict[str, bool] = {}
+
+    import backend.tagger2.workflow.pipeline as pipeline_module
+
+    real_pipeline = pipeline_module.run_offline_pipeline
+
+    def _recording_pipeline(*args, **kwargs):
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            observed["on_event_loop"] = False
+        else:
+            observed["on_event_loop"] = True
+        return real_pipeline(*args, **kwargs)
+
+    monkeypatch.setattr(pipeline_module, "run_offline_pipeline", _recording_pipeline)
+
+    (root / "input" / "sample.txt").write_text("solo", encoding="utf-8")
+    Image.new("RGB", (32, 32), color="white").save(root / "input" / "sample.png")
+
+    config = {
+        "profile": "e621",
+        "work_mode": "full_copy",
+        "overwrite_mode": "incremental",
+        "source_root": {"root_id": "wfinput", "relative_path": ""},
+        "output_root": {"root_id": "wfoutput", "relative_path": ""},
+        "caption": {"enabled": False},
+        "classify": {"enabled": False},
+        "replace": {"enabled": False},
+        "ocr": {"enabled": False},
+        "nl": {"enabled": False},
+        "token_budget": {"enabled": False},
+        "export": {"format": "json"},
+    }
+
+    created = client.post("/api/v1/workflows/jobs", json={"config": config})
+    assert created.status_code == 200, created.text
+
+    assert observed, "pipeline was never invoked"
+    assert observed["on_event_loop"] is False, (
+        "pipeline ran on the event loop, which blocks every other request"
+    )
 
 
 def test_lifecycle_unknown_job_is_404(workflow_client):

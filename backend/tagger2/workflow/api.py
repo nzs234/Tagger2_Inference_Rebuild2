@@ -313,6 +313,7 @@ def create_workflow_router(
         from .pipeline import run_offline_pipeline
         from .count_review import CountReviewStore
         from .token_budget_review import TokenBudgetReviewStore
+        import asyncio
         import traceback
     
         try:
@@ -409,7 +410,7 @@ def create_workflow_router(
                 from .ocr import PaddleOCREngine
 
                 try:
-                    ocr_engine = PaddleOCREngine()
+                    ocr_engine = await asyncio.to_thread(PaddleOCREngine)
                 except RuntimeError:
                     ocr_engine = None
 
@@ -419,7 +420,8 @@ def create_workflow_router(
             # Token counter passed through if available
             token_counter_arg = token_counter if config.token_budget.get("enabled") else None
 
-            report = run_offline_pipeline(
+            report = await asyncio.to_thread(
+                run_offline_pipeline,
                 config,
                 source_root=source_path,
                 output_root=output_path,
