@@ -14,7 +14,6 @@ from .contracts import WorkflowJobConfigV1, utc_now
 from .db import WorkflowDatabase, default_workflow_database_path
 from .preflight import WorkflowPreflightError, WorkflowPreflightService
 from .resources import WorkflowResourceCatalog
-from .policy_config_parser import parse_policy_config
 
 
 def _build_public_error_codes() -> dict[type, str]:
@@ -353,15 +352,10 @@ def create_workflow_router(
             # Wire up resources from catalog
             replacement_index_path = None
             if config.replace.get("enabled"):
-                # Use the replacement index specified in the job config
-                replace_resource_id = str(config.replace.get("resource_id", ""))
-                if not replace_resource_id:
-                    raise ValueError("replace stage is enabled but no resource_id was configured")
-                replacement_index_path = resource_catalog.get_resource_path(replace_resource_id)
+                # Use the designated e621 replacement index
+                replacement_index_path = resource_catalog.get_resource_path("e621-replacement-index-v1")
                 if replacement_index_path is None:
-                    raise ValueError(
-                        f"replace stage is enabled but the replacement index is not registered: {replace_resource_id}"
-                    )
+                    raise ValueError("replace stage enabled but e621-replacement-index-v1 not found in catalog")
             
             # Wire up tag predictor from inference engine
             tag_predictor = None
@@ -420,13 +414,8 @@ def create_workflow_router(
                 except RuntimeError:
                     ocr_engine = None
 
-            # Policy config converted to dataclass if enabled
-            policy_config_arg = None
-            if config.policy.get("enabled"):
-                try:
-                    policy_config_arg = parse_policy_config(config.policy)
-                except Exception as exc:
-                    raise ValueError(f"invalid policy configuration: {exc}") from exc
+            # Policy config passed through if enabled
+            policy_config_arg = config.policy if config.policy.get("enabled") else None
 
             # Token counter passed through if available
             token_counter_arg = token_counter if config.token_budget.get("enabled") else None
