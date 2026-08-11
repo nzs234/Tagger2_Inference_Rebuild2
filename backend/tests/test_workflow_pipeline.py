@@ -357,6 +357,86 @@ def test_commit_refuses_staged_file_changed_after_validation():
         assert not (dataset / "a.json").exists()
 
 
+def test_commit_rolls_back_already_written_files_on_partial_failure():
+    """A failure partway through must not leave a half-updated dataset.
+
+    Previously the loop promoted files one by one and re-raised on the first
+    failure, so earlier files stayed committed and the dataset matched neither
+    the old nor the new state.
+    """
+    from backend.tagger2.workflow.commit import (
+        CommitError,
+        CommitJournal,
+        ExportStaging,
+        commit_staged_files,
+    )
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+        dataset = root / "dataset"
+        dataset.mkdir()
+
+        # One target already exists (it will be overwritten) and one is new.
+        (dataset / "existing.json").write_bytes(b'{"version": "original"}')
+
+        staging = ExportStaging(root / "staging")
+        first = staging.stage("existing.json", b'{"version": "updated"}')
+        second = staging.stage("fresh.json", b'{"version": "new"}')
+        third = staging.stage("broken.json", b'{"version": "doomed"}')
+
+        # Make the third file fail its post-validation digest check, so the
+        # failure lands after the first two were already promoted.
+        staging.staged_path("broken.json").write_bytes(b'{"version": "tampered"}')
+
+        with pytest.raises(CommitError):
+            commit_staged_files(
+                dataset,
+                staging,
+                [first, second, third],
+                CommitJournal(root / "journal.jsonl"),
+            )
+
+        # The pre-existing file is byte-identical to before the commit.
+        assert (dataset / "existing.json").read_bytes() == b'{"version": "original"}'
+        # The file this commit created is gone again.
+        assert not (dataset / "fresh.json").exists()
+        assert not (dataset / "broken.json").exists()
+
+        # The journal records the rollback rather than only the failure.
+        events = [
+            entry["event"]
+            for entry in CommitJournal(root / "journal.jsonl").entries()
+        ]
+        assert "commit_failed" in events
+        assert "commit_rolled_back" in events
+
+
+def test_successful_commit_discards_the_undo_sidecars():
+    """A clean commit leaves no displaced originals behind."""
+    from backend.tagger2.workflow.commit import (
+        CommitJournal,
+        ExportStaging,
+        commit_staged_files,
+    )
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+        dataset = root / "dataset"
+        dataset.mkdir()
+        (dataset / "a.json").write_bytes(b'{"v": 1}')
+
+        staging = ExportStaging(root / "staging")
+        staged = staging.stage("a.json", b'{"v": 2}')
+
+        committed = commit_staged_files(
+            dataset, staging, [staged], CommitJournal(root / "journal.jsonl")
+        )
+
+        assert committed == 1
+        assert (dataset / "a.json").read_bytes() == b'{"v": 2}'
+        assert not (root / "staging.undo").exists()
+
+
 def test_alpha_images_composite_onto_white():
     """RGBA input is composited on white rather than losing its alpha silently."""
     from backend.tagger2.workflow.dataset_import import load_normalized_image

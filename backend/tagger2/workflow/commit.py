@@ -18,7 +18,7 @@ import tempfile
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Any, Iterable, Sequence
 
 from .contracts import utc_now
 
@@ -109,13 +109,13 @@ def write_annotation_backup(
                 raise CommitError("backup verification failed")
             with archive.open("manifest.jsonl") as manifest:
                 for raw in manifest:
-                    entry = json.loads(raw.decode("utf-8"))
-                    if not entry["exists"]:
+                    recorded: dict[str, Any] = json.loads(raw.decode("utf-8"))
+                    if not recorded["exists"]:
                         continue
-                    info = archive.getinfo(entry["path"])
-                    if info.file_size != entry["size"]:
+                    info = archive.getinfo(str(recorded["path"]))
+                    if info.file_size != recorded["size"]:
                         raise CommitError("backup verification failed")
-                    if sha256_bytes(archive.read(info)) != entry["sha256"]:
+                    if sha256_bytes(archive.read(info)) != recorded["sha256"]:
                         raise CommitError("backup verification failed")
 
         os.replace(partial, target)
@@ -254,6 +254,12 @@ def commit_staged_files(
 
     journal.append({"event": "commit_started", "files": len(staged)})
     committed = 0
+    # Prior state of every target this call touches, so a later failure can be
+    # undone. The displaced file is renamed aside rather than buffered, which
+    # keeps memory flat when the staged set includes images. `None` means the
+    # target did not exist and must be removed again on rollback.
+    undo: list[tuple[Path, Path | None]] = []
+    undo_root = staging.staging_root.parent / f"{staging.staging_root.name}.undo"
     try:
         for item in staged:
             source = staging.staged_path(item.relative_path)
@@ -264,6 +270,7 @@ def commit_staged_files(
                 raise CommitError(f"staged file changed after validation: {item.relative_path}")
 
             target = dataset_root / Path(item.relative_path.replace("/", os.sep))
+            undo.append((target, _displace_for_undo(target, undo_root, len(undo))))
             _atomic_write(target, data)
             committed += 1
             journal.append(
@@ -275,10 +282,88 @@ def commit_staged_files(
             )
     except Exception as exc:
         journal.append({"event": "commit_failed", "committed": committed, "error": str(exc)})
+        # A partial commit leaves the dataset in a state that matches neither
+        # the old nor the new dataset, so undo what this call already wrote.
+        rolled_back, rollback_errors = _rollback_committed(undo)
+        journal.append(
+            {
+                "event": "commit_rolled_back",
+                "restored": rolled_back,
+                "failed": rollback_errors,
+            }
+        )
+        if rollback_errors:
+            # The dataset is now neither old nor new and cannot be repaired
+            # here; say so instead of reporting a plain commit failure.
+            raise CommitError(
+                f"commit failed and rollback was incomplete: {exc};"
+                f" {len(rollback_errors)} file(s) could not be restored"
+            ) from exc
         raise
 
     journal.append({"event": "commit_completed", "committed": committed})
+    _discard_undo(undo_root)
     return committed
+
+
+def _discard_undo(undo_root: Path) -> None:
+    """Drop the displaced originals after a successful commit."""
+
+    if not undo_root.is_dir():
+        return
+    for child in undo_root.iterdir():
+        try:
+            child.unlink()
+        except OSError:
+            pass
+    try:
+        undo_root.rmdir()
+    except OSError:
+        # Leftover sidecars are inert; the next run uses a fresh index.
+        pass
+
+
+def _displace_for_undo(target: Path, undo_root: Path, index: int) -> Path | None:
+    """Move an existing target aside so a failed commit can put it back.
+
+    Returns the sidecar path holding the previous content, or `None` when the
+    target did not exist. Renaming keeps memory flat regardless of file size,
+    and the sidecar lives next to the staging tree so it shares a filesystem
+    with the dataset in the normal layout.
+    """
+
+    if not target.is_file():
+        return None
+    undo_root.mkdir(parents=True, exist_ok=True)
+    sidecar = undo_root / f"{index:08d}_{target.name}"
+    os.replace(target, sidecar)
+    return sidecar
+
+
+def _rollback_committed(
+    undo: Sequence[tuple[Path, Path | None]],
+) -> tuple[int, list[str]]:
+    """Undo the writes of a failed commit, newest first.
+
+    Returns the number of restored entries and the paths that could not be
+    restored. Every entry is attempted even if one fails, so a single stubborn
+    file does not strand the rest of the dataset.
+    """
+
+    restored = 0
+    failures: list[str] = []
+    for target, sidecar in reversed(list(undo)):
+        try:
+            if sidecar is None:
+                # The commit created this file, so removing it restores the
+                # original state.
+                target.unlink(missing_ok=True)
+            else:
+                os.replace(sidecar, target)
+            restored += 1
+        except OSError:
+            failures.append(str(target))
+    return restored, failures
 
 
 __all__ = [
