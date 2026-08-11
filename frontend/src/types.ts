@@ -399,3 +399,64 @@ export interface WorkflowPreflightReport {
   errors: string[]
   warnings: string[]
 }
+
+export interface WorkflowCountDecision {
+  sample_id: number
+  count_value: string
+  status: 'pending' | 'confirmed'
+  updated_at: string
+  version: number
+  proposed_count: string
+  base_value: string
+  selected_source: string
+  original_normalized: string | null
+  wiki_value: string | null
+  matched_tags: string[]
+  conflict: boolean
+  issue_codes: string[]
+  warnings: string[]
+  applied_lower_bounds: string[]
+  blocking_code: string | null
+  relative_image_path: string
+  nl_observation: Record<string, unknown>
+}
+
+export interface WorkflowCountReviewPage {
+  items: WorkflowCountDecision[]
+  pending: number
+}
+
+export interface WorkflowRepairReport {
+  job_id: string
+  reclaimed_samples: number
+  parked_samples: number
+  committed_files: number
+  journal_state: string
+  resumable_samples: number
+}
+
+export type WorkflowTokenReviewStatus =
+  | 'overflow'
+  | 'edited'
+  | 'recounted'
+  | 'rewritten'
+  | 'applied'
+
+export type WorkflowTokenReviewAction = 'edit' | 'recount' | 'rewrite_short' | 'apply'
+
+export interface WorkflowTokenReviewItem {
+  sample_id: number
+  nl_text: string
+  token_count: number
+  token_limit: number
+  status: WorkflowTokenReviewStatus
+  proposal_text: string | null
+  proposal_token_count: number | null
+  over_by: number
+  updated_at: string
+}
+
+export interface WorkflowTokenReviewPage {
+  items: WorkflowTokenReviewItem[]
+  unresolved: number
+}

@@ -1,4 +1,4 @@
-"""Tests for policy and token budget wired into the pipeline."""
+﻿"""Tests for policy and token budget wired into the pipeline."""
 
 import json
 import tempfile
@@ -256,6 +256,58 @@ def test_pipeline_token_budget_empty_payload_is_overflow():
         assert report.committed_files == 0
         assert report.token_budget.get("overflow") == 1
         assert any(issue.code == "token_budget_overflow" for issue in report.issues)
+
+
+
+def test_pipeline_overflow_seeds_token_budget_review():
+    """The overflow report is exactly what token budget review needs to seed."""
+    import tempfile as _tempfile
+
+    from backend.tagger2.workflow.db import WorkflowDatabase
+    from backend.tagger2.workflow.pipeline import run_offline_pipeline
+    from backend.tagger2.workflow.token_budget_review import TokenBudgetReviewStore
+
+    with _tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+        source, output = root / "src", root / "out"
+        source.mkdir()
+        output.mkdir()
+        _image(source / "a.png")
+        (source / "a.txt").write_text("male, anthro, forest", encoding="utf-8")
+
+        report = run_offline_pipeline(
+            _config(token_budget={"enabled": True, "max_tokens": 2}),
+            source_root=source,
+            output_root=output,
+            workspace=root / "ws",
+            token_counter=lambda texts: [len(t.decode("utf-8").split()) + 5 for t in texts],
+        )
+
+        assert report.token_overflows, "an overflow must be reported for review"
+        entry = report.token_overflows[0]
+        assert entry["token_limit"] == 2
+        assert entry["token_count"] > entry["token_limit"]
+        # The serialized dict form carries the same rows for the API layer.
+        assert report.as_dict()["token_overflows"] == report.token_overflows
+
+        database = WorkflowDatabase(root / "workflows.sqlite3")
+        job_id, _workspace = database.create_job(
+            config_json={},
+            config_hash="h",
+            profile="e621",
+            work_mode="full_copy",
+            overwrite_mode="incremental",
+            source_root_id="in",
+            output_root_id="out",
+            workspace_root=root / "jobs",
+        )
+        for item in report.token_overflows:
+            database.create_sample(job_id, item["sample_id"], item["relative_image_path"], "png")
+
+        store = TokenBudgetReviewStore(database, job_id)
+        assert store.initialize(report.token_overflows) == len(report.token_overflows)
+        # Export stays blocked until a human resolves the overflow.
+        assert store.unresolved_count() == len(report.token_overflows)
 
 
 if __name__ == "__main__":

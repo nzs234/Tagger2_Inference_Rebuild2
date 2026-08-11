@@ -389,3 +389,124 @@ def test_lifecycle_unknown_job_is_404(workflow_client):
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+def _seed_token_review(client, root, runtime):
+    """Create a job with one overflowing caption awaiting review."""
+    from backend.tagger2.workflow.token_budget_review import TokenBudgetReviewStore
+
+    database = runtime.workflow_database
+    job_id, _workspace = database.create_job(
+        config_json={},
+        config_hash="h",
+        profile="e621",
+        work_mode="full_copy",
+        overwrite_mode="incremental",
+        source_root_id="wfinput",
+        output_root_id="wfoutput",
+        workspace_root=root / "jobs",
+    )
+    database.create_sample(job_id, 0, "a.png", "png")
+    TokenBudgetReviewStore(database, job_id).initialize(
+        [{"sample_id": 0, "nl_text": "a b c d e", "token_count": 5, "token_limit": 3}]
+    )
+    return job_id
+
+
+def test_token_review_lists_overflowing_samples(workflow_client):
+    """The review page reports the caption, the budget and the margin."""
+    client, root, _input_root = workflow_client
+    runtime = client.app.state.runtime
+    job_id = _seed_token_review(client, root, runtime)
+
+    response = client.get(f"/api/v1/workflows/jobs/{job_id}/token-review")
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["unresolved"] == 1
+    (item,) = body["items"]
+    assert item["status"] == "overflow"
+    assert item["token_limit"] == 3
+    assert item["over_by"] == 2
+    assert item["proposal_text"] is None
+    # No absolute server path is exposed.
+    assert str(root) not in response.text
+
+
+def test_token_review_counting_actions_fail_closed_without_a_tokenizer(workflow_client):
+    """Without the tokenizer resource the API reports unavailable, not a guess."""
+    client, root, _input_root = workflow_client
+    runtime = client.app.state.runtime
+    job_id = _seed_token_review(client, root, runtime)
+
+    response = client.post(
+        f"/api/v1/workflows/jobs/{job_id}/token-review/review",
+        json={"sample_id": 0, "action": "edit", "expected_status": "overflow", "text": "a b"},
+    )
+    assert response.status_code == 503
+    assert response.json()["code"] == "token_review_unavailable"
+
+    # The gate stays closed, so export cannot proceed.
+    confirm = client.post(
+        f"/api/v1/workflows/jobs/{job_id}/token-review/confirm",
+        json={"confirmed": True},
+    )
+    assert confirm.status_code == 409
+    assert confirm.json()["code"] == "token_review_incomplete"
+
+
+def test_token_review_rejects_unknown_actions_and_missing_jobs(workflow_client):
+    """The action vocabulary is closed and an unknown job is a 404."""
+    client, root, _input_root = workflow_client
+    runtime = client.app.state.runtime
+    job_id = _seed_token_review(client, root, runtime)
+
+    bad = client.post(
+        f"/api/v1/workflows/jobs/{job_id}/token-review/review",
+        json={"sample_id": 0, "action": "truncate", "expected_status": "overflow"},
+    )
+    assert bad.status_code == 422
+
+    missing = client.get("/api/v1/workflows/jobs/nope/token-review")
+    assert missing.status_code == 404
+    assert missing.json()["code"] == "job_not_found"
+
+
+def test_token_review_apply_flow_clears_the_gate(workflow_client):
+    """A counted proposal can be applied, and only then is export unblocked."""
+    from backend.tagger2.workflow.token_budget_review import TokenBudgetReviewStore
+
+    client, root, _input_root = workflow_client
+    runtime = client.app.state.runtime
+    job_id = _seed_token_review(client, root, runtime)
+
+    # Record the proposal directly: the HTTP edit path needs a tokenizer, which
+    # is deliberately absent in this deployment.
+    store = TokenBudgetReviewStore(runtime.workflow_database, job_id)
+    store.review(
+        0,
+        action="edit",
+        expected_status="overflow",
+        text="a b",
+        count_tokens=lambda texts: [2 for _ in texts],
+    )
+
+    applied = client.post(
+        f"/api/v1/workflows/jobs/{job_id}/token-review/review",
+        json={"sample_id": 0, "action": "apply", "expected_status": "edited"},
+    )
+    assert applied.status_code == 200, applied.text
+    assert applied.json()["nl_text"] == "a b"
+
+    stale = client.post(
+        f"/api/v1/workflows/jobs/{job_id}/token-review/review",
+        json={"sample_id": 0, "action": "apply", "expected_status": "edited"},
+    )
+    assert stale.status_code == 409
+    assert stale.json()["code"] == "token_review_conflict"
+
+    confirm = client.post(
+        f"/api/v1/workflows/jobs/{job_id}/token-review/confirm",
+        json={"confirmed": True},
+    )
+    assert confirm.status_code == 200, confirm.text
+    assert confirm.json()["unresolved"] == 0

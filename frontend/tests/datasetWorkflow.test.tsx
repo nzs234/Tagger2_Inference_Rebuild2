@@ -1,4 +1,4 @@
-import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+﻿import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { DatasetWorkflow } from '../src/pages/DatasetWorkflow'
@@ -103,5 +103,314 @@ describe('DatasetWorkflow page', () => {
     renderPage()
     const create = screen.getByRole('button', { name: '创建任务' })
     expect(create).toBeDisabled()
+  })
+})
+
+describe('DatasetWorkflow count review and job controls', () => {
+  const decision = {
+    sample_id: 7,
+    count_value: 'duo',
+    status: 'pending',
+    updated_at: '2026-08-11T00:00:00Z',
+    version: 3,
+    proposed_count: 'duo',
+    base_value: 'solo',
+    selected_source: 'rules',
+    original_normalized: 'solo',
+    wiki_value: null,
+    matched_tags: ['duo', 'two_characters'],
+    conflict: true,
+    issue_codes: [],
+    warnings: [],
+    applied_lower_bounds: [],
+    blocking_code: null,
+    relative_image_path: 'set-a/img-0007.png',
+    nl_observation: {},
+  }
+
+  let posts: { url: string; body: unknown }[] = []
+  let pending = 1
+
+  beforeEach(() => {
+    posts = []
+    pending = 1
+    usePreferences.setState({ workflowLanguage: 'zh' })
+    vi.spyOn(globalThis, 'fetch').mockImplementation(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input)
+        const json = (body: unknown, status = 200) =>
+          new Response(JSON.stringify(body), {
+            status,
+            headers: { 'Content-Type': 'application/json' },
+          })
+        if (init?.method === 'POST') {
+          posts.push({ url, body: init.body ? JSON.parse(String(init.body)) : null })
+          if (url.includes('/count-review/resolve')) {
+            pending = 0
+            return json({ sample_id: 7, count_value: 'duo', version: 4 })
+          }
+          if (url.includes('/count-review/confirm')) {
+            return json({ job_id: 'job-1', confirmed: true, pending: 0 })
+          }
+          if (url.includes('/repair')) {
+            return json({
+              job_id: 'job-1',
+              reclaimed_samples: 2,
+              parked_samples: 1,
+              committed_files: 5,
+              journal_state: 'validated',
+              resumable_samples: 3,
+            })
+          }
+          return json({ job_id: 'job-1', status: 'paused' })
+        }
+        if (url.includes('/count-review')) {
+          return json({ items: [{ ...decision, status: pending ? 'pending' : 'confirmed' }], pending })
+        }
+        if (url.includes('/token-review')) return json({ items: [], unresolved: 0 })
+        if (url.includes('/issues')) return json([])
+        if (url.includes('/workflows/capabilities')) {
+          return json({ profiles: ['e621'], work_modes: ['in_place', 'full_copy'], resources: [] })
+        }
+        if (url.includes('/workflows/resources')) return json([])
+        if (url.includes('/workflows/jobs')) {
+          return json([
+            {
+              job_id: 'job-1',
+              status: 'running',
+              profile: 'e621',
+              processed_samples: 4,
+              total_samples: 9,
+              current_module_id: 'classify',
+              created_at: '2026-08-11T00:00:00Z',
+            },
+            {
+              job_id: 'job-2',
+              status: 'paused',
+              profile: 'e621',
+              processed_samples: 0,
+              total_samples: 3,
+              current_module_id: null,
+              created_at: '2026-08-11T01:00:00Z',
+            },
+          ])
+        }
+        if (url.includes('/roots')) {
+          return json({ items: [{ id: 'in', name: 'Input', kind: 'input', writable: false }] })
+        }
+        return json({})
+      },
+    )
+  })
+
+  afterEach(() => {
+    cleanup()
+    vi.restoreAllMocks()
+    usePreferences.setState({ workflowLanguage: 'zh' })
+  })
+
+  async function selectJob() {
+    renderPage()
+    const cell = await screen.findByText(/job-1/)
+    fireEvent.click(cell)
+    return cell
+  }
+
+  it('blocks confirmation while any count is still pending', async () => {
+    await selectJob()
+    const confirm = await screen.findByRole('button', { name: /确认完成复核/ })
+    expect(confirm).toBeDisabled()
+    expect(screen.getByText('set-a/img-0007.png')).toBeInTheDocument()
+    // Conflicting sources must be surfaced, not silently resolved.
+    expect(screen.getByText('来源冲突')).toBeInTheDocument()
+  })
+
+  it('sends the stored version so a stale edit is rejected server-side', async () => {
+    await selectJob()
+    const apply = await screen.findByRole('button', { name: /采用 duo/ })
+    fireEvent.click(apply)
+
+    await waitFor(() => {
+      const resolve = posts.find((post) => post.url.includes('/count-review/resolve'))
+      expect(resolve?.body).toEqual({
+        sample_id: 7,
+        expected_version: 3,
+        count: 'duo',
+        source: 'manual',
+      })
+    })
+  })
+
+  it('enables confirmation once nothing is pending', async () => {
+    await selectJob()
+    fireEvent.click(await screen.findByRole('button', { name: /采用 duo/ }))
+
+    await waitFor(async () => {
+      expect(await screen.findByRole('button', { name: /确认完成复核/ })).toBeEnabled()
+    })
+  })
+
+  it('offers only the four count values the API accepts', async () => {
+    await selectJob()
+    await screen.findByRole('button', { name: /采用 duo/ })
+    for (const value of ['solo', 'duo', 'trio', 'group']) {
+      expect(screen.getByRole('button', { name: new RegExp(`采用 ${value}`) })).toBeInTheDocument()
+    }
+    expect(screen.queryByRole('button', { name: /采用 zero/ })).not.toBeInTheDocument()
+  })
+
+  it('pauses a running job and reports repair results', async () => {
+    await selectJob()
+    fireEvent.click(await screen.findByRole('button', { name: /暂停/ }))
+    await waitFor(() => {
+      expect(posts.some((post) => post.url.endsWith('/pause'))).toBe(true)
+    })
+
+    fireEvent.click(screen.getByRole('button', { name: /修复中断/ }))
+    await waitFor(() => {
+      expect(screen.getByLabelText('修复结果')).toBeInTheDocument()
+    })
+    expect(screen.getByText('validated')).toBeInTheDocument()
+  })
+
+  it('drops a repair report when switching to another job', async () => {
+    await selectJob()
+    fireEvent.click(await screen.findByRole('button', { name: /修复中断/ }))
+    await waitFor(() => {
+      expect(screen.getByLabelText('修复结果')).toBeInTheDocument()
+    })
+
+    fireEvent.click(screen.getByText(/job-2/))
+
+    // The report describes job-1, so it must not linger under job-2.
+    await waitFor(() => {
+      expect(screen.queryByLabelText('修复结果')).not.toBeInTheDocument()
+    })
+  })
+
+  it('shows resume instead of pause for a paused job', async () => {
+    renderPage()
+    fireEvent.click(await screen.findByText(/job-2/))
+
+    expect(await screen.findByRole('button', { name: /继续/ })).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /暂停/ })).not.toBeInTheDocument()
+  })
+})
+
+describe('DatasetWorkflow token budget review', () => {
+  const item = {
+    sample_id: 4,
+    nl_text: 'a b c d e',
+    token_count: 5,
+    token_limit: 3,
+    status: 'overflow',
+    proposal_text: null,
+    proposal_token_count: null,
+    over_by: 2,
+    updated_at: '2026-08-11T00:00:00Z',
+  }
+
+  let posts: { url: string; body: unknown }[] = []
+  let tokenizerAvailable = true
+
+  beforeEach(() => {
+    posts = []
+    tokenizerAvailable = true
+    usePreferences.setState({ workflowLanguage: 'zh' })
+    vi.spyOn(globalThis, 'fetch').mockImplementation(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input)
+        const json = (body: unknown, status = 200) =>
+          new Response(JSON.stringify(body), {
+            status,
+            headers: { 'Content-Type': 'application/json' },
+          })
+        if (init?.method === 'POST') {
+          posts.push({ url, body: init.body ? JSON.parse(String(init.body)) : null })
+          if (url.includes('/token-review/review')) {
+            if (!tokenizerAvailable) {
+              return json(
+                { code: 'token_review_unavailable', message: 'no tokenizer' },
+                503,
+              )
+            }
+            return json({ ...item, status: 'edited', proposal_text: 'a b', proposal_token_count: 2 })
+          }
+          return json({})
+        }
+        if (url.includes('/token-review')) return json({ items: [item], unresolved: 1 })
+        if (url.includes('/count-review')) return json({ items: [], pending: 0 })
+        if (url.includes('/issues')) return json([])
+        if (url.includes('/workflows/capabilities')) {
+          return json({ profiles: ['e621'], work_modes: ['in_place', 'full_copy'], resources: [] })
+        }
+        if (url.includes('/workflows/resources')) return json([])
+        if (url.includes('/workflows/jobs')) {
+          return json([
+            {
+              job_id: 'job-1',
+              status: 'running',
+              profile: 'e621',
+              processed_samples: 4,
+              total_samples: 9,
+              current_module_id: 'token_budget',
+              created_at: '2026-08-11T00:00:00Z',
+            },
+          ])
+        }
+        if (url.includes('/roots')) {
+          return json({ items: [{ id: 'in', name: 'Input', kind: 'input', writable: false }] })
+        }
+        return json({})
+      },
+    )
+  })
+
+  afterEach(() => {
+    cleanup()
+    vi.restoreAllMocks()
+    usePreferences.setState({ workflowLanguage: 'zh' })
+  })
+
+  async function selectJob() {
+    renderPage()
+    fireEvent.click(await screen.findByText(/job-1/))
+  }
+
+  it('shows the overflow margin and blocks confirmation', async () => {
+    await selectJob()
+    expect(await screen.findByText('超出')).toBeInTheDocument()
+    const confirm = screen.getByRole('button', { name: /确认完成 Token 复核/ })
+    expect(confirm).toBeDisabled()
+    // The reviewer must know a proposal is not the export value.
+    expect(screen.getByText(/不会写入最终 JSON/)).toBeInTheDocument()
+  })
+
+  it('cannot apply until a proposal exists', async () => {
+    await selectJob()
+    expect(await screen.findByRole('button', { name: /应用候选/ })).toBeDisabled()
+  })
+
+  it('sends the current status so a stale review is rejected server-side', async () => {
+    await selectJob()
+    fireEvent.click(await screen.findByRole('button', { name: /手动改写/ }))
+
+    await waitFor(() => {
+      const review = posts.find((post) => post.url.includes('/token-review/review'))
+      expect(review?.body).toEqual({
+        sample_id: 4,
+        action: 'edit',
+        expected_status: 'overflow',
+        text: 'a b c d e',
+      })
+    })
+  })
+
+  it('reports a missing tokenizer instead of failing silently', async () => {
+    tokenizerAvailable = false
+    await selectJob()
+    fireEvent.click(await screen.findByRole('button', { name: /重新计数/ }))
+
+    expect(await screen.findByText(/未注册 Tokenizer 资源/)).toBeInTheDocument()
   })
 })

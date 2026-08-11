@@ -1,4 +1,4 @@
-"""Offline e621 vertical: import -> replace -> normalize -> export -> commit.
+﻿"""Offline e621 vertical: import -> replace -> normalize -> export -> commit.
 
 The stages implemented here are the deterministic, rule-only ones, so their
 output is reproducible without any model or network access. Caption, OCR, NL,
@@ -80,6 +80,8 @@ class PipelineReport:
     caption: dict[str, int] = field(default_factory=dict)
     policy: dict[str, int] = field(default_factory=dict)
     token_budget: dict[str, int] = field(default_factory=dict)
+    # Overflowing captions, for the caller to seed into token budget review.
+    token_overflows: list[dict[str, Any]] = field(default_factory=list)
     issues: list[StageIssue] = field(default_factory=list)
     backup_path: str | None = None
     resource_fingerprints: dict[str, str] = field(default_factory=dict)
@@ -95,6 +97,7 @@ class PipelineReport:
             "caption": dict(self.caption),
             "policy": dict(self.policy),
             "token_budget": dict(self.token_budget),
+            "token_overflows": [dict(item) for item in self.token_overflows],
             "issues": [
                 {
                     "sample_id": issue.sample_id,
@@ -361,6 +364,15 @@ def run_offline_pipeline(
                             ),
                         )
                     )
+                    report.token_overflows.append(
+                        {
+                            "sample_id": sample.sample_id,
+                            "relative_image_path": sample.relative_image_path,
+                            "nl_text": _safe_flat_txt(projection, policy),
+                            "token_count": int(config.token_budget.get("max_tokens", 225)) + 1,
+                            "token_limit": int(config.token_budget.get("max_tokens", 225)),
+                        }
+                    )
                     budget_counts["overflow"] = budget_counts.get("overflow", 0) + 1
                     report.failed_samples += 1
                     continue
@@ -390,6 +402,17 @@ def run_offline_pipeline(
                                 f" the budget even after trimming"
                             ),
                         )
+                    )
+                    report.token_overflows.append(
+                        {
+                            "sample_id": sample.sample_id,
+                            "relative_image_path": sample.relative_image_path,
+                            "nl_text": _safe_flat_txt(
+                                budget.annotation or projection, policy
+                            ),
+                            "token_count": budget.original_tokens,
+                            "token_limit": int(config.token_budget.get("max_tokens", 225)),
+                        }
                     )
                     report.failed_samples += 1
                     continue
@@ -493,3 +516,16 @@ __all__ = [
     "build_projection",
     "run_offline_pipeline",
 ]
+
+
+def _safe_flat_txt(annotation: dict[str, Any], policy: CaptionDisplayPolicy) -> str:
+    """Flatten a caption for review, tolerating a payload that cannot serialize.
+
+    An overflow row only needs readable text for the reviewer, so a payload that
+    trimming emptied returns "" instead of failing the whole run.
+    """
+
+    try:
+        return serialize_flat_txt(annotation, policy).decode("utf-8", "replace")
+    except (FlatTextSerializationError, TypeError, ValueError):
+        return ""

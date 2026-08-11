@@ -1,12 +1,25 @@
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { AlertTriangle, CheckCircle2, Database, RefreshCw, Upload } from 'lucide-react'
+﻿import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import {
+  AlertTriangle,
+  CheckCircle2,
+  Database,
+  Pause,
+  Play,
+  RefreshCw,
+  Upload,
+  Wrench,
+} from 'lucide-react'
 import { useMemo, useState } from 'react'
 import { Button, EmptyState, Field, Notice, Panel, StatusBadge } from '../components/ui'
-import { api } from '../lib/api'
+import { api, ApiError } from '../lib/api'
 import { copyFor } from '../lib/workflowCopy'
 import { usePreferences } from '../store/app'
 import type {
+  WorkflowCountDecision,
   WorkflowExportFormat,
+  WorkflowRepairReport,
+  WorkflowTokenReviewAction,
+  WorkflowTokenReviewItem,
   WorkflowImportPreview,
   WorkflowPreflightReport,
   WorkflowProfile,
@@ -39,6 +52,9 @@ const emptyDraft: JobDraft = {
   replaceResourceId: '',
 }
 
+// Mirrors COUNT_VALUES in backend/tagger2/workflow/count_review.py; the API rejects anything else.
+const COUNT_VALUES = ['solo', 'duo', 'trio', 'group'] as const
+
 export function DatasetWorkflow() {
   const language = usePreferences((state) => state.workflowLanguage)
   const setLanguage = usePreferences((state) => state.setWorkflowLanguage)
@@ -52,6 +68,10 @@ export function DatasetWorkflow() {
   const [importForm, setImportForm] = useState({ rootId: '', relativePath: '', resourceId: '' })
   const [importPreview, setImportPreview] = useState<WorkflowImportPreview>()
   const [importError, setImportError] = useState<string>()
+  const [countError, setCountError] = useState<string>()
+  const [repair, setRepair] = useState<WorkflowRepairReport>()
+  const [tokenError, setTokenError] = useState<string>()
+  const [tokenDraft, setTokenDraft] = useState<Record<number, string>>({})
 
   const roots = useQuery({ queryKey: ['roots'], queryFn: api.roots, retry: false })
   const resources = useQuery({
@@ -64,6 +84,18 @@ export function DatasetWorkflow() {
     queryFn: () => api.workflowJobs(),
     retry: false,
     refetchInterval: 5_000,
+  })
+  const countReview = useQuery({
+    queryKey: ['workflow', 'count-review', selectedJobId],
+    queryFn: () => api.workflowCountReview(selectedJobId as string, { limit: 50 }),
+    enabled: Boolean(selectedJobId),
+    retry: false,
+  })
+  const tokenReview = useQuery({
+    queryKey: ['workflow', 'token-review', selectedJobId],
+    queryFn: () => api.workflowTokenReview(selectedJobId as string, { limit: 50 }),
+    enabled: Boolean(selectedJobId),
+    retry: false,
   })
   const issues = useQuery({
     queryKey: ['workflow', 'issues', selectedJobId],
@@ -146,6 +178,103 @@ export function DatasetWorkflow() {
     },
     onError: (error: Error) => setImportError(error.message),
   })
+
+  const resolveCount = useMutation({
+    mutationFn: ({ decision, count }: { decision: WorkflowCountDecision; count: string }) =>
+      api.workflowResolveCount(selectedJobId as string, {
+        sample_id: decision.sample_id,
+        expected_version: decision.version,
+        count,
+        source: 'manual',
+      }),
+    onMutate: () => setCountError(undefined),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ['workflow', 'count-review'] })
+    },
+    onError: (error: ApiError) => {
+      // A 409 means someone else changed the row; say so rather than retrying.
+      setCountError(error.status === 409 ? text.countStale : error.message)
+    },
+  })
+
+  const confirmCount = useMutation({
+    mutationFn: () => api.workflowConfirmCount(selectedJobId as string),
+    onMutate: () => setCountError(undefined),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ['workflow', 'count-review'] })
+    },
+    onError: (error: ApiError) => {
+      setCountError(error.status === 409 ? text.countGateBlocked : error.message)
+    },
+  })
+
+  const jobAction = useMutation({
+    mutationFn: (action: 'pause' | 'resume') =>
+      api.workflowJobAction(selectedJobId as string, action),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ['workflow', 'jobs'] })
+    },
+    onError: (error: Error) => setCountError(error.message),
+  })
+
+  const repairJob = useMutation({
+    mutationFn: () => api.workflowRepairJob(selectedJobId as string),
+    onSuccess: (report) => {
+      setRepair(report)
+      void queryClient.invalidateQueries({ queryKey: ['workflow', 'jobs'] })
+    },
+    onError: (error: Error) => setCountError(error.message),
+  })
+
+  const reviewToken = useMutation({
+    mutationFn: ({
+      item,
+      action,
+      text,
+    }: {
+      item: WorkflowTokenReviewItem
+      action: WorkflowTokenReviewAction
+      text?: string
+    }) =>
+      api.workflowReviewToken(selectedJobId as string, {
+        sample_id: item.sample_id,
+        action,
+        expected_status: item.status,
+        ...(text === undefined ? {} : { text }),
+      }),
+    onMutate: () => setTokenError(undefined),
+    onSuccess: () => {
+      setTokenDraft({})
+      void queryClient.invalidateQueries({ queryKey: ['workflow', 'token-review'] })
+    },
+    onError: (error: ApiError) => {
+      // 409 is a stale status, 503 means the tokenizer resource is missing.
+      if (error.status === 409) setTokenError(text.tokenStale)
+      else if (error.status === 503) setTokenError(text.tokenUnavailable)
+      else setTokenError(error.message)
+    },
+  })
+
+  const confirmTokenReview = useMutation({
+    mutationFn: () => api.workflowConfirmTokenReview(selectedJobId as string),
+    onMutate: () => setTokenError(undefined),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ['workflow', 'token-review'] })
+    },
+    onError: (error: ApiError) => setTokenError(error.message),
+  })
+
+  const selectedJob = jobs.data?.find((job) => job.job_id === selectedJobId)
+
+  // A repair report and a review error belong to one job, so clear them on switch.
+  function selectJob(jobId: string) {
+    if (jobId === selectedJobId) return
+    setSelectedJobId(jobId)
+    setRepair(undefined)
+    setCountError(undefined)
+    setTokenError(undefined)
+    setTokenDraft({})
+  }
 
   const canPreflight = Boolean(
     draft.sourceRootId && (draft.workMode === 'in_place' || draft.outputRootId),
@@ -469,7 +598,7 @@ export function DatasetWorkflow() {
               {jobs.data.map((job) => (
                 <tr
                   key={job.job_id}
-                  onClick={() => setSelectedJobId(job.job_id)}
+                  onClick={() => selectJob(job.job_id)}
                   className={job.job_id === selectedJobId ? 'row-active' : ''}
                 >
                   <td className="workflow-mono">{job.job_id.slice(0, 12)}…</td>
@@ -490,6 +619,249 @@ export function DatasetWorkflow() {
           <EmptyState icon={<Database size={20} />} title={text.jobsEmpty} />
         )}
       </Panel>
+
+      {selectedJob && (
+        <Panel title={text.jobControlsTitle} eyebrow={selectedJob.job_id.slice(0, 12)}>
+          {countError && <Notice tone="danger">{countError}</Notice>}
+          <div className="workflow-actions">
+            <StatusBadge state={selectedJob.status} />
+            {selectedJob.status === 'running' && (
+              <Button
+                variant="secondary"
+                onClick={() => jobAction.mutate('pause')}
+                disabled={jobAction.isPending}
+              >
+                <Pause size={15} aria-hidden="true" />
+                {text.pauseJob}
+              </Button>
+            )}
+            {selectedJob.status === 'paused' && (
+              <Button onClick={() => jobAction.mutate('resume')} disabled={jobAction.isPending}>
+                <Play size={15} aria-hidden="true" />
+                {text.resumeJob}
+              </Button>
+            )}
+            <Button
+              variant="quiet"
+              onClick={() => repairJob.mutate()}
+              disabled={repairJob.isPending}
+            >
+              <Wrench size={15} aria-hidden="true" />
+              {text.repairJob}
+            </Button>
+          </div>
+          {repair && (
+            <dl className="workflow-summary" aria-label={text.repairResult}>
+              <div>
+                <dt>{text.reclaimed}</dt>
+                <dd>{repair.reclaimed_samples}</dd>
+              </div>
+              <div>
+                <dt>{text.parked}</dt>
+                <dd>{repair.parked_samples}</dd>
+              </div>
+              <div>
+                <dt>{text.resumableSamples}</dt>
+                <dd>{repair.resumable_samples}</dd>
+              </div>
+              <div>
+                <dt>{text.committedFiles}</dt>
+                <dd>{repair.committed_files}</dd>
+              </div>
+              <div>
+                <dt>{text.journalState}</dt>
+                <dd className="workflow-mono">{repair.journal_state}</dd>
+              </div>
+            </dl>
+          )}
+        </Panel>
+      )}
+
+      {selectedJobId && countReview.data?.items && (
+        <Panel
+          title={text.countReviewTitle}
+          eyebrow={`${text.countReviewPending} ${countReview.data.pending ?? 0}`}
+        >
+          {countError && <Notice tone="danger">{countError}</Notice>}
+          {countReview.data.items.length === 0 ? (
+            <EmptyState icon={<CheckCircle2 size={20} />} title={text.countReviewEmpty} />
+          ) : (
+            <div className="workflow-review-list">
+              {countReview.data.items.map((decision) => (
+                <article key={decision.sample_id} className="workflow-review-card">
+                  <header>
+                    <span className="workflow-mono">{decision.relative_image_path}</span>
+                    {decision.status === 'confirmed' && (
+                      <StatusBadge state={text.countConfirmed} />
+                    )}
+                    {decision.conflict && <Notice tone="warning">{text.countConflict}</Notice>}
+                  </header>
+                  <dl className="workflow-summary">
+                    <div>
+                      <dt>{text.countProposed}</dt>
+                      <dd>{decision.proposed_count || '—'}</dd>
+                    </div>
+                    <div>
+                      <dt>{text.countSource}</dt>
+                      <dd>{decision.selected_source}</dd>
+                    </div>
+                    <div>
+                      <dt>{text.countEvidence}</dt>
+                      <dd>
+                        {[
+                          decision.original_normalized
+                            ? `json:${decision.original_normalized}`
+                            : null,
+                          decision.wiki_value ? `wiki:${decision.wiki_value}` : null,
+                          decision.matched_tags.length
+                            ? `tags:${decision.matched_tags.join(' ')}`
+                            : null,
+                        ]
+                          .filter(Boolean)
+                          .join(' · ') || '—'}
+                      </dd>
+                    </div>
+                  </dl>
+                  <div className="workflow-actions">
+                    {COUNT_VALUES.map((value) => (
+                      <Button
+                        key={value}
+                        variant={value === decision.count_value ? 'primary' : 'secondary'}
+                        onClick={() =>
+                          resolveCount.mutate({ decision, count: value })
+                        }
+                        disabled={resolveCount.isPending}
+                      >
+                        {text.countApply} {value}
+                      </Button>
+                    ))}
+                  </div>
+                </article>
+              ))}
+            </div>
+          )}
+          <div className="workflow-actions">
+            <Button
+              onClick={() => confirmCount.mutate()}
+              disabled={confirmCount.isPending || (countReview.data.pending ?? 0) > 0}
+            >
+              <CheckCircle2 size={15} aria-hidden="true" />
+              {text.countConfirm}
+            </Button>
+          </div>
+        </Panel>
+      )}
+
+      {selectedJobId && tokenReview.data?.items && (
+        <Panel
+          title={text.tokenReviewTitle}
+          eyebrow={`${text.tokenReviewUnresolved} ${tokenReview.data.unresolved ?? 0}`}
+        >
+          {tokenError && <Notice tone="danger">{tokenError}</Notice>}
+          {tokenReview.data.items.length === 0 ? (
+            <EmptyState icon={<CheckCircle2 size={20} />} title={text.tokenReviewEmpty} />
+          ) : (
+            <>
+              <Notice tone="info">{text.tokenNotApplied}</Notice>
+              <div className="workflow-review-list">
+                {tokenReview.data.items.map((item) => (
+                  <article key={item.sample_id} className="workflow-review-card">
+                    <header>
+                      <StatusBadge state={item.status} />
+                      <span className="workflow-mono">#{item.sample_id}</span>
+                    </header>
+                    <dl className="workflow-summary">
+                      <div>
+                        <dt>{text.tokenCount}</dt>
+                        <dd>{item.token_count}</dd>
+                      </div>
+                      <div>
+                        <dt>{text.tokenLimit}</dt>
+                        <dd>{item.token_limit}</dd>
+                      </div>
+                      <div>
+                        <dt>{text.tokenOverBy}</dt>
+                        <dd>{item.over_by}</dd>
+                      </div>
+                      <div>
+                        <dt>{text.tokenProposal}</dt>
+                        <dd>
+                          {item.proposal_text === null
+                            ? '—'
+                            : `${item.proposal_text} (${item.proposal_token_count ?? '?'})`}
+                        </dd>
+                      </div>
+                    </dl>
+                    <Field label={text.tokenCaption}>
+                      <textarea
+                        rows={3}
+                        value={tokenDraft[item.sample_id] ?? item.proposal_text ?? item.nl_text}
+                        onChange={(event) =>
+                          setTokenDraft({ ...tokenDraft, [item.sample_id]: event.target.value })
+                        }
+                      />
+                    </Field>
+                    <div className="workflow-actions">
+                      <Button
+                        variant="secondary"
+                        onClick={() =>
+                          reviewToken.mutate({
+                            item,
+                            action: 'edit',
+                            text: tokenDraft[item.sample_id] ?? item.proposal_text ?? item.nl_text,
+                          })
+                        }
+                        disabled={reviewToken.isPending || item.status === 'applied'}
+                      >
+                        {text.tokenEdit}
+                      </Button>
+                      <Button
+                        variant="secondary"
+                        onClick={() =>
+                          reviewToken.mutate({
+                            item,
+                            action: 'rewrite_short',
+                            text: tokenDraft[item.sample_id] ?? item.proposal_text ?? item.nl_text,
+                          })
+                        }
+                        disabled={reviewToken.isPending || item.status === 'applied'}
+                      >
+                        {text.tokenRewriteShort}
+                      </Button>
+                      <Button
+                        variant="quiet"
+                        onClick={() => reviewToken.mutate({ item, action: 'recount' })}
+                        disabled={reviewToken.isPending || item.status === 'applied'}
+                      >
+                        {text.tokenRecount}
+                      </Button>
+                      <Button
+                        onClick={() => reviewToken.mutate({ item, action: 'apply' })}
+                        disabled={
+                          reviewToken.isPending ||
+                          item.status === 'applied' ||
+                          item.proposal_text === null
+                        }
+                      >
+                        {text.tokenApply}
+                      </Button>
+                    </div>
+                  </article>
+                ))}
+              </div>
+            </>
+          )}
+          <div className="workflow-actions">
+            <Button
+              onClick={() => confirmTokenReview.mutate()}
+              disabled={confirmTokenReview.isPending || (tokenReview.data.unresolved ?? 0) > 0}
+            >
+              <CheckCircle2 size={15} aria-hidden="true" />
+              {text.tokenConfirm}
+            </Button>
+          </div>
+        </Panel>
+      )}
 
       {selectedJobId && (
         <Panel title={text.issuesTitle} eyebrow={selectedJobId.slice(0, 12)}>
@@ -529,3 +901,5 @@ export function DatasetWorkflow() {
     </div>
   )
 }
+
+

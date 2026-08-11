@@ -1,8 +1,7 @@
-"""Workflow API routes."""
+﻿"""Workflow API routes."""
 
-from __future__ import annotations
-
-from typing import Any
+from fastapi import APIRouter, HTTPException, BackgroundTasks
+from typing import Any, Callable, Literal, Sequence
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
@@ -66,6 +65,15 @@ class WorkflowCountConfirmRequest(BaseModel):
     confirmed: bool
 
 
+class WorkflowTokenReviewRequest(BaseModel):
+    """Record one token budget review action for a sample."""
+
+    sample_id: int
+    action: Literal["edit", "recount", "rewrite_short", "apply"]
+    expected_status: Literal["overflow", "edited", "recounted", "rewritten", "applied"]
+    text: str | None = None
+
+
 class WorkflowResourceImportRequest(BaseModel):
     """Request to preview or apply a resource import.
 
@@ -114,8 +122,14 @@ def create_workflow_router(
     allowlist: PathAllowlist,
     resource_catalog: WorkflowResourceCatalog,
     database: WorkflowDatabase | None = None,
+    token_counter: Callable[[Sequence[str]], Sequence[int]] | None = None,
 ) -> APIRouter:
-    """Create workflow API router."""
+    """Create workflow API router.
+
+    ``token_counter`` stays optional because the tokenizer resource is not
+    bundled. Without it the token review actions that need a count fail closed
+    with ``token_review_unavailable`` instead of guessing a length.
+    """
     
     router = APIRouter(prefix="/api/v1/workflows", tags=["workflows"])
 
@@ -123,6 +137,91 @@ def create_workflow_router(
         database = WorkflowDatabase(default_workflow_database_path())
 
     preflight_service = WorkflowPreflightService(allowlist, resource_catalog)
+    async def _execute_job_async(job_id: str) -> None:
+        """Execute a workflow job in the background, updating status and seeding reviews."""
+        from .lifecycle import JobLifecycle
+        from .pipeline import run_offline_pipeline
+        from .count_review import CountReviewStore
+        from .token_budget_review import TokenBudgetReviewStore
+        import traceback
+    
+        try:
+            job = database.get_job(job_id)
+            if job is None:
+                return
+    
+            lifecycle = JobLifecycle(database, job_id)
+            lifecycle.transition_to("running")
+    
+            config = WorkflowJobConfigV1.from_payload(job["config"])
+            workspace = Path(job["workspace"])
+    
+            # Resolve physical paths from root references
+            source_path = None
+            output_path = None
+            try:
+                source_ref = allowlist.resolve(
+                    config.source_root.root_id, config.source_root.relative_path
+                )
+                source_path = Path(source_ref)
+                if config.output_root:
+                    output_ref = allowlist.resolve(
+                        config.output_root.root_id, config.output_root.relative_path
+                    )
+                    output_path = Path(output_ref)
+                elif config.work_mode == "in_place":
+                    output_path = source_path
+                else:
+                    raise ValueError("full_copy requires output_root")
+            except PathNotAllowedError as exc:
+                lifecycle.transition_to("failed")
+                database.update_job(job_id, error_message=f"path not allowed: {exc}")
+                return
+    
+            # TODO: wire up replacement_index, tag_predictor, policy_config, token_counter
+            # from resource catalog when resources are registered
+            report = run_offline_pipeline(
+                config,
+                source_root=source_path,
+                output_root=output_path,
+                workspace=workspace,
+            )
+    
+            # Seed count review if decisions exist
+            if report.count_decisions:
+                count_store = CountReviewStore(database, job_id)
+                count_store.initialize(report.count_decisions)
+    
+            # Seed token review if overflows exist
+            if report.token_overflows:
+                token_store = TokenBudgetReviewStore(database, job_id)
+                token_store.initialize(report.token_overflows)
+    
+            # Mark completed or failed based on blocking issues
+            has_blocking = any(
+                issue.get("blocking", False) for issue in report.issues
+            )
+            final_status = "failed" if has_blocking else "completed"
+            lifecycle.transition_to(final_status)
+    
+            if report.issues:
+                database.update_job(
+                    job_id,
+                    error_message=f"{len(report.issues)} issue(s) recorded",
+                )
+    
+        except Exception as exc:
+            try:
+                lifecycle = JobLifecycle(database, job_id)
+                lifecycle.transition_to("failed")
+                database.update_job(
+                        job_id,
+                        error_message=f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}",
+                    )
+            except Exception:
+                pass  # Already failed, no need to propagate
+    
+
 
     @router.get("/capabilities")
     async def get_capabilities() -> dict[str, Any]:
@@ -388,6 +487,97 @@ def create_workflow_router(
             ) from exc
         return {"job_id": job_id, "confirmed": True, "pending": 0}
 
+
+    def _token_store(job_id: str):
+        from .token_budget_review import TokenBudgetReviewStore
+
+        job = database.get_job(job_id)
+        if job is None:
+            raise HTTPException(
+                status_code=404,
+                detail={"code": "job_not_found", "message": f"unknown job: {job_id}"},
+            )
+        return TokenBudgetReviewStore(database, job_id)
+
+    @router.get("/jobs/{job_id}/token-review")
+    async def list_token_review(
+        job_id: str,
+        limit: int = 50,
+        offset: int = 0,
+        unresolved_only: bool = False,
+    ) -> dict[str, Any]:
+        """Page through captions that overflow the token budget."""
+        store = _token_store(job_id)
+        return {
+            "items": store.page(limit=limit, offset=offset, unresolved_only=unresolved_only),
+            "unresolved": store.unresolved_count(),
+        }
+
+    @router.post("/jobs/{job_id}/token-review/review")
+    async def review_token_budget(
+        job_id: str,
+        request: WorkflowTokenReviewRequest,
+    ) -> dict[str, Any]:
+        """Record one review action, rejecting a stale status."""
+        from .token_budget_review import (
+            TokenBudgetReviewConflictError,
+            TokenBudgetReviewError,
+        )
+
+        store = _token_store(job_id)
+        if token_counter is None and request.action != "apply":
+            # No tokenizer resource, so report unavailable rather than guess.
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "code": "token_review_unavailable",
+                    "message": "no tokenizer resource is registered, so captions cannot be counted",
+                },
+            )
+        try:
+            return store.review(
+                request.sample_id,
+                action=request.action,
+                expected_status=request.expected_status,
+                text=request.text,
+                count_tokens=token_counter,
+            )
+        except TokenBudgetReviewConflictError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "token_review_conflict", "message": str(exc)},
+            ) from exc
+        except TokenBudgetReviewError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail={"code": "token_review_invalid", "message": str(exc)},
+            ) from exc
+
+    @router.post("/jobs/{job_id}/token-review/confirm")
+    async def confirm_token_review(
+        job_id: str,
+        request: WorkflowCountConfirmRequest,
+    ) -> dict[str, Any]:
+        """Gate export on every overflow having been applied."""
+        from .token_budget_review import TokenBudgetReviewError
+
+        if not request.confirmed:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "code": "token_review_not_confirmed",
+                    "message": "explicit token budget review confirmation is required",
+                },
+            )
+        store = _token_store(job_id)
+        try:
+            store.assert_ready_for_export()
+        except TokenBudgetReviewError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "token_review_incomplete", "message": str(exc)},
+            ) from exc
+        return {"job_id": job_id, "confirmed": True, "unresolved": 0}
     @router.post("/jobs/preflight")
     async def preflight_job(config: dict[str, Any]) -> dict[str, Any]:
         """Validate job configuration before creation."""
@@ -404,7 +594,7 @@ def create_workflow_router(
             ) from exc
 
     @router.post("/jobs", response_model=WorkflowJobCreateResponse)
-    async def create_job(request: WorkflowJobCreateRequest) -> WorkflowJobCreateResponse:
+    async def create_job(request: WorkflowJobCreateRequest, background_tasks: BackgroundTasks) -> WorkflowJobCreateResponse:
         """Create a new workflow job."""
         try:
             job_config = WorkflowJobConfigV1.from_payload(request.config)
@@ -425,6 +615,10 @@ def create_workflow_router(
                 output_root_id=job_config.output_root.root_id if job_config.output_root else None,
                 workspace_root=workspace_root,
             )
+            
+            
+            # Start execution in background
+            background_tasks.add_task(_execute_job_async, job_id)
             
             return WorkflowJobCreateResponse(job_id=job_id, status="pending")
         

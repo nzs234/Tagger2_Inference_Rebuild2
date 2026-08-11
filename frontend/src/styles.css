@@ -1,4 +1,4 @@
-:root {
+﻿:root {
   font-family: Inter, "Segoe UI", "Microsoft YaHei UI", "Microsoft YaHei", system-ui, sans-serif;
   color: #1a2421;
   background: #f2f4f2;
@@ -788,13 +788,21 @@ small { font-size: 11px; }
 .workflow-button-row { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 14px; }
 .workflow-table { width: 100%; border-collapse: collapse; font-size: 12px; }
 .workflow-table th,
-.workflow-table td { padding: 8px 10px; text-align: left; border-bottom: 1px solid var(--border); }
+.workflow-table td { padding: 8px 10px; text-align: left; border-bottom: 1px solid var(--line); }
 .workflow-table th { color: var(--muted); font-weight: 600; }
 .workflow-table tbody tr { cursor: pointer; }
 .workflow-table tbody tr:hover { background: var(--surface-2); }
 .workflow-table tbody tr.row-active { background: var(--surface-3); }
 .workflow-mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; }
 .page-dataset-workflow .form-grid { grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); }
+.workflow-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin-top: 14px; }
+.workflow-summary { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 10px 16px; margin: 14px 0 0; }
+.workflow-summary div { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.workflow-summary dt { color: var(--muted); font-size: 11px; font-weight: 600; }
+.workflow-summary dd { margin: 0; font-size: 13px; overflow-wrap: anywhere; }
+.workflow-review-list { display: grid; gap: 12px; margin-top: 14px; }
+.workflow-review-card { background: var(--surface-2); border: 1px solid var(--line); border-radius: 12px; padding: 14px; }
+.workflow-review-card > header { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
 
 @media (max-width: 720px) {
   .page-dataset-workflow .page-heading { flex-direction: column; align-items: stretch; gap: 12px; }

@@ -1,4 +1,4 @@
-import type {
+﻿import type {
   CreateJobRequest,
   ClassifierProfile,
   JobListResponse,
@@ -15,11 +15,17 @@ import type {
   ScanResponse,
   UploadResponse,
   WorkflowCapabilities,
+  WorkflowCountReviewPage,
   WorkflowImportPreview,
   WorkflowIssue,
   WorkflowJobSummary,
   WorkflowPreflightReport,
+  WorkflowRepairReport,
   WorkflowResource,
+  WorkflowTokenReviewAction,
+  WorkflowTokenReviewItem,
+  WorkflowTokenReviewPage,
+  WorkflowTokenReviewStatus,
   Fl2vaSingleImageRole,
   VideoPromptMode,
   VideoPromptPackage,
@@ -214,9 +220,73 @@ export const api = {
     request<WorkflowJobSummary[]>(`/workflows/jobs?limit=${limit}`),
   workflowJob: (id: string) =>
     request<WorkflowJobSummary>(`/workflows/jobs/${encodeURIComponent(id)}`),
+  workflowCountReview: (id: string, params: { limit?: number; offset?: number; pendingOnly?: boolean } = {}) => {
+    const query = new URLSearchParams()
+    if (params.limit !== undefined) query.set('limit', String(params.limit))
+    if (params.offset !== undefined) query.set('offset', String(params.offset))
+    if (params.pendingOnly) query.set('pending_only', 'true')
+    const suffix = query.toString() ? `?${query.toString()}` : ''
+    return request<WorkflowCountReviewPage>(
+      `/workflows/jobs/${encodeURIComponent(id)}/count-review${suffix}`,
+    )
+  },
+  workflowResolveCount: (
+    id: string,
+    body: { sample_id: number; expected_version: number; count: string; source?: string },
+  ) =>
+    request<{ sample_id: number; count_value: string; version: number }>(
+      `/workflows/jobs/${encodeURIComponent(id)}/count-review/resolve`,
+      { method: 'POST', body: JSON.stringify(body) },
+    ),
+  workflowConfirmCount: (id: string) =>
+    request<{ job_id: string; confirmed: boolean; pending: number }>(
+      `/workflows/jobs/${encodeURIComponent(id)}/count-review/confirm`,
+      { method: 'POST', body: JSON.stringify({ confirmed: true }) },
+    ),
+  workflowJobAction: (id: string, action: 'pause' | 'resume') =>
+    request<{ job_id: string; status: string }>(
+      `/workflows/jobs/${encodeURIComponent(id)}/${action}`,
+      { method: 'POST', body: '{}' },
+    ),
+  workflowRepairJob: (id: string) =>
+    request<WorkflowRepairReport>(`/workflows/jobs/${encodeURIComponent(id)}/repair`, {
+      method: 'POST',
+      body: '{}',
+    }),
   workflowIssues: (id: string, blockingOnly = false) =>
     request<WorkflowIssue[]>(
       `/workflows/jobs/${encodeURIComponent(id)}/issues${blockingOnly ? '?blocking_only=true' : ''}`,
+    ),
+  workflowTokenReview: (
+    id: string,
+    params: { limit?: number; offset?: number; unresolvedOnly?: boolean } = {},
+  ) => {
+    const query = new URLSearchParams()
+    if (params.limit !== undefined) query.set('limit', String(params.limit))
+    if (params.offset !== undefined) query.set('offset', String(params.offset))
+    if (params.unresolvedOnly) query.set('unresolved_only', 'true')
+    const suffix = query.toString() ? `?${query.toString()}` : ''
+    return request<WorkflowTokenReviewPage>(
+      `/workflows/jobs/${encodeURIComponent(id)}/token-review${suffix}`,
+    )
+  },
+  workflowReviewToken: (
+    id: string,
+    body: {
+      sample_id: number
+      action: WorkflowTokenReviewAction
+      expected_status: WorkflowTokenReviewStatus
+      text?: string
+    },
+  ) =>
+    request<WorkflowTokenReviewItem>(
+      `/workflows/jobs/${encodeURIComponent(id)}/token-review/review`,
+      { method: 'POST', body: JSON.stringify(body) },
+    ),
+  workflowConfirmTokenReview: (id: string) =>
+    request<{ job_id: string; confirmed: boolean; unresolved: number }>(
+      `/workflows/jobs/${encodeURIComponent(id)}/token-review/confirm`,
+      { method: 'POST', body: JSON.stringify({ confirmed: true }) },
     ),
 }
 
