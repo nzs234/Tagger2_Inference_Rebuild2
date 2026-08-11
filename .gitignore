@@ -13,6 +13,9 @@ dist/
 config/*.local.*
 secrets/
 
+# The embedded CPython runtime is provisioned by setup.bat, not tracked
+runtime/
+
 # Model/cache binaries are provisioned separately
 models/*
 !models/.gitkeep
