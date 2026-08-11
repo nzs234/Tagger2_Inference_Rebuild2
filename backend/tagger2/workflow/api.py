@@ -10,10 +10,53 @@ import json
 from pathlib import Path
 
 from ..security import PathAllowlist, PathNotAllowedError
-from .contracts import WorkflowJobConfigV1
+from .contracts import WorkflowJobConfigV1, utc_now
 from .db import WorkflowDatabase, default_workflow_database_path
 from .preflight import WorkflowPreflightError, WorkflowPreflightService
 from .resources import WorkflowResourceCatalog
+
+
+def _build_public_error_codes() -> dict[type, str]:
+    """Stable client-facing codes for the failures a run can raise."""
+
+    from .commit import CommitError
+    from .pipeline import PipelineError
+    from .stages.policy import PolicyError
+    from .stages.replacement import ReplacementError
+    from .stages.token_budget import TokenBudgetError
+
+    return {
+        CommitError: "commit_failed",
+        PipelineError: "pipeline_failed",
+        PolicyError: "policy_failed",
+        ReplacementError: "replacement_failed",
+        TokenBudgetError: "token_budget_failed",
+        PathNotAllowedError: "path_not_allowed",
+        FileNotFoundError: "input_unavailable",
+        PermissionError: "permission_denied",
+        OSError: "io_error",
+    }
+
+
+_PUBLIC_ERROR_CODES: dict[type, str] | None = None
+
+
+def _public_error_code(exc: BaseException) -> str:
+    """Map an exception onto a stable public code via its MRO.
+
+    Walking the MRO means a subclass of a mapped error still reports the
+    specific code, and anything unmapped degrades to `internal_error` rather
+    than exposing the exception text.
+    """
+
+    global _PUBLIC_ERROR_CODES
+    if _PUBLIC_ERROR_CODES is None:
+        _PUBLIC_ERROR_CODES = _build_public_error_codes()
+    for klass in type(exc).__mro__:
+        code = _PUBLIC_ERROR_CODES.get(klass)
+        if code is not None:
+            return code
+    return "internal_error"
 
 
 class WorkflowJobCreateRequest(BaseModel):
@@ -42,7 +85,86 @@ class WorkflowJobStatusResponse(BaseModel):
     created_at: str
     started_at: str | None
     finished_at: str | None
-    error: str | None
+    # A stable public code, never an exception message or traceback. The full
+    # diagnosis stays server-side in the job workspace.
+    error_code: str | None
+
+
+class WorkflowJobSummaryResponse(BaseModel):
+    """One row of the job list.
+
+    Deliberately narrower than the ``workflow_jobs`` table: `workspace_path`,
+    `config_json` and `config_hash` are server-side details and must not cross
+    the API boundary.
+    """
+
+    job_id: str
+    status: str
+    profile: str
+    work_mode: str
+    overwrite_mode: str
+    source_root_id: str
+    output_root_id: str | None
+    current_module_id: str | None
+    total_samples: int
+    processed_samples: int
+    succeeded_samples: int
+    failed_samples: int
+    skipped_samples: int
+    created_at: str
+    started_at: str | None
+    finished_at: str | None
+    error_code: str | None
+
+
+class WorkflowJobIssueResponse(BaseModel):
+    """One recorded issue, addressed by relative path only."""
+
+    issue_id: str
+    sample_id: int | None
+    relative_image_path: str | None
+    module_id: str
+    code: str
+    message: str
+    severity: str
+    blocking: bool
+    created_at: str | None
+
+
+class WorkflowJobReportResponse(BaseModel):
+    """Per-stage report for a finished job."""
+
+    job_id: str
+    available: bool
+    report: dict[str, Any] | None = None
+
+
+def _job_summary(job: dict[str, Any]) -> WorkflowJobSummaryResponse:
+    """Project a `workflow_jobs` row onto the public summary.
+
+    Whitelists fields explicitly, so a future column added to the table cannot
+    silently start crossing the API boundary.
+    """
+
+    return WorkflowJobSummaryResponse(
+        job_id=str(job["job_id"]),
+        status=str(job["status"]),
+        profile=str(job["profile"]),
+        work_mode=str(job["work_mode"]),
+        overwrite_mode=str(job["overwrite_mode"]),
+        source_root_id=str(job["source_root_id"]),
+        output_root_id=job["output_root_id"],
+        current_module_id=job["current_module_id"],
+        total_samples=int(job["total_samples"]),
+        processed_samples=int(job["processed_samples"]),
+        succeeded_samples=int(job["succeeded_samples"]),
+        failed_samples=int(job["failed_samples"]),
+        skipped_samples=int(job["skipped_samples"]),
+        created_at=str(job["created_at"]),
+        started_at=job["started_at"],
+        finished_at=job["finished_at"],
+        error_code=job["error"],
+    )
 
 
 class WorkflowCountResolveRequest(BaseModel):
@@ -150,6 +272,41 @@ def create_workflow_router(
         database = WorkflowDatabase(default_workflow_database_path())
 
     preflight_service = WorkflowPreflightService(allowlist, resource_catalog)
+
+    def _record_job_failure(job_id: str, exc: BaseException, trace: str) -> None:
+        """Fail a job without leaking internals to the client.
+
+        The job row keeps a short, stable code so the UI can branch on it. The
+        exception text and traceback go to `<workspace>/job_error.log`, which an
+        operator can read but the API never returns.
+        """
+
+        from .lifecycle import JobLifecycle
+
+        code = _public_error_code(exc)
+        try:
+            job = database.get_job(job_id)
+            if job is not None:
+                log_path = Path(job["workspace_path"]) / "job_error.log"
+                log_path.parent.mkdir(parents=True, exist_ok=True)
+                log_path.write_text(
+                    f"{utc_now()} {type(exc).__name__}: {exc}\n\n{trace}",
+                    encoding="utf-8",
+                )
+        except Exception:
+            # Losing the diagnostic file must not mask the original failure or
+            # leave the job stuck in `running`.
+            pass
+
+        try:
+            JobLifecycle(database, job_id).transition("failed")
+        except Exception:
+            pass
+        try:
+            database.update_job_status(job_id, status="failed", error=code)
+        except Exception:
+            pass
+
     async def _execute_job_async(job_id: str) -> None:
         """Execute a workflow job in the background, updating status and seeding reviews."""
         from .lifecycle import JobLifecycle
@@ -303,16 +460,9 @@ def create_workflow_router(
             # Issues are already persisted in the issues table via report
     
         except Exception as exc:
-            try:
-                lifecycle = JobLifecycle(database, job_id)
-                lifecycle.transition("failed")
-                database.update_job_status(
-                        job_id,
-                        status="failed",
-                        error=f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}",
-                    )
-            except Exception:
-                pass  # Already failed, no need to propagate
+            # The traceback is operator data, not client data: write it to the
+            # job workspace and store only a stable code on the job row.
+            _record_job_failure(job_id, exc, traceback.format_exc())
     
 
 
@@ -728,11 +878,14 @@ def create_workflow_router(
                 detail={"code": "invalid_config", "message": str(exc)},
             ) from exc
 
-    @router.get("/jobs")
-    async def list_jobs(limit: int = 100, offset: int = 0) -> list[dict[str, Any]]:
-        """List workflow jobs."""
-        jobs = database.list_jobs(limit=limit, offset=offset)
-        return jobs
+    @router.get("/jobs", response_model=list[WorkflowJobSummaryResponse])
+    async def list_jobs(limit: int = 100, offset: int = 0) -> list[WorkflowJobSummaryResponse]:
+        """List workflow jobs, projected onto the public summary shape."""
+        limit = max(1, min(limit, 200))
+        offset = max(0, offset)
+        return [
+            _job_summary(job) for job in database.list_jobs(limit=limit, offset=offset)
+        ]
 
     @router.get("/jobs/{job_id}", response_model=WorkflowJobStatusResponse)
     async def get_job_status(job_id: str) -> WorkflowJobStatusResponse:
@@ -755,11 +908,11 @@ def create_workflow_router(
             created_at=job["created_at"],
             started_at=job["started_at"],
             finished_at=job["finished_at"],
-            error=job["error"],
+            error_code=job["error"],
         )
 
-    @router.get("/jobs/{job_id}/report")
-    async def get_job_report(job_id: str) -> dict[str, Any]:
+    @router.get("/jobs/{job_id}/report", response_model=WorkflowJobReportResponse)
+    async def get_job_report(job_id: str) -> WorkflowJobReportResponse:
         """Return the persisted per-stage report for a finished job.
 
         Returns ``{"available": false}`` while a job has not written its report
@@ -774,7 +927,7 @@ def create_workflow_router(
             )
         report_path = Path(job["workspace_path"]) / "pipeline_report.json"
         if not report_path.is_file():
-            return {"job_id": job_id, "available": False}
+            return WorkflowJobReportResponse(job_id=job_id, available=False)
         try:
             payload = json.loads(report_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
@@ -782,17 +935,40 @@ def create_workflow_router(
                 status_code=500,
                 detail={"code": "report_unreadable", "message": str(exc)},
             ) from exc
-        return {"job_id": job_id, "available": True, "report": payload}
+        if isinstance(payload, dict) and payload.get("backup_path"):
+            # The report stores an absolute server path; the client only needs
+            # to know that a backup exists.
+            payload = dict(payload)
+            payload["backup_path"] = None
+            payload["backup_available"] = True
+        return WorkflowJobReportResponse(job_id=job_id, available=True, report=payload)
 
-    @router.get("/jobs/{job_id}/issues")
-    async def list_job_issues(job_id: str, blocking_only: bool = False) -> list[dict[str, Any]]:
-        """List issues for a workflow job."""
+    @router.get("/jobs/{job_id}/issues", response_model=list[WorkflowJobIssueResponse])
+    async def list_job_issues(
+        job_id: str, blocking_only: bool = False
+    ) -> list[WorkflowJobIssueResponse]:
+        """List issues for a workflow job, projected onto the public shape."""
         job = database.get_job(job_id)
         if not job:
-            raise HTTPException(status_code=404, detail="Job not found")
-        
-        issues = database.list_issues(job_id, blocking_only=blocking_only)
-        return issues
+            raise HTTPException(
+                status_code=404,
+                detail={"code": "job_not_found", "message": f"unknown job: {job_id}"},
+            )
+
+        return [
+            WorkflowJobIssueResponse(
+                issue_id=str(issue.get("issue_id", "")),
+                sample_id=issue.get("sample_id"),
+                relative_image_path=issue.get("relative_image_path"),
+                module_id=str(issue.get("module_id", "")),
+                code=str(issue.get("code", "")),
+                message=str(issue.get("message", "")),
+                severity=str(issue.get("severity", "error")),
+                blocking=bool(issue.get("blocking", False)),
+                created_at=issue.get("created_at"),
+            )
+            for issue in database.list_issues(job_id, blocking_only=blocking_only)
+        ]
 
     return router
 

@@ -391,6 +391,9 @@ export interface WorkflowJobSummary {
   status: WorkflowJobStatus
   profile: WorkflowProfile
   work_mode: WorkflowWorkMode
+  overwrite_mode?: WorkflowOverwriteMode
+  source_root_id?: string
+  output_root_id?: string | null
   total_samples: number
   processed_samples: number
   succeeded_samples: number
@@ -400,18 +403,20 @@ export interface WorkflowJobSummary {
   created_at: string
   started_at: string | null
   finished_at: string | null
-  error: string | null
+  /** Stable public code, never an exception message or traceback. */
+  error_code: string | null
 }
 
 export interface WorkflowIssue {
   issue_id: string
   sample_id: number | null
+  relative_image_path: string | null
   module_id: string
   code: string
   severity: 'info' | 'warning' | 'error'
-  blocking: number
+  blocking: boolean
   message: string
-  created_at: string
+  created_at: string | null
 }
 
 export interface WorkflowPreflightReport {

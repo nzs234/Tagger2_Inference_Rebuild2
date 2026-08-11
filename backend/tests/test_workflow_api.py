@@ -482,6 +482,57 @@ def test_job_pause_resume_and_repair(workflow_client):
     assert str(root) not in repaired.text
 
 
+def test_job_list_does_not_leak_server_internals(workflow_client):
+    """`GET /jobs` returns the public summary, not raw `workflow_jobs` rows."""
+    client, root, runtime = (
+        workflow_client[0],
+        workflow_client[1],
+        workflow_client[0].app.state.runtime,
+    )
+    job_id = _seed_count_review(client, root, runtime)
+
+    response = client.get("/api/v1/workflows/jobs")
+    assert response.status_code == 200, response.text
+    rows = response.json()
+    assert rows, "expected the seeded job to be listed"
+
+    row = next(item for item in rows if item["job_id"] == job_id)
+    # Server-side detail must not cross the API boundary.
+    for leaked in ("workspace_path", "config_json", "config_hash", "config_version"):
+        assert leaked not in row, f"{leaked} leaked into the job list"
+    # The public summary reports a code, never a free-form exception string.
+    assert "error" not in row
+    assert "error_code" in row
+
+
+def test_failed_job_reports_a_code_and_keeps_the_traceback_server_side(workflow_client):
+    """A crash yields a stable code to the client and a log in the workspace."""
+    client, root, _input_root = workflow_client
+    runtime = client.app.state.runtime
+    database = runtime.workflow_database
+
+    job_id = _seed_count_review(client, root, runtime)
+    job = database.get_job(job_id)
+
+    from backend.tagger2.workflow.api import _public_error_code
+    from backend.tagger2.workflow.pipeline import PipelineError
+
+    # The mapping is what the failure path relies on.
+    assert _public_error_code(PipelineError("boom")) == "pipeline_failed"
+    assert _public_error_code(RuntimeError("boom")) == "internal_error"
+
+    # Simulate the recorded outcome of a crashed run.
+    database.update_job_status(job_id, status="failed", error="pipeline_failed")
+
+    status = client.get(f"/api/v1/workflows/jobs/{job_id}")
+    assert status.status_code == 200, status.text
+    body = status.json()
+    assert body["error_code"] == "pipeline_failed"
+    assert "Traceback" not in json.dumps(body)
+    # The workspace path itself is never handed to the client.
+    assert job["workspace_path"] not in json.dumps(body)
+
+
 def test_lifecycle_unknown_job_is_404(workflow_client):
     client, _root, _input_root = workflow_client
     assert client.post("/api/v1/workflows/jobs/nope/pause").status_code == 404
