@@ -37,6 +37,8 @@ interface JobDraft {
   recursive: boolean
   replaceEnabled: boolean
   replaceResourceId: string
+  ocrEnabled: boolean
+  ocrMinConfidence: number
 }
 
 const emptyDraft: JobDraft = {
@@ -50,6 +52,8 @@ const emptyDraft: JobDraft = {
   recursive: false,
   replaceEnabled: true,
   replaceResourceId: '',
+  ocrEnabled: false,
+  ocrMinConfidence: 0.5,
 }
 
 // Mirrors COUNT_VALUES in backend/tagger2/workflow/count_review.py; the API rejects anything else.
@@ -97,6 +101,12 @@ export function DatasetWorkflow() {
     enabled: Boolean(selectedJobId),
     retry: false,
   })
+  const jobReport = useQuery({
+    queryKey: ['workflow', 'report', selectedJobId],
+    queryFn: () => api.workflowJobReport(selectedJobId as string),
+    enabled: Boolean(selectedJobId),
+    retry: false,
+  })
   const issues = useQuery({
     queryKey: ['workflow', 'issues', selectedJobId],
     queryFn: () => api.workflowIssues(selectedJobId as string),
@@ -118,7 +128,9 @@ export function DatasetWorkflow() {
       replace: draft.replaceEnabled
         ? { enabled: true, resource_id: draft.replaceResourceId }
         : { enabled: false },
-      ocr: { enabled: false },
+      ocr: draft.ocrEnabled
+        ? { enabled: true, min_confidence: draft.ocrMinConfidence }
+        : { enabled: false },
       nl: { enabled: false },
       token_budget: { enabled: false },
       export: { format: draft.exportFormat },
@@ -524,6 +536,31 @@ export function DatasetWorkflow() {
               </select>
             </Field>
           )}
+          <Field label={text.enableOcr}>
+            <select
+              value={draft.ocrEnabled ? 'yes' : 'no'}
+              onChange={(event) =>
+                setDraft({ ...draft, ocrEnabled: event.target.value === 'yes' })
+              }
+            >
+              <option value="no">{text.no}</option>
+              <option value="yes">{text.yes}</option>
+            </select>
+          </Field>
+          {draft.ocrEnabled && (
+            <Field label={text.ocrMinConfidence}>
+              <input
+                type="number"
+                min={0}
+                max={1}
+                step={0.05}
+                value={draft.ocrMinConfidence}
+                onChange={(event) =>
+                  setDraft({ ...draft, ocrMinConfidence: Number(event.target.value) })
+                }
+              />
+            </Field>
+          )}
           <Field label={text.recursive}>
             <select
               value={draft.recursive ? 'yes' : 'no'}
@@ -860,6 +897,39 @@ export function DatasetWorkflow() {
               {text.tokenConfirm}
             </Button>
           </div>
+        </Panel>
+      )}
+
+      {selectedJobId && jobReport.data?.available && jobReport.data.report?.ocr && (
+        <Panel title={text.ocrTitle} eyebrow="OCR">
+          {(() => {
+            const ocr = jobReport.data.report?.ocr ?? {}
+            const processed = ocr.processed ?? 0
+            const failed = ocr.failed ?? 0
+            const regions = ocr.regions ?? 0
+            if (processed === 0 && failed === 0) {
+              return <p className="workflow-empty">{text.ocrEmpty}</p>
+            }
+            return (
+              <>
+                <dl className="workflow-summary">
+                  <div>
+                    <dt>{text.ocrProcessed}</dt>
+                    <dd>{processed}</dd>
+                  </div>
+                  <div>
+                    <dt>{text.ocrFailed}</dt>
+                    <dd>{failed}</dd>
+                  </div>
+                  <div>
+                    <dt>{text.ocrRegions}</dt>
+                    <dd>{regions}</dd>
+                  </div>
+                </dl>
+                <p className="workflow-hint">{text.ocrUnavailableHint}</p>
+              </>
+            )
+          })()}
         </Panel>
       )}
 

@@ -29,6 +29,34 @@ class WorkflowPreflightService:
         self.allowlist = allowlist
         self.resource_catalog = resource_catalog
 
+    def _snapshot_profile(self, resource_id: str) -> str | None:
+        """Return the profile a registered classification snapshot was built for.
+
+        Returns ``None`` when the file is missing or unreadable, so the caller
+        reports a blocking error instead of assuming a profile.
+        """
+
+        import json
+
+        path = self.resource_catalog.get_resource_path(resource_id)
+        if path is None or not path.is_file():
+            return None
+        try:
+            raw = path.read_bytes()
+        except OSError:
+            return None
+        if raw.startswith(b"\xef\xbb\xbf"):
+            raw = raw[3:]
+        try:
+            document = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return None
+        if not isinstance(document, dict):
+            return None
+        profile = document.get("profile")
+        return profile if isinstance(profile, str) else None
+
+
     def validate_config(self, config: WorkflowJobConfigV1) -> dict[str, Any]:
         """Validate workflow job configuration.
         
@@ -98,10 +126,30 @@ class WorkflowPreflightService:
 
         if config.classify.get("enabled"):
             resource_id = config.classify.get("resource_id")
-            if resource_id:
+            if not resource_id:
+                missing_resources.append(
+                    "Classify is enabled but no classification snapshot is selected"
+                )
+            else:
                 manifest = self.resource_catalog.get_manifest(resource_id)
                 if not manifest:
                     missing_resources.append(f"Classify resource not found: {resource_id}")
+                else:
+                    # A snapshot built for another profile must never be used as a
+                    # substitute, so the profile is checked here rather than at run
+                    # time when the dataset is already being processed.
+                    snapshot_profile = self._snapshot_profile(resource_id)
+                    if snapshot_profile is None:
+                        missing_resources.append(
+                            "Classify snapshot cannot be read:"
+                            f" {resource_id}"
+                        )
+                    elif snapshot_profile != config.profile:
+                        missing_resources.append(
+                            f"Classify snapshot {resource_id} is built for profile"
+                            f" {snapshot_profile!r}, but the job profile is"
+                            f" {config.profile!r}; no cross-profile fallback is allowed"
+                        )
 
         if config.replace.get("enabled"):
             resource_id = config.replace.get("resource_id")
@@ -136,9 +184,16 @@ class WorkflowPreflightService:
             except PathNotAllowedError:
                 pass  # Already reported above
 
-        # Profile-specific validation
+        # Profile-specific validation. Danbooru resources are not bundled, so the
+        # profile is selectable but every stage that needs a Danbooru resource
+        # must fail closed instead of silently reusing an e621 one.
         if config.profile == "danbooru":
             warnings.append("Danbooru profile requires official resources (not bundled)")
+            if config.replace.get("enabled") and not config.replace.get("resource_id"):
+                errors.append(
+                    "Danbooru profile: Replace is enabled but no Danbooru replacement"
+                    " index is selected; the e621 index is not a valid substitute"
+                )
 
         # Build report
         report: dict[str, Any] = {

@@ -18,6 +18,7 @@
   WorkflowCountReviewPage,
   WorkflowImportPreview,
   WorkflowIssue,
+  WorkflowJobReport,
   WorkflowJobSummary,
   WorkflowPreflightReport,
   WorkflowRepairReport,
@@ -253,6 +254,8 @@ export const api = {
       method: 'POST',
       body: '{}',
     }),
+  workflowJobReport: (id: string) =>
+    request<WorkflowJobReport>(`/workflows/jobs/${encodeURIComponent(id)}/report`),
   workflowIssues: (id: string, blockingOnly = false) =>
     request<WorkflowIssue[]>(
       `/workflows/jobs/${encodeURIComponent(id)}/issues${blockingOnly ? '?blocking_only=true' : ''}`,

@@ -414,3 +414,130 @@ describe('DatasetWorkflow token budget review', () => {
     expect(await screen.findByText(/未注册 Tokenizer 资源/)).toBeInTheDocument()
   })
 })
+
+describe('DatasetWorkflow OCR', () => {
+  let posted: unknown
+  let reportBody: unknown
+
+  beforeEach(() => {
+    posted = undefined
+    reportBody = {
+      job_id: 'job-1',
+      available: true,
+      report: {
+        total_samples: 3,
+        exported_samples: 3,
+        ocr: { processed: 2, failed: 1, regions: 5 },
+      },
+    }
+    usePreferences.setState({ workflowLanguage: 'zh' })
+    vi.spyOn(globalThis, 'fetch').mockImplementation(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input)
+        const json = (body: unknown, status = 200) =>
+          new Response(JSON.stringify(body), {
+            status,
+            headers: { 'Content-Type': 'application/json' },
+          })
+        if (init?.method === 'POST') {
+          posted = init.body ? JSON.parse(String(init.body)) : null
+          return json({ valid: true, errors: [], warnings: [] })
+        }
+        if (url.includes('/report')) return json(reportBody)
+        if (url.includes('/token-review')) return json({ items: [], unresolved: 0 })
+        if (url.includes('/count-review')) return json({ items: [], pending: 0 })
+        if (url.includes('/issues')) return json([])
+        if (url.includes('/workflows/capabilities')) {
+          return json({ profiles: ['e621'], work_modes: ['in_place', 'full_copy'], resources: [] })
+        }
+        if (url.includes('/workflows/resources')) return json([])
+        if (url.includes('/workflows/jobs')) {
+          return json([
+            {
+              job_id: 'job-1',
+              status: 'completed',
+              profile: 'e621',
+              processed_samples: 3,
+              total_samples: 3,
+              current_module_id: 'export',
+              created_at: '2026-08-11T00:00:00Z',
+            },
+          ])
+        }
+        if (url.includes('/roots')) {
+          return json({ items: [{ id: 'in', name: 'Input', kind: 'input', writable: false }] })
+        }
+        return json({})
+      },
+    )
+  })
+
+  afterEach(() => {
+    cleanup()
+    vi.restoreAllMocks()
+    usePreferences.setState({ workflowLanguage: 'zh' })
+  })
+
+  it('is disabled by default and hides the confidence input', () => {
+    renderPage()
+    const toggle = screen.getByLabelText(copyFor('zh').enableOcr) as HTMLSelectElement
+    expect(toggle.value).toBe('no')
+    expect(screen.queryByLabelText(copyFor('zh').ocrMinConfidence)).not.toBeInTheDocument()
+  })
+
+  it('sends the confidence threshold once OCR is enabled', async () => {
+    renderPage()
+
+    const zh = copyFor('zh')
+    fireEvent.change(screen.getByLabelText(zh.workMode), { target: { value: 'in_place' } })
+
+    // The root list arrives asynchronously; selecting before it lands is a no-op.
+    const sourceRoot = screen.getByLabelText(zh.sourceRoot) as HTMLSelectElement
+    await waitFor(() => {
+      expect(sourceRoot.options.length).toBeGreaterThan(1)
+    })
+    fireEvent.change(sourceRoot, { target: { value: 'in' } })
+    expect(sourceRoot.value).toBe('in')
+
+    fireEvent.change(screen.getByLabelText(zh.enableOcr), {
+      target: { value: 'yes' },
+    })
+
+    const confidence = screen.getByLabelText(copyFor('zh').ocrMinConfidence)
+    expect(confidence).toBeInTheDocument()
+    fireEvent.change(confidence, { target: { value: '0.8' } })
+
+    fireEvent.click(screen.getByRole('button', { name: copyFor('zh').preflight }))
+
+    await waitFor(() => {
+      expect((posted as { ocr?: unknown })?.ocr).toEqual({
+        enabled: true,
+        min_confidence: 0.8,
+      })
+    })
+  })
+
+  it('shows the per-stage OCR counters for a finished job', async () => {
+    renderPage()
+    fireEvent.click(await screen.findByText(/job-1/))
+
+    expect(await screen.findByText(copyFor('zh').ocrTitle)).toBeInTheDocument()
+    // A failed image is reported, and the panel says it is non-blocking.
+    expect(screen.getByText(copyFor('zh').ocrRegions)).toBeInTheDocument()
+    expect(screen.getByText(copyFor('zh').ocrUnavailableHint)).toBeInTheDocument()
+  })
+
+  it('renders no OCR panel when the job never ran OCR', async () => {
+    reportBody = {
+      job_id: 'job-1',
+      available: true,
+      report: { total_samples: 3, exported_samples: 3 },
+    }
+    renderPage()
+    fireEvent.click(await screen.findByText(/job-1/))
+
+    await waitFor(() => {
+      expect(screen.queryByText(copyFor('zh').ocrTitle)).not.toBeInTheDocument()
+    })
+  })
+})

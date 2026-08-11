@@ -204,7 +204,7 @@ def test_offline_pipeline_full_copy_exports_json_and_flat_txt():
         assert report.total_samples == 1
         assert report.exported_samples == 1
         assert report.failed_samples == 0
-        assert report.committed_files == 2
+        assert report.committed_files == 3  # JSON + TXT + image
         assert report.replacement["dropped"] == 1
         assert report.replacement["replaced"] == 2
 

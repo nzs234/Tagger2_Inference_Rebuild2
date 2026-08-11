@@ -47,6 +47,14 @@ export interface WorkflowCopy {
   exportBoth: string
   recursive: string
   enableReplace: string
+  enableOcr: string
+  ocrMinConfidence: string
+  ocrTitle: string
+  ocrProcessed: string
+  ocrFailed: string
+  ocrRegions: string
+  ocrEmpty: string
+  ocrUnavailableHint: string
   preflight: string
   createJob: string
   preflightOk: string
@@ -153,6 +161,14 @@ export const workflowCopy: Record<WorkflowLanguage, WorkflowCopy> = {
     exportBoth: '两者',
     recursive: '递归子目录',
     enableReplace: '启用替换',
+    enableOcr: '启用 OCR',
+    ocrMinConfidence: 'OCR 最低置信度',
+    ocrTitle: 'OCR 结果',
+    ocrProcessed: '已识别',
+    ocrFailed: '失败',
+    ocrRegions: '文本区域',
+    ocrEmpty: '本次任务没有 OCR 结果。',
+    ocrUnavailableHint: 'OCR 运行时缺失或识别失败时只记录警告，不会中断流程。',
     preflight: '预检',
     createJob: '创建任务',
     preflightOk: '预检通过',
@@ -260,6 +276,14 @@ export const workflowCopy: Record<WorkflowLanguage, WorkflowCopy> = {
     exportBoth: 'Both',
     recursive: 'Recurse subdirectories',
     enableReplace: 'Enable replace',
+    enableOcr: 'Enable OCR',
+    ocrMinConfidence: 'OCR min confidence',
+    ocrTitle: 'OCR results',
+    ocrProcessed: 'Recognized',
+    ocrFailed: 'Failed',
+    ocrRegions: 'Text regions',
+    ocrEmpty: 'This job produced no OCR results.',
+    ocrUnavailableHint: 'A missing OCR runtime or a failed image is recorded as a warning and never blocks the run.',
     preflight: 'Preflight',
     createJob: 'Create job',
     preflightOk: 'Preflight passed',

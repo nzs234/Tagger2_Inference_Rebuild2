@@ -1,5 +1,6 @@
 """Contract tests for the mounted Dataset Workflow API surface."""
 
+import json
 import os
 import tempfile
 from pathlib import Path
@@ -154,6 +155,95 @@ def test_resource_import_rejects_invalid_index(workflow_client):
     assert applied.json()["code"] == "validation_failed"
 
 
+def test_classify_snapshot_import_preview_then_apply(workflow_client):
+    """A classification snapshot imports through its own reader, not the CSV one."""
+    client, root, _input_root = workflow_client
+
+    snapshot = {
+        "format": "classify-snapshot-v1",
+        "profile": "e621",
+        "source": {"url": "https://e621.net/db_export/"},
+        "tags": [
+            {"name": "solo", "category": "general", "post_count": 10},
+            {"name": "hatsune_miku", "category": "character", "post_count": 20},
+        ],
+        "aliases": [{"antecedent_name": "1girl", "consequent_name": "solo"}],
+        "implications": [],
+    }
+    (root / "input" / "classify.json").write_text(json.dumps(snapshot), encoding="utf-8")
+
+    payload = {
+        "root_id": "wfinput",
+        "relative_path": "classify.json",
+        "resource_id": "classify-e621-test-v1",
+        "category": "classify",
+    }
+
+    preview = client.post("/api/v1/workflows/resources/import/preview", json=payload)
+    assert preview.status_code == 200, preview.text
+    body = preview.json()
+    assert body["valid"] is True, body["errors"]
+    assert body["profile"] == "e621"
+    assert body["tag_count"] == 2
+    assert body["alias_count"] == 1
+    assert body["rule_count"] == 2
+    assert body["category_counts"]["character"] == 1
+
+    applied = client.post("/api/v1/workflows/resources/import/apply", json=payload)
+    assert applied.status_code == 200, applied.text
+    assert applied.json()["resource_id"] == "classify-e621-test-v1"
+
+    listing = client.get("/api/v1/workflows/resources?category=classify").json()
+    assert [item["resource_id"] for item in listing] == ["classify-e621-test-v1"]
+
+
+def test_classify_snapshot_import_rejects_bad_snapshot(workflow_client):
+    """A snapshot with an out-of-profile category is refused with its index."""
+    client, root, _input_root = workflow_client
+
+    snapshot = {
+        "format": "classify-snapshot-v1",
+        "profile": "danbooru",
+        "tags": [{"name": "human", "category": "species", "post_count": 1}],
+        "aliases": [],
+        "implications": [],
+    }
+    (root / "input" / "bad_classify.json").write_text(json.dumps(snapshot), encoding="utf-8")
+
+    payload = {
+        "root_id": "wfinput",
+        "relative_path": "bad_classify.json",
+        "resource_id": "classify-danbooru-bad-v1",
+        "category": "classify",
+    }
+
+    preview = client.post("/api/v1/workflows/resources/import/preview", json=payload).json()
+    assert preview["valid"] is False
+    assert any("tags[0]" in error for error in preview["errors"])
+
+    applied = client.post("/api/v1/workflows/resources/import/apply", json=payload)
+    assert applied.status_code == 400
+    assert applied.json()["code"] == "validation_failed"
+
+
+def test_resource_import_rejects_unknown_category(workflow_client):
+    """An unknown category is refused rather than read as an arbitrary format."""
+    client, root, _input_root = workflow_client
+
+    (root / "input" / "mystery.bin").write_text("whatever", encoding="utf-8")
+
+    payload = {
+        "root_id": "wfinput",
+        "relative_path": "mystery.bin",
+        "resource_id": "mystery-v1",
+        "category": "mystery",
+    }
+
+    preview = client.post("/api/v1/workflows/resources/import/preview", json=payload).json()
+    assert preview["valid"] is False
+    assert any("unsupported resource category" in error for error in preview["errors"])
+
+
 def test_job_preflight_rejects_overlapping_roots(workflow_client):
     """Preflight refuses a job whose output sits inside its source."""
     client, root, _input_root = workflow_client
@@ -239,11 +329,22 @@ def _seed_count_review(client, root, runtime):
         "ocr": {"enabled": False},
         "token_budget": {"enabled": False},
     }
-    created = client.post("/api/v1/workflows/jobs", json={"config": config})
-    assert created.status_code == 200, created.text
-    job_id = created.json()["job_id"]
+    # Create the job row directly: POST /jobs schedules a background run that
+    # would finish the job before the lifecycle assertions can observe it.
+    from backend.tagger2.workflow.contracts import WorkflowJobConfigV1
 
     database = runtime.workflow_database
+    job_config = WorkflowJobConfigV1.from_payload(config)
+    job_id, _workspace = database.create_job(
+        config_json=config,
+        config_hash=job_config.config_hash(),
+        profile=job_config.profile,
+        work_mode=job_config.work_mode,
+        overwrite_mode=job_config.overwrite_mode,
+        source_root_id=job_config.source_root.root_id,
+        output_root_id=job_config.output_root.root_id if job_config.output_root else None,
+        workspace_root=database.db_path.parent / "jobs",
+    )
     database.create_sample(job_id, 0, "a.png", "png")
     database.create_sample(job_id, 1, "b.png", "png")
 

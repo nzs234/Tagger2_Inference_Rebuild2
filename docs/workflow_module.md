@@ -15,16 +15,21 @@ backend/tagger2/workflow/
   contracts.py           versioned job config, path refs, resource manifests
   db_schema.py           schema v1 for the isolated workflows database
   db.py                  connection management, job/sample/issue operations
-  resources.py           content-addressed resource catalog
+  resources.py           content-addressed resource catalog, per-category readers
   replacement_index.py   strict reader for the e621 replacement index CSV
+  classify_snapshot.py   strict reader/builder for classify-snapshot-v1 bundles
   raw_e621.py            ported strict raw e621 grouped JSON parser
   dataset_import.py      dataset scan and annotation-format classification
+  ocr.py                 isolated PaddleOCR runtime and sidecar protocol
   commit.py              annotation backup, staging, journal, atomic commit
   pipeline.py            offline vertical orchestration
-  preflight.py           configuration validation
+  preflight.py           configuration validation and fail-closed profile checks
+  lifecycle.py           pause / resume / repair / lease recovery
+  count_review.py        count decisions and the export gate
+  token_budget_review.py overflow review and the export gate
   api.py                 router mounted at /api/v1/workflows
   caption_format/        ported nine-field normalizer and flat TXT serializer
-  stages/replacement.py  ported keep/replace/drop transform
+  stages/                caption, classify, replacement, nl, policy, token budget
 
 frontend/src/
   pages/DatasetWorkflow.tsx   the module page
@@ -39,7 +44,10 @@ migrated or rewritten.
 
 **Separate resource library.** Resources live under
 `data/workflows/resources/<category>/`, content-addressed by SHA-256 with a
-manifest recording provenance. Model assets are referenced, never copied.
+manifest recording provenance. Model assets are referenced, never copied. The
+category selects the validating reader: `classify` reads a
+`classify-snapshot-v1` bundle, `replace` / `replacement_index` read the index
+CSV, and an unknown category is refused rather than guessed at.
 
 **Per-job workspace.** `data/workflows/jobs/<job-id>/` holds the immutable input
 manifest, the frozen config snapshot, the staging tree, the issue log, the
@@ -68,6 +76,14 @@ store. The rest of the application remains Chinese.
 
 - Run the backend suite with the project runtime:
   `.\runtime\python.exe -m pytest backend\tests -q`
+- That runtime puts only `backend` on `sys.path`. Import as `tagger2.*` at module
+  level in tests; a module-level `backend.tagger2.*` import passes under a system
+  Python and fails under the project runtime.
+- OCR needs a separate interpreter. Build it with
+  `.\scripts\setup_ocr_runtime.ps1`; without it OCR reports `ocr_unavailable`
+  as a non-blocking warning.
+- Register a classification snapshot with
+  `scripts/import_classification_snapshot.py --dry-run` first, then without it.
 - Keep ported files verbatim. If a source algorithm needs changing, change the
   caller instead, so rule-stage output stays comparable to the source project.
 - Any new stage must write into the workspace staging tree and commit through

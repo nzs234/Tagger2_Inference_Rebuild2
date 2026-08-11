@@ -10,6 +10,12 @@ from typing import Any
 from .contracts import WorkflowResourceManifestV1, utc_now, RESOURCE_ID_PATTERN
 
 
+# Category names carried by the resource manifest. ``classify`` selects the
+# snapshot reader; the replacement categories select the index CSV reader.
+CLASSIFY_RESOURCE_CATEGORY = "classify"
+REPLACEMENT_RESOURCE_CATEGORIES = frozenset({"replace", "replacement_index"})
+
+
 class WorkflowResourceCatalog:
     """Content-addressed resource catalog."""
 
@@ -126,5 +132,38 @@ class WorkflowResourceCatalog:
         summary["line_count"] = summary.pop("rule_count")
         return summary
 
+    def validate_resource(self, source_path: Path, category: str) -> dict[str, Any]:
+        """Validate a resource file according to its category.
 
-__all__ = ["WorkflowResourceCatalog"]
+        A classification snapshot and a replacement index are different formats,
+        so the category selects the reader. An unknown category is rejected
+        rather than being guessed at, because importing a file under the wrong
+        format would register a resource that no stage can load.
+        """
+
+        if category == CLASSIFY_RESOURCE_CATEGORY:
+            from .classify_snapshot import validate_classify_snapshot
+
+            report = validate_classify_snapshot(source_path).as_dict()
+            # ``line_count`` is the shared "how many usable rows" field across
+            # resource categories, so a preview response stays uniform.
+            report["line_count"] = report["tag_count"]
+            return report
+        if category in REPLACEMENT_RESOURCE_CATEGORIES:
+            return self.validate_csv_resource(source_path)
+        return {
+            "valid": False,
+            "errors": [
+                f"unsupported resource category: {category!r};"
+                f" expected {CLASSIFY_RESOURCE_CATEGORY!r} or one of"
+                f" {sorted(REPLACEMENT_RESOURCE_CATEGORIES)}"
+            ],
+            "line_count": 0,
+        }
+
+
+__all__ = [
+    "CLASSIFY_RESOURCE_CATEGORY",
+    "REPLACEMENT_RESOURCE_CATEGORIES",
+    "WorkflowResourceCatalog",
+]

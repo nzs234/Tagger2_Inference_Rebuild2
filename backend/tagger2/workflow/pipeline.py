@@ -1,4 +1,4 @@
-﻿"""Offline e621 vertical: import -> replace -> normalize -> export -> commit.
+"""Offline e621 vertical: import -> replace -> normalize -> export -> commit.
 
 The stages implemented here are the deterministic, rule-only ones, so their
 output is reproducible without any model or network access. Caption, OCR, NL,
@@ -29,6 +29,7 @@ from .commit import (
 from .contracts import WorkflowJobConfigV1, canonical_json, utc_now
 from .dataset_import import ImportedSample, ImportResult, import_dataset
 from .replacement_index import load_replacement_rules
+from .ocr import OCREngine, run_ocr_stage
 from .stages.classify import ClassificationRules, classify_tags
 from .stages.caption import (
     CaptionStageReport,
@@ -36,7 +37,7 @@ from .stages.caption import (
     run_caption_stage,
     settings_from_config,
 )
-from .stages.policy import PolicyError, apply_policy
+from .stages.policy import PolicyError, apply_policy, merge_artists
 from .stages.token_budget import TokenBudgetError, fit as fit_token_budget
 from .stages.replacement import ReplacementError, ReplacementSummary, replace_projection
 
@@ -79,6 +80,7 @@ class PipelineReport:
     committed_files: int = 0
     replacement: dict[str, int] = field(default_factory=dict)
     caption: dict[str, int] = field(default_factory=dict)
+    ocr: dict[str, int] = field(default_factory=dict)
     policy: dict[str, int] = field(default_factory=dict)
     token_budget: dict[str, int] = field(default_factory=dict)
     # Overflowing captions, for the caller to seed into token budget review.
@@ -96,6 +98,7 @@ class PipelineReport:
             "committed_files": self.committed_files,
             "replacement": dict(self.replacement),
             "caption": dict(self.caption),
+            "ocr": dict(self.ocr),
             "policy": dict(self.policy),
             "token_budget": dict(self.token_budget),
             "token_overflows": [dict(item) for item in self.token_overflows],
@@ -163,6 +166,7 @@ def run_offline_pipeline(
     policy_config: Any | None = None,
     token_counter: Any | None = None,
     classification_rules: ClassificationRules | None = None,
+    ocr_engine: OCREngine | None = None,
 ) -> PipelineReport:
     """Run the deterministic offline vertical and commit its results.
 
@@ -255,6 +259,39 @@ def run_offline_pipeline(
                 )
 
 
+    # OCR stage: text recognition into per-sample sidecars. It never changes
+    # the nine-field payload and never blocks the run, so a missing runtime or a
+    # failed image is a warning and the pipeline continues.
+    if config.ocr.get("enabled"):
+        ocr_results, ocr_issues = run_ocr_stage(
+            workspace,
+            {
+                sample.relative_image_path: source_root / sample.relative_image_path
+                for sample in imported.samples
+            },
+            config.ocr,
+            ocr_engine,
+        )
+        report.ocr = {
+            "processed": sum(1 for result in ocr_results.values() if result.success),
+            "failed": sum(1 for result in ocr_results.values() if not result.success),
+            "regions": sum(
+                len(result.detected_regions) for result in ocr_results.values() if result.success
+            ),
+        }
+        for ocr_issue in ocr_issues:
+            report.issues.append(
+                StageIssue(
+                    sample_id=None,
+                    relative_image_path=ocr_issue.relative_image_path,
+                    module_id="ocr",
+                    code=ocr_issue.code,
+                    message=ocr_issue.message,
+                    severity="warning",
+                    blocking=False,
+                )
+            )
+
     # Classify stage: map caption tags to nine-field structure
     classified_projections: dict[str, dict[str, list[str]]] = {}
     if classification_rules is not None:
@@ -271,8 +308,9 @@ def run_offline_pipeline(
         
         for relative_path, tags in tags_to_classify.items():
             try:
-                projection = classify_tags(list(tags), classification_rules)
-                classified_projections[relative_path] = projection
+                classified_projections[relative_path] = classify_tags(
+                    list(tags), classification_rules
+                )
             except Exception as exc:
                 report.issues.append(
                     StageIssue(
@@ -338,11 +376,21 @@ def run_offline_pipeline(
                     # For raw_e621_json, preserve original character/artist from import
                     if sample.annotation_kind == "raw_e621_json":
                         # Remove character from tags to avoid collision
-                        tags = [t for t in classified.get("tags", []) if t != projection["character"]]
-                        projection["tags"] = tags
+                        projection["tags"] = [
+                            tag
+                            for tag in classified.get("tags", [])
+                            if tag != projection["character"]
+                        ]
                     else:
-                        projection["character"] = ",".join(classified.get("character", []))
+                        projection["character"] = ", ".join(classified.get("character", []))
                         projection["tags"] = classified.get("tags", [])
+                        # Classified artist tags would otherwise be dropped
+                        # entirely; merge them into the `artist` string field
+                        # without overwriting an artist supplied by the input.
+                        projection["artist"] = merge_artists(
+                            str(projection["artist"]),
+                            ", ".join(classified.get("artist", [])),
+                        )
                     projection["appearance"] = classified.get("appearance", [])
                     projection["environment"] = classified.get("environment", [])
                 elif caption_tags.get(sample.relative_image_path):
@@ -470,15 +518,19 @@ def run_offline_pipeline(
             normalization_format = "both" if export_format == "both" else (
                 "json" if export_format == "json" else "flat_txt"
             )
-            result = normalize_json_bytes(
+            normalized = normalize_json_bytes(
                 json.dumps(projection, ensure_ascii=False).encode("utf-8"),
                 policy,
                 export_format=normalization_format,
             )
-            if not result.valid or result.payload is None or result.json_bytes is None:
+            if (
+                not normalized.valid
+                or normalized.payload is None
+                or normalized.json_bytes is None
+            ):
                 codes = ", ".join(
                     f"{error.code}" + (f"[{error.field}]" if error.field else "")
-                    for error in result.field_errors
+                    for error in normalized.field_errors
                 )
                 report.issues.append(
                     StageIssue(
@@ -493,14 +545,30 @@ def run_offline_pipeline(
                 continue
 
             if export_format in {"json", "both"}:
-                staged.append(staging.stage(sample.annotation_key + ".json", result.json_bytes))
+                staged.append(
+                    staging.stage(sample.annotation_key + ".json", normalized.json_bytes)
+                )
             if export_format in {"txt", "both"}:
                 staged.append(
                     staging.stage(
                         sample.annotation_key + ".txt",
-                        serialize_flat_txt(result.payload, policy),
+                        serialize_flat_txt(normalized.payload, policy),
                     )
                 )
+            # `full_copy` writes into a separate output root, so the image has
+            # to travel with its annotation or the output is not a usable
+            # dataset. `in_place` already has the image where it belongs.
+            # Staged before the counter so a read failure below is counted once,
+            # as a failure, rather than as both exported and failed.
+            if config.work_mode == "full_copy":
+                source_image = source_root / sample.relative_image_path
+                if source_image.is_file():
+                    staged.append(
+                        staging.stage(
+                            sample.relative_image_path, source_image.read_bytes()
+                        )
+                    )
+
             report.exported_samples += 1
 
         except (ReplacementError, ValueError, OSError) as exc:

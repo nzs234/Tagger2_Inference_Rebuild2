@@ -366,6 +366,26 @@ export interface WorkflowImportPreview {
   fingerprint: string | null
 }
 
+export interface WorkflowStageCounts {
+  processed?: number
+  failed?: number
+  regions?: number
+}
+
+export interface WorkflowJobReport {
+  job_id: string
+  available: boolean
+  report?: {
+    total_samples?: number
+    exported_samples?: number
+    failed_samples?: number
+    committed_files?: number
+    ocr?: WorkflowStageCounts
+    caption?: Record<string, number>
+    replacement?: Record<string, number>
+  }
+}
+
 export interface WorkflowJobSummary {
   job_id: string
   status: WorkflowJobStatus

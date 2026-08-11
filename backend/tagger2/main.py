@@ -2677,6 +2677,8 @@ def create_app(settings: AppConfig | None = None) -> FastAPI:
             allowlist=runtime.allowlist,
             resource_catalog=runtime.workflow_resources,
             database=runtime.workflow_database,
+            model_registry=runtime.registry,
+            inference_engine=runtime.engine,
         ),
         dependencies=[Depends(authorize)],
     )

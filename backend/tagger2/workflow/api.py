@@ -1,4 +1,4 @@
-﻿"""Workflow API routes."""
+"""Workflow API routes."""
 
 from fastapi import APIRouter, HTTPException, BackgroundTasks
 from typing import Any, Callable, Literal, Sequence
@@ -6,6 +6,7 @@ from typing import Any, Callable, Literal, Sequence
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
+import json
 from pathlib import Path
 
 from ..security import PathAllowlist, PathNotAllowedError
@@ -88,7 +89,12 @@ class WorkflowResourceImportRequest(BaseModel):
 
 
 class WorkflowResourceImportPreviewResponse(BaseModel):
-    """Response for a resource import preview."""
+    """Response for a resource import preview.
+
+    ``rule_count`` is the category-neutral "usable rows" count: executable rules
+    for a replacement index, tags for a classification snapshot. The snapshot
+    specific counters stay optional so a replacement preview is unchanged.
+    """
 
     valid: bool
     errors: list[str]
@@ -97,6 +103,11 @@ class WorkflowResourceImportPreviewResponse(BaseModel):
     action_counts: dict[str, int]
     passthrough_count: int
     fingerprint: str | None
+    profile: str | None = None
+    tag_count: int | None = None
+    alias_count: int | None = None
+    implication_count: int | None = None
+    category_counts: dict[str, int] | None = None
 
 
 def _preflight_http_error(error: WorkflowPreflightError) -> HTTPException:
@@ -123,6 +134,8 @@ def create_workflow_router(
     resource_catalog: WorkflowResourceCatalog,
     database: WorkflowDatabase | None = None,
     token_counter: Callable[[Sequence[str]], Sequence[int]] | None = None,
+    model_registry: Any | None = None,
+    inference_engine: Any | None = None,
 ) -> APIRouter:
     """Create workflow API router.
 
@@ -151,10 +164,10 @@ def create_workflow_router(
                 return
     
             lifecycle = JobLifecycle(database, job_id)
-            lifecycle.transition_to("running")
+            lifecycle.transition("running")
     
-            config = WorkflowJobConfigV1.from_payload(job["config"])
-            workspace = Path(job["workspace"])
+            config = WorkflowJobConfigV1.from_payload(json.loads(job["config_json"]))
+            workspace = Path(job["workspace_path"])
     
             # Resolve physical paths from root references
             source_path = None
@@ -174,8 +187,8 @@ def create_workflow_router(
                 else:
                     raise ValueError("full_copy requires output_root")
             except PathNotAllowedError as exc:
-                lifecycle.transition_to("failed")
-                database.update_job(job_id, error_message=f"path not allowed: {exc}")
+                lifecycle.transition("failed")
+                database.update_job_status(job_id, status="failed", error=f"path not allowed: {exc}")
                 return
     
             # Wire up resources from catalog
@@ -186,19 +199,94 @@ def create_workflow_router(
                 if replacement_index_path is None:
                     raise ValueError("replace stage enabled but e621-replacement-index-v1 not found in catalog")
             
-            # TODO: wire up tag_predictor, policy_config, token_counter when available
+            # Wire up tag predictor from inference engine
+            tag_predictor = None
+            if config.caption.get("enabled") and inference_engine is not None and model_registry is not None:
+                from .stages.caption import EngineTagPredictor
+                model_id = str(config.caption.get("model_id", ""))
+                if model_id and model_registry.get_model(model_id) is not None:
+                    threshold_mode = str(config.caption.get("threshold_mode", "model_default"))
+                    tag_predictor = EngineTagPredictor(
+                        engine=inference_engine,
+                        model_id=model_id,
+                        threshold=None if threshold_mode == "model_default" else float(config.caption.get("threshold", 0.35)),
+                        category_thresholds=config.caption.get("category_thresholds"),
+                        use_category_thresholds=bool(config.caption.get("use_category_thresholds", True)),
+                    )
+
+            # Wire up classification rules from the registered snapshot. A
+            # missing or unreadable snapshot fails the job instead of letting
+            # Classify silently produce nothing.
+            classification_rules = None
+            if config.classify.get("enabled"):
+                from .classify_snapshot import (
+                    ClassifySnapshotError,
+                    load_classification_rules,
+                )
+
+                classify_resource_id = str(config.classify.get("resource_id", ""))
+                if not classify_resource_id:
+                    raise ValueError("classify stage is enabled but no resource_id was configured")
+                classify_path = resource_catalog.get_resource_path(classify_resource_id)
+                if classify_path is None:
+                    raise ValueError(
+                        "classify stage is enabled but the classification snapshot"
+                        f" is not registered: {classify_resource_id}"
+                    )
+                try:
+                    classification_rules = load_classification_rules(classify_path)
+                except ClassifySnapshotError as exc:
+                    raise ValueError(f"failed to load classification rules: {exc}") from exc
+                if classification_rules.profile != config.profile:
+                    raise ValueError(
+                        "classification snapshot profile"
+                        f" {classification_rules.profile!r} does not match the job profile"
+                        f" {config.profile!r}"
+                    )
+
+            # OCR runs in an isolated runtime. Building the engine is what
+            # detects a missing runtime, and the stage turns that into a
+            # non-blocking warning rather than failing the job.
+            ocr_engine = None
+            if config.ocr.get("enabled"):
+                from .ocr import PaddleOCREngine
+
+                try:
+                    ocr_engine = PaddleOCREngine()
+                except RuntimeError:
+                    ocr_engine = None
+
+            # Policy config passed through if enabled
+            policy_config_arg = config.policy if config.policy.get("enabled") else None
+
+            # Token counter passed through if available
+            token_counter_arg = token_counter if config.token_budget.get("enabled") else None
+
             report = run_offline_pipeline(
                 config,
                 source_root=source_path,
                 output_root=output_path,
                 workspace=workspace,
                 replacement_index_path=replacement_index_path,
+                tag_predictor=tag_predictor,
+                classification_rules=classification_rules,
+                policy_config=policy_config_arg,
+                token_counter=token_counter_arg,
+                ocr_engine=ocr_engine,
             )
     
-            # Seed count review if decisions exist
-            if report.count_decisions:
-                count_store = CountReviewStore(database, job_id)
-                count_store.initialize(report.count_decisions)
+            # Persist the stage report so the UI can read per-stage counters
+            # (OCR included) without the pipeline holding process state.
+            try:
+                (workspace / "pipeline_report.json").write_text(
+                    json.dumps(report.as_dict(), ensure_ascii=False, indent=2, default=str),
+                    encoding="utf-8",
+                )
+            except OSError:
+                # A missing report must not fail an otherwise successful run.
+                pass
+
+            # Count review is seeded during policy stage, not from pipeline report
     
             # Seed token review if overflows exist
             if report.token_overflows:
@@ -207,24 +295,21 @@ def create_workflow_router(
     
             # Mark completed or failed based on blocking issues
             has_blocking = any(
-                issue.get("blocking", False) for issue in report.issues
+                issue.blocking for issue in report.issues
             )
             final_status = "failed" if has_blocking else "completed"
-            lifecycle.transition_to(final_status)
+            lifecycle.transition(final_status)
     
-            if report.issues:
-                database.update_job(
-                    job_id,
-                    error_message=f"{len(report.issues)} issue(s) recorded",
-                )
+            # Issues are already persisted in the issues table via report
     
         except Exception as exc:
             try:
                 lifecycle = JobLifecycle(database, job_id)
-                lifecycle.transition_to("failed")
-                database.update_job(
+                lifecycle.transition("failed")
+                database.update_job_status(
                         job_id,
-                        error_message=f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}",
+                        status="failed",
+                        error=f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}",
                     )
             except Exception:
                 pass  # Already failed, no need to propagate
@@ -283,7 +368,7 @@ def create_workflow_router(
     ) -> WorkflowResourceImportPreviewResponse:
         """Validate a resource file without importing it."""
         source_path = _resolve_resource_source(request)
-        report = resource_catalog.validate_csv_resource(source_path)
+        report = resource_catalog.validate_resource(source_path, request.category)
 
         warnings: list[str] = []
         if report.get("truncated"):
@@ -301,6 +386,11 @@ def create_workflow_router(
             fingerprint=(
                 resource_catalog.fingerprint_file(source_path) if report["valid"] else None
             ),
+            profile=report.get("profile") or None,
+            tag_count=report.get("tag_count"),
+            alias_count=report.get("alias_count"),
+            implication_count=report.get("implication_count"),
+            category_counts=report.get("category_counts"),
         )
 
     @router.post("/resources/import/apply")
@@ -310,7 +400,7 @@ def create_workflow_router(
         """Import and register a resource after re-validating it."""
         source_path = _resolve_resource_source(request)
 
-        report = resource_catalog.validate_csv_resource(source_path)
+        report = resource_catalog.validate_resource(source_path, request.category)
         if not report["valid"]:
             raise HTTPException(
                 status_code=400,
@@ -667,6 +757,32 @@ def create_workflow_router(
             finished_at=job["finished_at"],
             error=job["error"],
         )
+
+    @router.get("/jobs/{job_id}/report")
+    async def get_job_report(job_id: str) -> dict[str, Any]:
+        """Return the persisted per-stage report for a finished job.
+
+        Returns ``{"available": false}`` while a job has not written its report
+        yet, so the client can render an empty state instead of treating a
+        pending job as an error.
+        """
+        job = database.get_job(job_id)
+        if not job:
+            raise HTTPException(
+                status_code=404,
+                detail={"code": "job_not_found", "message": f"unknown job: {job_id}"},
+            )
+        report_path = Path(job["workspace_path"]) / "pipeline_report.json"
+        if not report_path.is_file():
+            return {"job_id": job_id, "available": False}
+        try:
+            payload = json.loads(report_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise HTTPException(
+                status_code=500,
+                detail={"code": "report_unreadable", "message": str(exc)},
+            ) from exc
+        return {"job_id": job_id, "available": True, "report": payload}
 
     @router.get("/jobs/{job_id}/issues")
     async def list_job_issues(job_id: str, blocking_only: bool = False) -> list[dict[str, Any]]:

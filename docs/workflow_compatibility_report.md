@@ -19,8 +19,12 @@ verified.
 | Isolated workflow database and resource catalog | Implemented, tested |
 | API under `/api/v1/workflows` | Implemented, contract-tested |
 | Bilingual Dataset Workflow page | Implemented, tested |
-| Caption / Classify / OCR / NL / Count Review / Policy / Token Budget | Not implemented yet |
-| Pause / resume / repair / lease recovery | Not implemented yet |
+| Caption (adapter onto the host inference engine) | Implemented, tested |
+| Classify (official snapshot -> nine fields) | Implemented, tested |
+| OCR (isolated PaddleOCR runtime, sidecar output) | Implemented, tested with an engine double |
+| NL / Count Review / Policy / Token Budget | Implemented, tested |
+| Pause / resume / repair / lease recovery | Implemented, tested |
+| Bilingual page incl. OCR controls and per-stage report | Implemented, tested |
 
 The existing product surface is unchanged: `tagger2.sqlite3` (~804 MB) is not
 migrated or rewritten, the ~23.5 GB of model assets are not copied, and the
@@ -104,7 +108,9 @@ Confirmed by automated tests plus a 300-sample run against the real index:
   falls back to another path.
 - Animated WebP is rejected; unrelated file extensions are skipped, not failed.
 - RGBA input is composited onto white rather than silently losing alpha.
-- `full_copy` leaves the source dataset byte-identical.
+- `full_copy` leaves the source dataset byte-identical and copies each
+  sample's image alongside its annotation, so the output root is a complete
+  dataset rather than annotations without images.
 - `in_place` writes a verified ZIP64 backup first, and restoring it returns the
   original bytes and removes files the run created.
 - A blocking issue fails closed: nothing is committed and the journal records
@@ -118,23 +124,73 @@ Real-index spot check (`male, anthro, watermark, duo_focus, solo, fur, forest`):
 `watermark` has no rule and passes through. Flat TXT renders as
 `male, furry, watermark, duo focus, solo, body fur, forest.`
 
-## 5. Not implemented yet
+## 5. Stage status
 
-These stages are designed for but not built. They are absent, not stubbed to
-look successful:
+Every pipeline stage is now built and wired through the API. What remains
+unbuilt is listed at the end of this section rather than being implied.
 
-- Caption (adapter onto the existing `LocalInferenceEngine` and `ModelRegistry`)
-- Classify (e621 and Danbooru dictionaries)
-- OCR (isolated PaddleOCR runtime and versioned sidecar protocol)
-- NL (adapter onto the existing provider clients and `SecretStore`)
-- Count Review (single, batch and confirm flows)
-- Dropout / Policy (directory-name-to-artist, seeded dropout)
-- Token Budget (tokenizer counting and overflow review)
-- Pause / resume / repair / lease expiry / discard / retention
-- SSE event stream for workflow jobs
+### Classify
 
-The job record and issue tables already carry the columns these stages need, and
-the workspace layout, staging tree and commit journal are stage-agnostic.
+Classify reads a `classify-snapshot-v1` resource: one JSON bundle holding the
+official tag table, the alias table and the implication table. The published
+e621/Danbooru DB exports encode `category` as an integer, so
+`build_snapshot_from_official_csv` maps it through a per-profile table and an
+unmapped code is an error rather than being folded into `general`. Only `active`
+alias rows are kept, matching what the sites themselves apply. Alias chains are
+flattened with cycle detection, and validation runs the real rule builder so a
+cycle cannot pass a row-level check.
+
+Import with `scripts/import_classification_snapshot.py` (use `--dry-run` to
+validate without registering). The snapshots themselves are not bundled.
+
+Field mapping is deterministic, never a guess: `character` and `artist` come
+from those categories (an artist tag is merged into the `artist` field, not
+discarded), `species` fills `appearance`, `rating_*` meta fills `quality`, and
+everything else lands in `tags`. `series` stays empty for e621, matching the
+frozen source behaviour, so a `copyright` tag is kept in `tags`. `environment`
+is only filled by a category that states the distinction, so with the current
+official categories it stays empty rather than being populated by a heuristic.
+
+### OCR
+
+OCR is off by default. It runs PaddleOCR in a separate interpreter
+(`runtime_ocr/`, created by `scripts/setup_ocr_runtime.ps1`) because that
+dependency stack conflicts with the main runtime. Results are written to
+`<workspace>/ocr_sidecars/<relative_path>.ocr.json` carrying `version: v1`, and
+an existing sidecar is reused unless `force_reprocess` is set.
+
+OCR never touches the nine-field payload and never blocks a run: a missing
+runtime yields `ocr_unavailable` and a failed image yields `ocr_failed`, both
+`severity=warning`, `blocking=false`, and the dataset still commits. This is
+covered by tests asserting the exported JSON keys are unchanged and that a
+failing engine still produces a committed file.
+
+**Not verified:** real PaddleOCR recognition accuracy. The stage is tested
+against an engine double, so the subprocess protocol, sidecar format, caching
+and failure handling are verified, but no real model has been run here.
+
+### Fail-closed profile handling
+
+Preflight refuses, as blocking errors rather than warnings:
+
+- Classify enabled with no snapshot selected.
+- A snapshot id that is not registered, or a registered file that cannot be
+  parsed.
+- A snapshot whose `profile` differs from the job profile, in either direction.
+  There is no cross-profile fallback.
+- A Danbooru job with Replace enabled but no Danbooru index selected; the e621
+  index is not accepted as a substitute.
+
+Selecting the Danbooru profile with the dependent stages off is allowed and
+carries a warning that its resources are not bundled.
+
+### Still not built
+
+- SSE event stream for workflow jobs (status is polled instead).
+- Automated download of the official snapshots. Import is a local, explicit
+  step; nothing is fetched over the network on the project's behalf.
+- Danbooru-specific replacement and count resources. The profile is selectable
+  and fails closed; no substitute data is invented.
 
 ## 6. Resources that cannot be reproduced
 
@@ -164,8 +220,13 @@ npm run lint
 npm run build
 ```
 
-Current results: backend 136 passed / 1 skipped; frontend 20 passed
-(13 pre-existing plus 7 new); frontend lint clean; production build succeeds.
+Current results: backend 282 passed / 1 skipped; frontend 35 passed;
+frontend lint clean (`--max-warnings 0`); `tsc -b` clean.
+
+Note on running the backend suite: use the project runtime
+(`.\runtime\python.exe`). It puts only `backend` on `sys.path`, so test modules
+must import as `tagger2.*` at module level. A `backend.tagger2.*` import at
+module level passes under a system Python and fails under the project runtime.
 
 `backend/tests/test_workflow_ports.py` asserts that each verbatim-ported file is
 still byte-identical to its source counterpart (skipped automatically when the

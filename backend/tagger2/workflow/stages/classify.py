@@ -101,14 +101,16 @@ def build_classification_rules(
         visited = {source}
         current = source
         for _ in range(1000):  # Arbitrary limit to prevent infinite loops
-            target = raw_aliases.get(current)
-            if target is None:
+            next_target = raw_aliases.get(current)
+            if next_target is None:
                 aliases[source] = current
                 break
-            if target in visited:
-                raise ClassifyError(f"alias cycle detected: {source} -> {' -> '.join(visited)} -> {target}")
-            visited.add(target)
-            current = target
+            if next_target in visited:
+                raise ClassifyError(
+                    f"alias cycle detected: {source} -> {' -> '.join(visited)} -> {next_target}"
+                )
+            visited.add(next_target)
+            current = next_target
         else:
             raise ClassifyError(f"alias chain too long: {source}")
     
@@ -143,8 +145,10 @@ def classify_tags(
         rules: Classification rules for the target profile
     
     Returns:
-        Dictionary with keys: quality, character, appearance, tags, environment
-        (count, series, artist, nl are handled elsewhere)
+        Dictionary with keys: quality, character, artist, appearance, tags,
+        environment. ``count``, ``series`` and ``nl`` are decided elsewhere:
+        ``count`` comes from the count rules, ``nl`` from the NL stage, and
+        ``series`` stays empty for e621 by frozen source behaviour.
     """
     
     # Normalize all tags through alias resolution
@@ -157,6 +161,7 @@ def classify_tags(
     # Classify by category
     quality: list[str] = []
     character: list[str] = []
+    artist: list[str] = []
     appearance: list[str] = []
     tags: list[str] = []
     environment: list[str] = []
@@ -168,10 +173,12 @@ def classify_tags(
         if category == "character":
             character.append(tag)
         elif category == "artist":
-            # Artist is handled separately in the pipeline
-            continue
+            # Returned separately so the caller can merge it into the `artist`
+            # string field; dropping it here would lose the tag entirely.
+            artist.append(tag)
         elif category == "copyright":
-            # Series is handled separately (e621) or maps to tags (danbooru)
+            # `series` stays empty for e621 by frozen source behaviour, so a
+            # copyright tag is kept in `tags` rather than being discarded.
             tags.append(tag)
         elif category == "meta":
             # Meta tags like ratings go to quality
@@ -183,13 +190,16 @@ def classify_tags(
             # Species goes to appearance for e621
             appearance.append(tag)
         else:
-            # General tags: need heuristics for appearance vs environment vs tags
-            # For now, put everything in tags; refined classification TBD
+            # A general tag that cannot be reliably subdivided lands in `tags`
+            # deterministically. `appearance` and `environment` are only filled
+            # from categories that state the distinction (for example species),
+            # never from a guess about a general tag.
             tags.append(tag)
     
     return {
         "quality": quality,
         "character": character,
+        "artist": artist,
         "appearance": appearance,
         "tags": tags,
         "environment": environment,
