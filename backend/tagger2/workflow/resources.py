@@ -112,60 +112,22 @@ class WorkflowResourceCatalog:
         return resource_path if resource_path.exists() else None
 
     def validate_csv_resource(self, csv_path: Path) -> dict[str, Any]:
-        """Validate CSV resource before import."""
-        import csv
-        
-        errors: list[str] = []
-        line_count = 0
-        
-        try:
-            with csv_path.open("r", encoding="utf-8", newline="") as f:
-                reader = csv.DictReader(f)
-                headers = reader.fieldnames
-                
-                if not headers:
-                    errors.append("CSV file has no headers")
-                    return {"valid": False, "errors": errors, "line_count": 0}
-                
-                required_headers = {"source", "action", "target"}
-                if not required_headers.issubset(set(headers)):
-                    errors.append(f"CSV missing required headers: {required_headers - set(headers)}")
-                    return {"valid": False, "errors": errors, "line_count": 0}
-                
-                seen_sources: set[str] = set()
-                
-                for i, row in enumerate(reader, start=2):
-                    line_count += 1
-                    source = row.get("source", "").strip()
-                    action = row.get("action", "").strip()
-                    target = row.get("target", "").strip()
-                    
-                    if not source:
-                        errors.append(f"Line {i}: empty source")
-                    
-                    if source in seen_sources:
-                        errors.append(f"Line {i}: duplicate source '{source}'")
-                    seen_sources.add(source)
-                    
-                    if action not in {"keep", "replace", "drop"}:
-                        errors.append(f"Line {i}: invalid action '{action}'")
-                    
-                    if action == "replace" and not target:
-                        errors.append(f"Line {i}: replace action requires target")
-                    
-                    if len(errors) >= 100:
-                        errors.append("Too many errors, stopping validation")
-                        break
-        
-        except UnicodeDecodeError:
-            errors.append("File is not valid UTF-8")
-        except Exception as e:
-            errors.append(f"CSV parsing error: {e}")
-        
+        """Validate a replacement index CSV before import.
+
+        Delegates to the ported replacement-index reader so the accepted
+        format is exactly the source project's ``e621-replacement-csv-v1``.
+        """
+
+        from .replacement_index import validate_replacement_index
+
+        report = validate_replacement_index(csv_path)
         return {
-            "valid": len(errors) == 0,
-            "errors": errors,
-            "line_count": line_count,
+            "valid": report.valid,
+            "errors": report.errors,
+            "line_count": report.rule_count,
+            "action_counts": report.action_counts,
+            "pipe_replacement_count": report.pipe_replacement_count,
+            "truncated": report.truncated,
         }
 
 

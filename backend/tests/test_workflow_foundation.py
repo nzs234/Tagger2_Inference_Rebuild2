@@ -122,61 +122,109 @@ def test_workflow_database():
 
 
 def test_workflow_resource_catalog():
-    """Test workflow resource catalog operations."""
+    """Test workflow resource catalog operations against the real CSV contract."""
     from backend.tagger2.workflow.resources import WorkflowResourceCatalog
-    
+
     with tempfile.TemporaryDirectory() as tmpdir:
         resource_dir = Path(tmpdir) / "resources"
         catalog = WorkflowResourceCatalog(resource_dir)
-        
-        # Create a test CSV file
+
         csv_path = Path(tmpdir) / "test_replace.csv"
-        csv_content = """source,action,target
-tag1,keep,
-tag2,replace,new_tag2
-tag3,drop,
-"""
+        csv_content = (
+            "source_tag,canonical_e621_tag,action,replacement_tags\n"
+            "male,male,keep,male\n"
+            "anthro,anthro,replace,furry\n"
+            "duo_focus,duo_focus,replace,duo|focus\n"
+            "meta_tag,meta_tag,drop,\n"
+        )
         csv_path.write_text(csv_content, encoding="utf-8")
-        
-        # Validate CSV
+
         validation = catalog.validate_csv_resource(csv_path)
-        assert validation["valid"] is True
-        assert validation["line_count"] == 3
-        assert len(validation["errors"]) == 0
-        
-        # Import resource
+        assert validation["valid"] is True, validation["errors"]
+        assert validation["line_count"] == 4
+        assert validation["action_counts"] == {"keep": 1, "replace": 2, "drop": 1}
+        assert validation["pipe_replacement_count"] == 1
+
         manifest = catalog.import_resource(
             source_path=csv_path,
             resource_id="replace-test-v1",
             category="replace",
         )
-        
+
         assert manifest.resource_id == "replace-test-v1"
         assert manifest.category == "replace"
         assert len(manifest.resource_fingerprint) == 64
-        
-        # Get manifest
+
         retrieved = catalog.get_manifest("replace-test-v1")
         assert retrieved is not None
-        assert retrieved.resource_id == manifest.resource_id
         assert retrieved.resource_fingerprint == manifest.resource_fingerprint
-        
-        # List resources
+
         resources = catalog.list_resources()
-        assert len(resources) == 1
-        assert resources[0].resource_id == "replace-test-v1"
-        
-        # Get resource path
+        assert [item.resource_id for item in resources] == ["replace-test-v1"]
+
         resource_path = catalog.get_resource_path("replace-test-v1")
-        assert resource_path is not None
-        assert resource_path.exists()
-        
-        # Test invalid CSV
-        bad_csv_path = Path(tmpdir) / "bad.csv"
-        bad_csv_path.write_text("source,action\ntag1,invalid_action\n", encoding="utf-8")
-        bad_validation = catalog.validate_csv_resource(bad_csv_path)
-        assert bad_validation["valid"] is False
-        assert len(bad_validation["errors"]) > 0
+        assert resource_path is not None and resource_path.exists()
+
+        # Import is content-addressed: re-importing the same bytes is stable.
+        again = catalog.import_resource(
+            source_path=csv_path,
+            resource_id="replace-test-v1",
+            category="replace",
+        )
+        assert again.resource_fingerprint == manifest.resource_fingerprint
+
+
+def test_workflow_replacement_index_rejects_bad_rows():
+    """Invalid replacement rows are reported with their line numbers."""
+    from backend.tagger2.workflow.replacement_index import (
+        ReplacementIndexError,
+        load_replacement_rules,
+        validate_replacement_index,
+    )
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bad = Path(tmpdir) / "bad.csv"
+        bad.write_text(
+            "source_tag,canonical_e621_tag,action,replacement_tags\n"
+            "a,a,bogus,a\n"
+            "b,b,drop,should_be_empty\n"
+            "c,c,keep,\n"
+            "a,a,keep,a\n",
+            encoding="utf-8",
+        )
+        report = validate_replacement_index(bad)
+        assert report.valid is False
+        assert len(report.errors) == 4
+        assert all(error.startswith("line ") for error in report.errors)
+        assert "line 2" in report.errors[0]
+        assert "line 5" in report.errors[3]
+
+        wrong_header = Path(tmpdir) / "header.csv"
+        wrong_header.write_text("source,action,target\na,keep,a\n", encoding="utf-8")
+        header_report = validate_replacement_index(wrong_header)
+        assert header_report.valid is False
+        assert "header" in header_report.errors[0]
+
+        good = Path(tmpdir) / "good.csv"
+        good.write_text(
+            "source_tag,canonical_e621_tag,action,replacement_tags\n"
+            "male,male,keep,male\n"
+            "anthro,anthro,replace,furry|beast\n"
+            "junk,junk,drop,\n",
+            encoding="utf-8",
+        )
+        rules = load_replacement_rules(good)
+        assert rules["male"].action == "keep"
+        assert rules["male"].replacement_tags == ("male",)
+        assert rules["anthro"].replacement_tags == ("furry", "beast")
+        assert rules["junk"].replacement_tags == ()
+
+        try:
+            load_replacement_rules(bad)
+        except ReplacementIndexError as exc:
+            assert "line 2" in str(exc)
+        else:
+            raise AssertionError("expected ReplacementIndexError")
 
 
 def test_workflow_preflight():
