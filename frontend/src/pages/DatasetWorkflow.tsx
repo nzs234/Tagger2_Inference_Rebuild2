@@ -1,0 +1,531 @@
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { AlertTriangle, CheckCircle2, Database, RefreshCw, Upload } from 'lucide-react'
+import { useMemo, useState } from 'react'
+import { Button, EmptyState, Field, Notice, Panel, StatusBadge } from '../components/ui'
+import { api } from '../lib/api'
+import { copyFor } from '../lib/workflowCopy'
+import { usePreferences } from '../store/app'
+import type {
+  WorkflowExportFormat,
+  WorkflowImportPreview,
+  WorkflowPreflightReport,
+  WorkflowProfile,
+  WorkflowWorkMode,
+} from '../types'
+
+interface JobDraft {
+  profile: WorkflowProfile
+  workMode: WorkflowWorkMode
+  sourceRootId: string
+  sourceRelativePath: string
+  outputRootId: string
+  outputRelativePath: string
+  exportFormat: WorkflowExportFormat
+  recursive: boolean
+  replaceEnabled: boolean
+  replaceResourceId: string
+}
+
+const emptyDraft: JobDraft = {
+  profile: 'e621',
+  workMode: 'full_copy',
+  sourceRootId: '',
+  sourceRelativePath: '',
+  outputRootId: '',
+  outputRelativePath: '',
+  exportFormat: 'both',
+  recursive: false,
+  replaceEnabled: true,
+  replaceResourceId: '',
+}
+
+export function DatasetWorkflow() {
+  const language = usePreferences((state) => state.workflowLanguage)
+  const setLanguage = usePreferences((state) => state.setWorkflowLanguage)
+  const text = copyFor(language)
+  const queryClient = useQueryClient()
+
+  const [draft, setDraft] = useState<JobDraft>(emptyDraft)
+  const [selectedJobId, setSelectedJobId] = useState<string>()
+  const [preflight, setPreflight] = useState<WorkflowPreflightReport>()
+  const [preflightError, setPreflightError] = useState<string>()
+  const [importForm, setImportForm] = useState({ rootId: '', relativePath: '', resourceId: '' })
+  const [importPreview, setImportPreview] = useState<WorkflowImportPreview>()
+  const [importError, setImportError] = useState<string>()
+
+  const roots = useQuery({ queryKey: ['roots'], queryFn: api.roots, retry: false })
+  const resources = useQuery({
+    queryKey: ['workflow', 'resources'],
+    queryFn: () => api.workflowResources(),
+    retry: false,
+  })
+  const jobs = useQuery({
+    queryKey: ['workflow', 'jobs'],
+    queryFn: () => api.workflowJobs(),
+    retry: false,
+    refetchInterval: 5_000,
+  })
+  const issues = useQuery({
+    queryKey: ['workflow', 'issues', selectedJobId],
+    queryFn: () => api.workflowIssues(selectedJobId as string),
+    enabled: Boolean(selectedJobId),
+    retry: false,
+  })
+
+  const rootOptions = roots.data?.items ?? []
+
+  const jobConfig = useMemo(() => {
+    const config: Record<string, unknown> = {
+      profile: draft.profile,
+      work_mode: draft.workMode,
+      overwrite_mode: 'incremental',
+      source_root: { root_id: draft.sourceRootId, relative_path: draft.sourceRelativePath },
+      recursive: draft.recursive,
+      caption: { enabled: false, input_txt_mode: 'tag' },
+      classify: { enabled: false },
+      replace: draft.replaceEnabled
+        ? { enabled: true, resource_id: draft.replaceResourceId }
+        : { enabled: false },
+      ocr: { enabled: false },
+      nl: { enabled: false },
+      token_budget: { enabled: false },
+      export: { format: draft.exportFormat },
+    }
+    if (draft.workMode === 'full_copy') {
+      config.output_root = { root_id: draft.outputRootId, relative_path: draft.outputRelativePath }
+    }
+    return config
+  }, [draft])
+
+  const preflightMutation = useMutation({
+    mutationFn: () => api.workflowPreflight(jobConfig),
+    onMutate: () => {
+      setPreflight(undefined)
+      setPreflightError(undefined)
+    },
+    onSuccess: (report) => setPreflight(report),
+    onError: (error: Error) => setPreflightError(error.message),
+  })
+
+  const createMutation = useMutation({
+    mutationFn: () => api.workflowCreateJob(jobConfig),
+    onSuccess: (created) => {
+      setSelectedJobId(created.job_id)
+      void queryClient.invalidateQueries({ queryKey: ['workflow', 'jobs'] })
+    },
+    onError: (error: Error) => setPreflightError(error.message),
+  })
+
+  const previewMutation = useMutation({
+    mutationFn: () =>
+      api.workflowImportPreview({
+        root_id: importForm.rootId,
+        relative_path: importForm.relativePath,
+        resource_id: importForm.resourceId,
+        category: 'replace',
+      }),
+    onMutate: () => {
+      setImportPreview(undefined)
+      setImportError(undefined)
+    },
+    onSuccess: (report) => setImportPreview(report),
+    onError: (error: Error) => setImportError(error.message),
+  })
+
+  const applyMutation = useMutation({
+    mutationFn: () =>
+      api.workflowImportApply({
+        root_id: importForm.rootId,
+        relative_path: importForm.relativePath,
+        resource_id: importForm.resourceId,
+        category: 'replace',
+      }),
+    onSuccess: () => {
+      setImportPreview(undefined)
+      void queryClient.invalidateQueries({ queryKey: ['workflow', 'resources'] })
+    },
+    onError: (error: Error) => setImportError(error.message),
+  })
+
+  const canPreflight = Boolean(
+    draft.sourceRootId && (draft.workMode === 'in_place' || draft.outputRootId),
+  )
+
+  return (
+    <div className="page page-dataset-workflow">
+      <div className="page-heading">
+        <div className="page-heading-copy">
+          <p className="eyebrow">DATASET WORKFLOW</p>
+          <h1>{text.title}</h1>
+          <p className="page-subtitle">{text.subtitle}</p>
+        </div>
+        <div className="workflow-language" role="group" aria-label={text.languageLabel}>
+          <Button
+            variant={language === 'zh' ? 'primary' : 'quiet'}
+            onClick={() => setLanguage('zh')}
+            aria-pressed={language === 'zh'}
+          >
+            {text.chinese}
+          </Button>
+          <Button
+            variant={language === 'en' ? 'primary' : 'quiet'}
+            onClick={() => setLanguage('en')}
+            aria-pressed={language === 'en'}
+          >
+            {text.english}
+          </Button>
+        </div>
+      </div>
+
+      <Notice tone="info">
+        <strong>{text.compatibilityTitle}</strong>
+        <div>{text.compatibilityBody}</div>
+      </Notice>
+
+      <Panel title={text.importTitle} eyebrow="Resources">
+        <div className="form-grid">
+          <Field label={text.importRootId}>
+            <select
+              value={importForm.rootId}
+              onChange={(event) => setImportForm({ ...importForm, rootId: event.target.value })}
+            >
+              <option value="">—</option>
+              {rootOptions.map((root) => (
+                <option key={root.id} value={root.id}>
+                  {root.name} ({root.kind})
+                </option>
+              ))}
+            </select>
+          </Field>
+          <Field label={text.importRelativePath}>
+            <input
+              value={importForm.relativePath}
+              onChange={(event) => setImportForm({ ...importForm, relativePath: event.target.value })}
+              placeholder="e621_general_tag_replacement_index.csv"
+            />
+          </Field>
+          <Field label={text.importResourceId}>
+            <input
+              value={importForm.resourceId}
+              onChange={(event) => setImportForm({ ...importForm, resourceId: event.target.value })}
+              placeholder="replace-e621-local-v1"
+            />
+          </Field>
+        </div>
+        <div className="workflow-button-row">
+          <Button
+            icon={<RefreshCw size={15} />}
+            onClick={() => previewMutation.mutate()}
+            disabled={
+              previewMutation.isPending ||
+              !importForm.rootId ||
+              !importForm.relativePath ||
+              !importForm.resourceId
+            }
+          >
+            {text.importPreview}
+          </Button>
+          <Button
+            variant="primary"
+            icon={<Upload size={15} />}
+            onClick={() => applyMutation.mutate()}
+            disabled={applyMutation.isPending || !importPreview?.valid}
+          >
+            {text.importApply}
+          </Button>
+        </div>
+
+        {importError && <Notice tone="danger">{importError}</Notice>}
+        {importPreview && (
+          <Notice tone={importPreview.valid ? 'success' : 'danger'}>
+            <strong>
+              {importPreview.valid ? text.importPreviewOk : text.importPreviewFailed}
+            </strong>
+            <div>
+              {text.importRuleCount}: {importPreview.rule_count} · {text.importPassthrough}:{' '}
+              {importPreview.passthrough_count}
+            </div>
+            {importPreview.fingerprint && (
+              <div className="workflow-mono">
+                {text.importFingerprint}: {importPreview.fingerprint.slice(0, 16)}…
+              </div>
+            )}
+            {importPreview.warnings.map((warning) => (
+              <div key={warning}>{warning}</div>
+            ))}
+            {importPreview.errors.slice(0, 10).map((error) => (
+              <div key={error}>{error}</div>
+            ))}
+          </Notice>
+        )}
+      </Panel>
+
+      <Panel title={text.resourcesTitle} eyebrow="Catalog">
+        {resources.data && resources.data.length > 0 ? (
+          <table className="workflow-table">
+            <thead>
+              <tr>
+                <th>{text.resourceId}</th>
+                <th>{text.resourceCategory}</th>
+                <th>{text.resourceFingerprint}</th>
+              </tr>
+            </thead>
+            <tbody>
+              {resources.data.map((resource) => (
+                <tr key={resource.resource_id}>
+                  <td>{resource.resource_id}</td>
+                  <td>{resource.category}</td>
+                  <td className="workflow-mono">{resource.fingerprint.slice(0, 16)}…</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        ) : (
+          <EmptyState icon={<Database size={20} />} title={text.resourcesEmpty} />
+        )}
+      </Panel>
+
+      <Panel title={text.createJobTitle} eyebrow="Pipeline">
+        <div className="form-grid">
+          <Field label={text.profile}>
+            <select
+              value={draft.profile}
+              onChange={(event) =>
+                setDraft({ ...draft, profile: event.target.value as WorkflowProfile })
+              }
+            >
+              <option value="e621">e621</option>
+              <option value="danbooru">danbooru</option>
+            </select>
+          </Field>
+          <Field label={text.workMode}>
+            <select
+              value={draft.workMode}
+              onChange={(event) =>
+                setDraft({ ...draft, workMode: event.target.value as WorkflowWorkMode })
+              }
+            >
+              <option value="full_copy">{text.workModeFullCopy}</option>
+              <option value="in_place">{text.workModeInPlace}</option>
+            </select>
+          </Field>
+          <Field label={text.sourceRoot}>
+            <select
+              value={draft.sourceRootId}
+              onChange={(event) => setDraft({ ...draft, sourceRootId: event.target.value })}
+            >
+              <option value="">—</option>
+              {rootOptions.map((root) => (
+                <option key={root.id} value={root.id}>
+                  {root.name} ({root.kind})
+                </option>
+              ))}
+            </select>
+          </Field>
+          <Field label={`${text.sourceRoot} · ${text.relativePath}`}>
+            <input
+              value={draft.sourceRelativePath}
+              onChange={(event) => setDraft({ ...draft, sourceRelativePath: event.target.value })}
+            />
+          </Field>
+          {draft.workMode === 'full_copy' && (
+            <>
+              <Field label={text.outputRoot}>
+                <select
+                  value={draft.outputRootId}
+                  onChange={(event) => setDraft({ ...draft, outputRootId: event.target.value })}
+                >
+                  <option value="">—</option>
+                  {rootOptions
+                    .filter((root) => root.writable)
+                    .map((root) => (
+                      <option key={root.id} value={root.id}>
+                        {root.name} ({root.kind})
+                      </option>
+                    ))}
+                </select>
+              </Field>
+              <Field label={`${text.outputRoot} · ${text.relativePath}`}>
+                <input
+                  value={draft.outputRelativePath}
+                  onChange={(event) =>
+                    setDraft({ ...draft, outputRelativePath: event.target.value })
+                  }
+                />
+              </Field>
+            </>
+          )}
+          <Field label={text.exportFormat}>
+            <select
+              value={draft.exportFormat}
+              onChange={(event) =>
+                setDraft({ ...draft, exportFormat: event.target.value as WorkflowExportFormat })
+              }
+            >
+              <option value="both">{text.exportBoth}</option>
+              <option value="json">{text.exportJson}</option>
+              <option value="txt">{text.exportTxt}</option>
+            </select>
+          </Field>
+          <Field label={text.enableReplace}>
+            <select
+              value={draft.replaceEnabled ? 'yes' : 'no'}
+              onChange={(event) =>
+                setDraft({ ...draft, replaceEnabled: event.target.value === 'yes' })
+              }
+            >
+              <option value="yes">{text.yes}</option>
+              <option value="no">{text.no}</option>
+            </select>
+          </Field>
+          {draft.replaceEnabled && (
+            <Field label="Replace resource">
+              <select
+                value={draft.replaceResourceId}
+                onChange={(event) => setDraft({ ...draft, replaceResourceId: event.target.value })}
+              >
+                <option value="">—</option>
+                {(resources.data ?? [])
+                  .filter((resource) => resource.category === 'replace')
+                  .map((resource) => (
+                    <option key={resource.resource_id} value={resource.resource_id}>
+                      {resource.resource_id}
+                    </option>
+                  ))}
+              </select>
+            </Field>
+          )}
+          <Field label={text.recursive}>
+            <select
+              value={draft.recursive ? 'yes' : 'no'}
+              onChange={(event) => setDraft({ ...draft, recursive: event.target.value === 'yes' })}
+            >
+              <option value="no">{text.no}</option>
+              <option value="yes">{text.yes}</option>
+            </select>
+          </Field>
+        </div>
+
+        <div className="workflow-button-row">
+          <Button
+            onClick={() => preflightMutation.mutate()}
+            disabled={preflightMutation.isPending || !canPreflight}
+          >
+            {text.preflight}
+          </Button>
+          <Button
+            variant="primary"
+            onClick={() => createMutation.mutate()}
+            disabled={createMutation.isPending || !preflight?.valid}
+          >
+            {text.createJob}
+          </Button>
+        </div>
+
+        {preflightError && <Notice tone="danger">{preflightError}</Notice>}
+        {preflight && (
+          <Notice tone={preflight.valid ? 'success' : 'danger'}>
+            <strong>
+              {preflight.valid ? text.preflightOk : text.preflightFailed}
+            </strong>
+            {preflight.warnings.length > 0 && (
+              <div>
+                {text.warnings}: {preflight.warnings.join('; ')}
+              </div>
+            )}
+            {preflight.errors.map((error) => (
+              <div key={error}>{error}</div>
+            ))}
+          </Notice>
+        )}
+      </Panel>
+
+      <Panel
+        title={text.jobsTitle}
+        eyebrow="Jobs"
+        actions={
+          <Button
+            variant="quiet"
+            icon={<RefreshCw size={15} />}
+            onClick={() => void jobs.refetch()}
+          >
+            {text.refresh}
+          </Button>
+        }
+      >
+        {jobs.data && jobs.data.length > 0 ? (
+          <table className="workflow-table">
+            <thead>
+              <tr>
+                <th>{text.jobId}</th>
+                <th>{text.status}</th>
+                <th>{text.profile}</th>
+                <th>{text.samples}</th>
+                <th>{text.module}</th>
+                <th>{text.created}</th>
+              </tr>
+            </thead>
+            <tbody>
+              {jobs.data.map((job) => (
+                <tr
+                  key={job.job_id}
+                  onClick={() => setSelectedJobId(job.job_id)}
+                  className={job.job_id === selectedJobId ? 'row-active' : ''}
+                >
+                  <td className="workflow-mono">{job.job_id.slice(0, 12)}…</td>
+                  <td>
+                    <StatusBadge state={job.status} />
+                  </td>
+                  <td>{job.profile}</td>
+                  <td>
+                    {job.processed_samples}/{job.total_samples}
+                  </td>
+                  <td>{job.current_module_id ?? '—'}</td>
+                  <td className="workflow-mono">{job.created_at}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        ) : (
+          <EmptyState icon={<Database size={20} />} title={text.jobsEmpty} />
+        )}
+      </Panel>
+
+      {selectedJobId && (
+        <Panel title={text.issuesTitle} eyebrow={selectedJobId.slice(0, 12)}>
+          {issues.data && issues.data.length > 0 ? (
+            <table className="workflow-table">
+              <thead>
+                <tr>
+                  <th>{text.severity}</th>
+                  <th>{text.blocking}</th>
+                  <th>{text.module}</th>
+                  <th>{text.code}</th>
+                  <th>{text.message}</th>
+                </tr>
+              </thead>
+              <tbody>
+                {issues.data.map((issue) => (
+                  <tr key={issue.issue_id}>
+                    <td>
+                      {issue.severity === 'error' ? (
+                        <AlertTriangle size={15} aria-hidden="true" />
+                      ) : null}
+                      {issue.severity}
+                    </td>
+                    <td>{issue.blocking ? text.yes : text.no}</td>
+                    <td>{issue.module_id}</td>
+                    <td className="workflow-mono">{issue.code}</td>
+                    <td>{issue.message}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          ) : (
+            <EmptyState icon={<CheckCircle2 size={20} />} title={text.issuesEmpty} />
+          )}
+        </Panel>
+      )}
+    </div>
+  )
+}

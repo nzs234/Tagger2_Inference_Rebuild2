@@ -1,4 +1,4 @@
-﻿"""Workflow API routes."""
+"""Workflow API routes."""
 
 from __future__ import annotations
 

@@ -14,6 +14,12 @@ import type {
   RuntimeSettings,
   ScanResponse,
   UploadResponse,
+  WorkflowCapabilities,
+  WorkflowImportPreview,
+  WorkflowIssue,
+  WorkflowJobSummary,
+  WorkflowPreflightReport,
+  WorkflowResource,
   Fl2vaSingleImageRole,
   VideoPromptMode,
   VideoPromptPackage,
@@ -167,6 +173,51 @@ export const api = {
   settings: () => request<RuntimeSettings>('/settings'),
   saveSettings: (body: RuntimeSettings) =>
     request<RuntimeSettings>('/settings', { method: 'PUT', body: JSON.stringify(body) }),
+
+  // --- Dataset Workflow ---
+  workflowCapabilities: () => request<WorkflowCapabilities>('/workflows/capabilities'),
+  workflowResources: (category?: string) =>
+    request<WorkflowResource[]>(
+      category ? `/workflows/resources?category=${encodeURIComponent(category)}` : '/workflows/resources',
+    ),
+  workflowImportPreview: (body: {
+    root_id: string
+    relative_path: string
+    resource_id: string
+    category: string
+  }) =>
+    request<WorkflowImportPreview>('/workflows/resources/import/preview', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+  workflowImportApply: (body: {
+    root_id: string
+    relative_path: string
+    resource_id: string
+    category: string
+  }) =>
+    request<{ resource_id: string; fingerprint: string; category: string; rule_count: number }>(
+      '/workflows/resources/import/apply',
+      { method: 'POST', body: JSON.stringify(body) },
+    ),
+  workflowPreflight: (config: Record<string, unknown>) =>
+    request<WorkflowPreflightReport>('/workflows/jobs/preflight', {
+      method: 'POST',
+      body: JSON.stringify(config),
+    }),
+  workflowCreateJob: (config: Record<string, unknown>) =>
+    request<{ job_id: string; status: string }>('/workflows/jobs', {
+      method: 'POST',
+      body: JSON.stringify({ config }),
+    }),
+  workflowJobs: (limit = 50) =>
+    request<WorkflowJobSummary[]>(`/workflows/jobs?limit=${limit}`),
+  workflowJob: (id: string) =>
+    request<WorkflowJobSummary>(`/workflows/jobs/${encodeURIComponent(id)}`),
+  workflowIssues: (id: string, blockingOnly = false) =>
+    request<WorkflowIssue[]>(
+      `/workflows/jobs/${encodeURIComponent(id)}/issues${blockingOnly ? '?blocking_only=true' : ''}`,
+    ),
 }
 
 export function getSseHeaders(lastEventId?: number): HeadersInit {

@@ -1,4 +1,4 @@
-export type AppPage = 'workbench' | 'video-prompts' | 'batch' | 'providers' | 'models' | 'settings'
+export type AppPage = 'workbench' | 'video-prompts' | 'batch' | 'dataset-workflow' | 'providers' | 'models' | 'settings'
 export type JobMode = 'local' | 'online'
 export type JobState =
   | 'queued'
@@ -326,4 +326,76 @@ export interface VideoPromptRevision {
   instruction: string
   package: VideoPromptPackage
   created_at: string
+}
+
+// --- Dataset Workflow ---
+
+export type WorkflowLanguage = 'zh' | 'en'
+export type WorkflowProfile = 'e621' | 'danbooru'
+export type WorkflowWorkMode = 'in_place' | 'full_copy'
+export type WorkflowOverwriteMode = 'incremental' | 'rebuild'
+export type WorkflowExportFormat = 'json' | 'txt' | 'both'
+export type WorkflowJobStatus = 'pending' | 'running' | 'paused' | 'completed' | 'failed' | 'cancelled'
+
+export interface WorkflowPathRef {
+  root_id: string
+  relative_path: string
+}
+
+export interface WorkflowResource {
+  resource_id: string
+  category: string
+  fingerprint: string
+  source_url?: string | null
+  created_at?: string
+}
+
+export interface WorkflowCapabilities {
+  profiles: WorkflowProfile[]
+  work_modes: WorkflowWorkMode[]
+  resources: WorkflowResource[]
+}
+
+export interface WorkflowImportPreview {
+  valid: boolean
+  errors: string[]
+  warnings: string[]
+  rule_count: number
+  action_counts: Record<string, number>
+  passthrough_count: number
+  fingerprint: string | null
+}
+
+export interface WorkflowJobSummary {
+  job_id: string
+  status: WorkflowJobStatus
+  profile: WorkflowProfile
+  work_mode: WorkflowWorkMode
+  total_samples: number
+  processed_samples: number
+  succeeded_samples: number
+  failed_samples: number
+  skipped_samples: number
+  current_module_id: string | null
+  created_at: string
+  started_at: string | null
+  finished_at: string | null
+  error: string | null
+}
+
+export interface WorkflowIssue {
+  issue_id: string
+  sample_id: number | null
+  module_id: string
+  code: string
+  severity: 'info' | 'warning' | 'error'
+  blocking: number
+  message: string
+  created_at: string
+}
+
+export interface WorkflowPreflightReport {
+  valid: boolean
+  errors: string[]
+  warnings: string[]
 }

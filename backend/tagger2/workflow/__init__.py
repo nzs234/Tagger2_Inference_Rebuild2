@@ -1,4 +1,4 @@
-﻿"""Dataset workflow module for transactional annotation processing.
+"""Dataset workflow module for transactional annotation processing.
 
 This module provides a complete workflow system for dataset annotation:
 - Transactional workspace with pause/resume/recovery

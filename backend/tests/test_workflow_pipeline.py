@@ -1,4 +1,4 @@
-﻿"""End-to-end tests for the offline e621 vertical."""
+"""End-to-end tests for the offline e621 vertical."""
 
 import json
 import tempfile

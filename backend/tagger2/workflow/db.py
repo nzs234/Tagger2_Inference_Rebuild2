@@ -1,4 +1,4 @@
-﻿"""Workflow database connection and operations."""
+"""Workflow database connection and operations."""
 
 from __future__ import annotations
 

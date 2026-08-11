@@ -1,4 +1,4 @@
-﻿"""Workflow resource catalog and fingerprinting."""
+"""Workflow resource catalog and fingerprinting."""
 
 from __future__ import annotations
 

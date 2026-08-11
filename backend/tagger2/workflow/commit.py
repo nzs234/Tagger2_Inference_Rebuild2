@@ -1,4 +1,4 @@
-﻿"""Annotation backup, staged export and atomic commit.
+"""Annotation backup, staged export and atomic commit.
 
 Ordering guarantees, mirroring the source project:
 

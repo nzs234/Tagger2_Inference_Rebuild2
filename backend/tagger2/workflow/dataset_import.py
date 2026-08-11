@@ -1,4 +1,4 @@
-﻿"""Dataset import: scan a source tree into an immutable sample manifest.
+"""Dataset import: scan a source tree into an immutable sample manifest.
 
 Only the source project's compatible image set is accepted. Each image is paired
 with its optional ``.txt`` / ``.json`` sidecars, and the annotation format is

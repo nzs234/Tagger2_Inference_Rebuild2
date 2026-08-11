@@ -7,6 +7,7 @@ import { usePreferences } from './store/app'
 const Workbench = lazy(() => import('./pages/Workbench').then((module) => ({ default: module.Workbench })))
 const VideoPrompts = lazy(() => import('./pages/VideoPrompts').then((module) => ({ default: module.VideoPrompts })))
 const BatchJobs = lazy(() => import('./pages/BatchJobs').then((module) => ({ default: module.BatchJobs })))
+const DatasetWorkflow = lazy(() => import('./pages/DatasetWorkflow').then((module) => ({ default: module.DatasetWorkflow })))
 const Providers = lazy(() => import('./pages/Providers').then((module) => ({ default: module.Providers })))
 const Models = lazy(() => import('./pages/Models').then((module) => ({ default: module.Models })))
 const Settings = lazy(() => import('./pages/Settings').then((module) => ({ default: module.Settings })))
@@ -17,6 +18,7 @@ export default function App() {
     {page === 'workbench' && <Workbench />}
     {page === 'video-prompts' && <VideoPrompts />}
     {page === 'batch' && <BatchJobs />}
+    {page === 'dataset-workflow' && <DatasetWorkflow />}
     {page === 'providers' && <Providers />}
     {page === 'models' && <Models />}
     {page === 'settings' && <Settings />}

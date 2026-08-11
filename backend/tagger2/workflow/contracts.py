@@ -1,4 +1,4 @@
-﻿"""Workflow contracts: versioned job config, resource references, and protocols.
+"""Workflow contracts: versioned job config, resource references, and protocols.
 
 All contracts are immutable dataclasses with explicit schema versions.
 """

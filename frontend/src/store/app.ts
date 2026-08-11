@@ -2,6 +2,7 @@ import { create } from 'zustand'
 import { persist } from 'zustand/middleware'
 import type {
   AppPage,
+  WorkflowLanguage,
   ImageResult,
   QueueItem,
   QueueState,
@@ -16,9 +17,12 @@ interface PreferencesState {
   page: AppPage
   compact: boolean
   sidebarOpen: boolean
+  // Only the Dataset Workflow module is bilingual; the rest of the UI is Chinese.
+  workflowLanguage: WorkflowLanguage
   setPage: (page: AppPage) => void
   setCompact: (compact: boolean) => void
   setSidebarOpen: (open: boolean) => void
+  setWorkflowLanguage: (language: WorkflowLanguage) => void
 }
 
 export const usePreferences = create<PreferencesState>()(
@@ -27,11 +31,20 @@ export const usePreferences = create<PreferencesState>()(
       page: 'workbench',
       compact: false,
       sidebarOpen: false,
+      workflowLanguage: 'zh',
       setPage: (page) => set({ page, sidebarOpen: false }),
       setCompact: (compact) => set({ compact }),
       setSidebarOpen: (sidebarOpen) => set({ sidebarOpen }),
+      setWorkflowLanguage: (workflowLanguage) => set({ workflowLanguage }),
     }),
-    { name: 'tagger2-ui', partialize: (state) => ({ page: state.page, compact: state.compact }) },
+    {
+      name: 'tagger2-ui',
+      partialize: (state) => ({
+        page: state.page,
+        compact: state.compact,
+        workflowLanguage: state.workflowLanguage,
+      }),
+    },
   ),
 )
 

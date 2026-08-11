@@ -1,4 +1,4 @@
-﻿"""Test workflow foundation: contracts, database, resources, preflight, API."""
+"""Test workflow foundation: contracts, database, resources, preflight, API."""
 
 import json
 import tempfile

@@ -1,4 +1,4 @@
-﻿"""Workflow preflight validation."""
+"""Workflow preflight validation."""
 
 from __future__ import annotations
 

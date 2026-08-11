@@ -1,4 +1,4 @@
-﻿"""Contract tests for the mounted Dataset Workflow API surface."""
+"""Contract tests for the mounted Dataset Workflow API surface."""
 
 import os
 import tempfile

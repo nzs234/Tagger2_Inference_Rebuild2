@@ -1,5 +1,5 @@
 import { useQuery } from '@tanstack/react-query'
-import { Activity, Boxes, ChevronLeft, ChevronRight, Clapperboard, Cpu, Database, Menu, Network, PanelLeftClose, Settings, Tags, X } from 'lucide-react'
+import { Activity, Boxes, ChevronLeft, ChevronRight, Clapperboard, Cpu, Database, Menu, Network, PanelLeftClose, Settings, Tags, Workflow, X } from 'lucide-react'
 import { useEffect } from 'react'
 import { api } from '../lib/api'
 import { usePreferences } from '../store/app'
@@ -10,6 +10,7 @@ const navItems: Array<{ id: AppPage; label: string; icon: typeof Tags; hint: str
   { id: 'workbench', label: '工作台', icon: Tags, hint: '单图与快速队列' },
   { id: 'video-prompts', label: '视频提示词', icon: Clapperboard, hint: '图生视频提示词工作区' },
   { id: 'batch', label: '批量任务', icon: Database, hint: '目录扫描与历史' },
+  { id: 'dataset-workflow', label: '数据集工作流', icon: Workflow, hint: '事务化标注流水线' },
   { id: 'providers', label: '在线模型', icon: Network, hint: 'Provider 与密钥' },
   { id: 'models', label: '本地模型', icon: Cpu, hint: '模型、Adapter、阈值' },
   { id: 'settings', label: '设置', icon: Settings, hint: '路径与运行策略' },

@@ -1,4 +1,4 @@
-﻿"""Tests for the ported replacement index reader and nine-field caption format."""
+"""Tests for the ported replacement index reader and nine-field caption format."""
 
 import tempfile
 from pathlib import Path

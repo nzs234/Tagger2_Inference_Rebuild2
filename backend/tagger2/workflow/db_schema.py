@@ -1,4 +1,4 @@
-﻿"""Workflow database schema and migrations."""
+"""Workflow database schema and migrations."""
 
 from __future__ import annotations
 

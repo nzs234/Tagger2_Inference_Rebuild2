@@ -1,4 +1,4 @@
-﻿"""Offline e621 vertical: import -> replace -> normalize -> export -> commit.
+"""Offline e621 vertical: import -> replace -> normalize -> export -> commit.
 
 The stages implemented here are the deterministic, rule-only ones, so their
 output is reproducible without any model or network access. Caption, OCR, NL,

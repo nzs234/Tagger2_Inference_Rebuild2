@@ -1,4 +1,4 @@
-﻿"""e621 replacement index resource: strict CSV validation and rule loading.
+"""e621 replacement index resource: strict CSV validation and rule loading.
 
 The on-disk contract matches the source project's ``e621-replacement-csv-v1``
 format so imported indexes keep their exact keep/replace/drop semantics::

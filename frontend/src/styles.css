@@ -781,3 +781,24 @@ small { font-size: 11px; }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; }
 }
+
+/* --- Dataset Workflow --- */
+.page-dataset-workflow .page-heading { align-items: flex-start; }
+.workflow-language { display: flex; gap: 6px; align-self: flex-end; }
+.workflow-button-row { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 14px; }
+.workflow-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.workflow-table th,
+.workflow-table td { padding: 8px 10px; text-align: left; border-bottom: 1px solid var(--border); }
+.workflow-table th { color: var(--muted); font-weight: 600; }
+.workflow-table tbody tr { cursor: pointer; }
+.workflow-table tbody tr:hover { background: var(--surface-2); }
+.workflow-table tbody tr.row-active { background: var(--surface-3); }
+.workflow-mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; }
+.page-dataset-workflow .form-grid { grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); }
+
+@media (max-width: 720px) {
+  .page-dataset-workflow .page-heading { flex-direction: column; align-items: stretch; gap: 12px; }
+  .workflow-language { align-self: stretch; }
+  .workflow-language .button { flex: 1; }
+  .workflow-table { display: block; overflow-x: auto; white-space: nowrap; }
+}
