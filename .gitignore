@@ -29,6 +29,8 @@ __pycache__/
 .ruff_cache/
 .mypy_cache/
 *.egg-info/
+.tmp-mig/
+.tmp-pytest/
 
 # Frontend
 frontend/node_modules/
