@@ -150,6 +150,10 @@ class WorkflowPreflightService:
                 if not manifest:
                     missing_resources.append(f"Classify resource not found: {resource_id}")
                 else:
+                    if self.resource_catalog.get_resource_path(resource_id) is None:
+                        missing_resources.append(
+                            f"Classify resource digest verification failed: {resource_id}"
+                        )
                     # A snapshot built for another profile must never be used as a
                     # substitute, so the profile is checked here rather than at run
                     # time when the dataset is already being processed.
@@ -178,6 +182,10 @@ class WorkflowPreflightService:
                     missing_resources.append(
                         f"Replace resource {resource_id} has incompatible category {manifest.category!r}"
                     )
+                elif self.resource_catalog.get_resource_path(resource_id) is None:
+                    missing_resources.append(
+                        f"Replace resource digest verification failed: {resource_id}"
+                    )
 
         if config.ocr.get("enabled"):
             resource_id = config.ocr.get("resource_id")
@@ -189,15 +197,34 @@ class WorkflowPreflightService:
                     missing_resources.append(
                         f"OCR resource {resource_id} has incompatible category {manifest.category!r}"
                     )
+                else:
+                    descriptor_path = self.resource_catalog.get_resource_path(resource_id)
+                    if descriptor_path is None:
+                        missing_resources.append(
+                            f"OCR resource digest verification failed: {resource_id}"
+                        )
+                    else:
+                        descriptor_report = self.resource_catalog.validate_resource(
+                            descriptor_path, "ocr"
+                        )
+                        if not descriptor_report.get("valid"):
+                            missing_resources.extend(
+                                f"OCR resource {resource_id}: {error}"
+                                for error in descriptor_report.get("errors", [])
+                            )
             else:
                 missing_resources.append("OCR is enabled but no OCR resource_id is selected")
 
             # OCR is an isolated runtime, not an optional warning in a
             # production job.  A missing interpreter must fail closed before
             # any sample is touched.
-            from .ocr import PaddleOCREngine
+            from .ocr import load_ocr_engine_from_resource
             try:
-                PaddleOCREngine()
+                descriptor_path = self.resource_catalog.get_resource_path(
+                    str(config.ocr.get("resource_id") or "")
+                )
+                if descriptor_path is not None:
+                    load_ocr_engine_from_resource(descriptor_path)
             except RuntimeError as exc:
                 missing_resources.append(f"OCR runtime unavailable: {exc}")
 
@@ -213,6 +240,19 @@ class WorkflowPreflightService:
                     missing_resources.append(
                         f"Tokenizer resource {resource_id} has incompatible category {manifest.category!r}"
                     )
+                elif self.resource_catalog.get_resource_path(str(resource_id)) is None:
+                    missing_resources.append(
+                        f"Tokenizer resource digest verification failed: {resource_id}"
+                    )
+                else:
+                    from .tokenizer_resource import TokenizerResourceError, load_tokenizer_counter
+
+                    try:
+                        load_tokenizer_counter(
+                            self.resource_catalog.get_resource_path(str(resource_id))  # type: ignore[arg-type]
+                        )
+                    except TokenizerResourceError as exc:
+                        missing_resources.append(f"Tokenizer resource {resource_id}: {exc}")
 
         if missing_resources:
             errors.extend(missing_resources)

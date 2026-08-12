@@ -26,6 +26,7 @@ whole resource is rejected, matching the replacement-index reader.
 from __future__ import annotations
 
 import csv
+import gzip
 import json
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -42,6 +43,10 @@ MAX_REPORTED_ERRORS = 100
 E621_CATEGORIES = {
     0: "general",
     1: "artist",
+    # e621's DB export keeps contributor as a distinct category (the
+    # classifier currently preserves it in the generic tags field because
+    # the nine-field contract has no dedicated contributor field).
+    2: "contributor",
     3: "copyright",
     4: "character",
     5: "species",
@@ -106,6 +111,11 @@ def _tag_name_error(name: str) -> str | None:
         return "tag name contains NUL"
     if any(character in name for character in ",\r\n"):
         return "tag name contains a CSV separator or newline"
+    if any(
+        (ord(character) < 32 or 0x7F <= ord(character) <= 0x9F)
+        for character in name
+    ):
+        return "tag name contains a control character"
     stripped = name.strip()
     if stripped and stripped != name:
         return f"tag name is padded with whitespace: {name!r}"
@@ -321,7 +331,14 @@ def load_classification_rules(path: Path) -> ClassificationRules:
 
 def _iter_csv_rows(path: Path, required: tuple[str, ...]) -> Iterator[tuple[int, dict[str, str]]]:
     try:
-        stream = path.open("r", encoding="utf-8-sig", newline="")
+        # The official e621 endpoint publishes gzip-compressed CSV.  Keep the
+        # same strict DictReader path for plain CSV and .csv.gz so callers do
+        # not need an untracked decompression step (and line numbers remain
+        # the source CSV line numbers in either case).
+        if path.name.casefold().endswith(".csv.gz"):
+            stream = gzip.open(path, "rt", encoding="utf-8-sig", newline="")
+        else:
+            stream = path.open("r", encoding="utf-8-sig", newline="")
     except OSError as exc:
         raise ClassifySnapshotError(f"cannot read {path.name}: {exc}") from exc
     with stream:
@@ -345,6 +362,8 @@ def build_snapshot_from_official_csv(
     source_url: str | None = None,
     source_timestamp: str | None = None,
     note: str | None = None,
+    allow_official_anomalies: bool = False,
+    anomaly_report: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Convert published e621/Danbooru DB exports into a snapshot bundle.
 
@@ -352,11 +371,44 @@ def build_snapshot_from_official_csv(
     declared table. An unknown category is an error rather than being folded
     into ``general``, and an alias row that is not ``active`` is skipped because
     only active aliases are applied by the site itself.
+
+    Strict validation is the default.  ``allow_official_anomalies`` is an
+    explicit compatibility mode for the live e621 export: malformed source
+    rows are quarantined into ``anomaly_report`` and omitted from the executable
+    snapshot, never trimmed or otherwise repaired.
     """
 
     if profile not in PROFILE_CATEGORIES:
         raise ClassifySnapshotError(f"unsupported classification profile: {profile!r}")
     categories = PROFILE_CATEGORIES[profile]
+
+    def anomaly(
+        *, path: Path, line_number: int, kind: str, message: str, row: dict[str, str]
+    ) -> None:
+        """Record an official-export anomaly without repairing its source row."""
+
+        item: dict[str, Any] = {
+            "file": path.name,
+            "line": line_number,
+            "kind": kind,
+            "message": message,
+        }
+        # Keep the original offending fields in the quarantine report.  This
+        # makes every skipped row auditable while keeping the generated
+        # executable snapshot free of malformed names.
+        for key in ("id", "name", "category", "antecedent_name", "consequent_name"):
+            if key in row:
+                item[key] = row[key]
+        if anomaly_report is not None:
+            anomaly_report.append(item)
+
+    def reject_or_quarantine(
+        *, path: Path, line_number: int, kind: str, message: str, row: dict[str, str]
+    ) -> bool:
+        if not allow_official_anomalies:
+            raise ClassifySnapshotError(f"{path.name} line {line_number}: {message}")
+        anomaly(path=path, line_number=line_number, kind=kind, message=message, row=row)
+        return True
 
     tags: list[dict[str, Any]] = []
     seen_tags: set[str] = set()
@@ -364,31 +416,56 @@ def build_snapshot_from_official_csv(
         name = row["name"] or ""
         problem = _tag_name_error(name)
         if problem:
-            raise ClassifySnapshotError(f"{Path(tags_csv).name} line {line_number}: {problem}")
-        if name in seen_tags:
-            raise ClassifySnapshotError(
-                f"{Path(tags_csv).name} line {line_number}: duplicate tag name {name!r}"
+            reject_or_quarantine(
+                path=Path(tags_csv),
+                line_number=line_number,
+                kind="tag_name",
+                message=problem,
+                row=row,
             )
+            continue
+        if name in seen_tags:
+            reject_or_quarantine(
+                path=Path(tags_csv),
+                line_number=line_number,
+                kind="duplicate_tag",
+                message=f"duplicate tag name {name!r}",
+                row=row,
+            )
+            continue
         raw_category = (row.get("category") or "").strip()
         try:
             category_name = categories[int(raw_category)]
-        except (KeyError, ValueError) as exc:
-            raise ClassifySnapshotError(
-                f"{Path(tags_csv).name} line {line_number}: unknown {profile} category"
-                f" {raw_category!r}"
-            ) from exc
+        except (KeyError, ValueError):
+            reject_or_quarantine(
+                path=Path(tags_csv),
+                line_number=line_number,
+                kind="unknown_category",
+                message=f"unknown {profile} category {raw_category!r}",
+                row=row,
+            )
+            continue
         raw_post_count = (row.get("post_count") or "0").strip() or "0"
         try:
             post_count = int(raw_post_count)
-        except ValueError as exc:
-            raise ClassifySnapshotError(
-                f"{Path(tags_csv).name} line {line_number}: post_count is not an integer:"
-                f" {raw_post_count!r}"
-            ) from exc
-        if post_count < 0:
-            raise ClassifySnapshotError(
-                f"{Path(tags_csv).name} line {line_number}: post_count is negative"
+        except ValueError:
+            reject_or_quarantine(
+                path=Path(tags_csv),
+                line_number=line_number,
+                kind="invalid_post_count",
+                message=f"post_count is not an integer: {raw_post_count!r}",
+                row=row,
             )
+            continue
+        if post_count < 0:
+            reject_or_quarantine(
+                path=Path(tags_csv),
+                line_number=line_number,
+                kind="negative_post_count",
+                message="post_count is negative",
+                row=row,
+            )
+            continue
         seen_tags.add(name)
         tags.append({"name": name, "category": category_name, "post_count": post_count})
 
@@ -404,17 +481,32 @@ def build_snapshot_from_official_csv(
         target = row["consequent_name"] or ""
         problem = _tag_name_error(source) or _tag_name_error(target)
         if problem:
-            raise ClassifySnapshotError(f"{Path(aliases_csv).name} line {line_number}: {problem}")
+            reject_or_quarantine(
+                path=Path(aliases_csv),
+                line_number=line_number,
+                kind="alias_name",
+                message=problem,
+                row=row,
+            )
+            continue
         if source == target:
-            raise ClassifySnapshotError(
-                f"{Path(aliases_csv).name} line {line_number}: alias points at itself:"
-                f" {source!r}"
+            reject_or_quarantine(
+                path=Path(aliases_csv),
+                line_number=line_number,
+                kind="self_alias",
+                message=f"alias points at itself: {source!r}",
+                row=row,
             )
+            continue
         if source in seen_aliases:
-            raise ClassifySnapshotError(
-                f"{Path(aliases_csv).name} line {line_number}: duplicate antecedent_name"
-                f" {source!r}"
+            reject_or_quarantine(
+                path=Path(aliases_csv),
+                line_number=line_number,
+                kind="duplicate_alias",
+                message=f"duplicate antecedent_name {source!r}",
+                row=row,
             )
+            continue
         seen_aliases.add(source)
         aliases.append({"antecedent_name": source, "consequent_name": target})
 
@@ -430,9 +522,14 @@ def build_snapshot_from_official_csv(
             target = row["consequent_name"] or ""
             problem = _tag_name_error(source) or _tag_name_error(target)
             if problem:
-                raise ClassifySnapshotError(
-                    f"{Path(implications_csv).name} line {line_number}: {problem}"
+                reject_or_quarantine(
+                    path=Path(implications_csv),
+                    line_number=line_number,
+                    kind="implication_name",
+                    message=problem,
+                    row=row,
                 )
+                continue
             implications.append({"antecedent_name": source, "consequent_name": target})
 
     source_metadata: dict[str, Any] = {}
@@ -442,6 +539,11 @@ def build_snapshot_from_official_csv(
         source_metadata["timestamp"] = source_timestamp
     if note:
         source_metadata["note"] = note
+    if anomaly_report:
+        source_metadata["official_anomalies"] = {
+            "policy": "quarantine-skip-row-no-repair",
+            "count": len(anomaly_report),
+        }
 
     return {
         "format": CLASSIFY_SNAPSHOT_FORMAT,

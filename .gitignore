@@ -17,6 +17,9 @@ secrets/
 # The embedded CPython runtime is provisioned by setup.bat, not tracked
 runtime/
 
+# Isolated PaddleOCR runtime and user-provisioned model cache are not tracked.
+runtime_ocr/
+
 # Model/cache binaries are provisioned separately
 models/*
 !models/.gitkeep

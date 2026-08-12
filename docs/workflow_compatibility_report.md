@@ -153,21 +153,23 @@ official categories it stays empty rather than being populated by a heuristic.
 
 ### OCR
 
-OCR is off by default. It runs PaddleOCR in a separate interpreter
+OCR is off by default. When enabled, it runs PaddleOCR in a separate interpreter
 (`runtime_ocr/`, created by `scripts/setup_ocr_runtime.ps1`) because that
 dependency stack conflicts with the main runtime. Results are written to
 `<workspace>/ocr_sidecars/<relative_path>.ocr.json` carrying `version: v1`, and
 an existing sidecar is reused unless `force_reprocess` is set.
 
-OCR never touches the nine-field payload and never blocks a run: a missing
-runtime yields `ocr_unavailable` and a failed image yields `ocr_failed`, both
-`severity=warning`, `blocking=false`, and the dataset still commits. This is
-covered by tests asserting the exported JSON keys are unchanged and that a
-failing engine still produces a committed file.
+OCR never touches the nine-field payload. Direct/offline stage calls translate
+a missing runtime to `ocr_unavailable` and a failed image to `ocr_failed`, both
+`severity=warning`, `blocking=false`; production API preflight additionally
+requires the registered runtime descriptor and model-cache digest before a job
+can start. This is covered by tests asserting the exported JSON keys are
+unchanged and that a failing engine still produces a committed file.
 
-**Not verified:** real PaddleOCR recognition accuracy. The stage is tested
-against an engine double, so the subprocess protocol, sidecar format, caching
-and failure handling are verified, but no real model has been run here.
+The local CPU runtime and its provisioned English det/rec/cls model cache have
+also passed a real blank-image probe and the resource smoke; runtime executable
+and model-cache fingerprints are checked before execution, so an absent or
+drifted cache fails closed without a download.
 
 ### Fail-closed profile handling
 

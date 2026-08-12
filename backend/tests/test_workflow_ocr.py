@@ -8,7 +8,10 @@ from unittest.mock import Mock
 
 from tagger2.workflow.ocr import (
     OCRIssue,
+    OCRModelPaths,
     PaddleOCREngine,
+    build_ocr_runtime_manifest,
+    discover_ocr_model_paths,
     load_ocr_sidecar,
     run_ocr_stage,
 )
@@ -83,6 +86,71 @@ def test_ocr_explicit_missing_runtime_never_falls_back(tmp_path):
         assert str(missing_runtime.resolve()) in str(exc)
     else:  # pragma: no cover - protects the fail-closed contract
         raise AssertionError("missing OCR runtime unexpectedly initialized")
+
+
+def test_ocr_model_cache_discovery_is_complete_and_content_addressed(tmp_path):
+    """Model discovery requires all three families and hashes their contents."""
+
+    cache = tmp_path / "paddleocr"
+    model_dirs = {
+        "det": cache / "det" / "en_PP-OCRv3_det_infer",
+        "rec": cache / "rec" / "en_PP-OCRv4_rec_infer",
+        "cls": cache / "cls" / "ch_ppocr_mobile_v2.0_cls_infer",
+    }
+    for model_dir in model_dirs.values():
+        model_dir.mkdir(parents=True)
+        (model_dir / "inference.pdmodel").write_bytes(b"model")
+        (model_dir / "inference.pdiparams").write_bytes(b"weights")
+
+    paths = discover_ocr_model_paths(cache)
+    assert isinstance(paths, OCRModelPaths)
+    first_key = paths.cache_key
+    (model_dirs["rec"] / "inference.pdiparams").write_bytes(b"changed")
+    assert discover_ocr_model_paths(cache).cache_key != first_key
+
+
+def test_ocr_model_cache_discovery_fails_closed_when_incomplete(tmp_path):
+    """An incomplete cache must not trigger a model download or fallback."""
+
+    cache = tmp_path / "paddleocr"
+    (cache / "det" / "det_model").mkdir(parents=True)
+    (cache / "det" / "det_model" / "inference.pdmodel").write_bytes(b"model")
+
+    try:
+        discover_ocr_model_paths(cache)
+    except RuntimeError as exc:
+        assert "incomplete" in str(exc)
+        assert "automatic downloads are disabled" in str(exc)
+    else:  # pragma: no cover - protects the fail-closed contract
+        raise AssertionError("incomplete OCR model cache unexpectedly accepted")
+
+
+def test_ocr_runtime_manifest_contains_digests_and_versions(tmp_path, monkeypatch):
+    """A probe records immutable runtime/model identities without downloads."""
+
+    runtime = tmp_path / "runtime" / "python.exe"
+    runtime.parent.mkdir(parents=True)
+    runtime.write_bytes(b"isolated-python")
+    monkeypatch.setattr(PaddleOCREngine, "_validate_runtime", lambda self: None)
+
+    cache = tmp_path / "paddleocr"
+    for family in ("det", "rec", "cls"):
+        model_dir = cache / family / f"{family}_model"
+        model_dir.mkdir(parents=True)
+        (model_dir / "inference.pdmodel").write_bytes(b"model")
+        (model_dir / "inference.pdiparams").write_bytes(b"weights")
+    monkeypatch.setattr(
+        "tagger2.workflow.ocr.subprocess.run",
+        lambda *args, **kwargs: type(
+            "ProbeResult", (), {"returncode": 0, "stdout": '{"paddle":"3.0.0","paddleocr":"2.9.1"}', "stderr": ""}
+        )(),
+    )
+
+    manifest = build_ocr_runtime_manifest(runtime, cache)
+    assert manifest["schema_version"] == "ocr-runtime-v1"
+    assert manifest["runtime_sha256"]
+    assert manifest["versions"]["paddle"] == "3.0.0"
+    assert manifest["model_cache"]["fingerprint"]
 
 
 def test_ocr_basic_recognition(tmp_path):

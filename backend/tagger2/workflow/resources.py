@@ -13,6 +13,8 @@ from .contracts import RESOURCE_ID_PATTERN, WorkflowResourceManifestV1, utc_now
 # snapshot reader; the replacement categories select the index CSV reader.
 CLASSIFY_RESOURCE_CATEGORY = "classify"
 REPLACEMENT_RESOURCE_CATEGORIES = frozenset({"replace", "replacement_index"})
+TOKENIZER_RESOURCE_CATEGORY = "tokenizer"
+OCR_RESOURCE_CATEGORY = "ocr"
 
 
 class WorkflowResourceCatalog:
@@ -38,6 +40,8 @@ class WorkflowResourceCatalog:
         source_url: str | None = None,
         source_timestamp: str | None = None,
         builder_version: str | None = None,
+        profile: str | None = None,
+        license_status: str = "unknown",
     ) -> WorkflowResourceManifestV1:
         """Import a resource file and register its manifest."""
         if not RESOURCE_ID_PATTERN.match(resource_id):
@@ -73,6 +77,8 @@ class WorkflowResourceCatalog:
             source_timestamp=source_timestamp,
             builder_version=builder_version,
             size_bytes=source_path.stat().st_size,
+            profile=profile,
+            license_status=license_status,
             source_digest=fingerprint,
         )
         
@@ -162,13 +168,22 @@ class WorkflowResourceCatalog:
             return report
         if category in REPLACEMENT_RESOURCE_CATEGORIES:
             return self.validate_csv_resource(source_path)
+        if category == TOKENIZER_RESOURCE_CATEGORY:
+            from .tokenizer_resource import validate_tokenizer_resource
+
+            return validate_tokenizer_resource(source_path)
+        if category == OCR_RESOURCE_CATEGORY:
+            from .ocr import validate_ocr_resource
+
+            return validate_ocr_resource(source_path)
         return {
             "valid": False,
             "errors": [
                 (
                     f"unsupported resource category: {category!r};"
-                    f" expected {CLASSIFY_RESOURCE_CATEGORY!r} or one of"
-                    f" {sorted(REPLACEMENT_RESOURCE_CATEGORIES)}"
+                    f" expected {CLASSIFY_RESOURCE_CATEGORY!r},"
+                    f" {TOKENIZER_RESOURCE_CATEGORY!r}, {OCR_RESOURCE_CATEGORY!r},"
+                    f" or one of {sorted(REPLACEMENT_RESOURCE_CATEGORIES)}"
                 ),
             ],
             "line_count": 0,
@@ -177,6 +192,8 @@ class WorkflowResourceCatalog:
 
 __all__ = [
     "CLASSIFY_RESOURCE_CATEGORY",
+    "OCR_RESOURCE_CATEGORY",
     "REPLACEMENT_RESOURCE_CATEGORIES",
+    "TOKENIZER_RESOURCE_CATEGORY",
     "WorkflowResourceCatalog",
 ]

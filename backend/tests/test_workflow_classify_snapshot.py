@@ -246,6 +246,77 @@ def test_build_snapshot_rejects_unknown_category_code(tmp_path):
     assert "unknown e621 category" in str(excinfo.value)
 
 
+def test_build_snapshot_maps_e621_contributor_category(tmp_path):
+    """e621 category 2 is contributor and must not be treated as general."""
+    tags_csv = tmp_path / "tags.csv"
+    tags_csv.write_text(
+        "id,name,category,post_count\n1,source_user,2,3\n", encoding="utf-8"
+    )
+    aliases_csv = tmp_path / "aliases.csv"
+    aliases_csv.write_text("id,antecedent_name,consequent_name,status\n", encoding="utf-8")
+
+    document = build_snapshot_from_official_csv(
+        profile="e621", tags_csv=tags_csv, aliases_csv=aliases_csv
+    )
+
+    assert document["tags"] == [
+        {"name": "source_user", "category": "contributor", "post_count": 3}
+    ]
+
+
+def test_build_snapshot_accepts_gzip_exports(tmp_path):
+    """The official .csv.gz endpoint is read without a manual decompression step."""
+    import gzip
+
+    tags_csv = tmp_path / "tags.csv.gz"
+    with gzip.open(tags_csv, "wt", encoding="utf-8", newline="") as stream:
+        stream.write("id,name,category,post_count\n1,solo,0,3\n")
+    aliases_csv = tmp_path / "aliases.csv.gz"
+    with gzip.open(aliases_csv, "wt", encoding="utf-8", newline="") as stream:
+        stream.write("id,antecedent_name,consequent_name,status\n")
+
+    document = build_snapshot_from_official_csv(
+        profile="e621", tags_csv=tags_csv, aliases_csv=aliases_csv
+    )
+
+    assert document["tags"][0]["name"] == "solo"
+
+
+def test_official_anomaly_mode_quarantines_without_repairing(tmp_path):
+    """Explicit compatibility mode records and skips malformed source rows."""
+    tags_csv = tmp_path / "tags.csv"
+    tags_csv.write_text(
+        "id,name,category,post_count\n"
+        "1,solo,0,3\n"
+        "2, bad_tag ,0,4\n",
+        encoding="utf-8",
+    )
+    aliases_csv = tmp_path / "aliases.csv"
+    aliases_csv.write_text("id,antecedent_name,consequent_name,status\n", encoding="utf-8")
+    anomalies: list[dict[str, object]] = []
+
+    document = build_snapshot_from_official_csv(
+        profile="e621",
+        tags_csv=tags_csv,
+        aliases_csv=aliases_csv,
+        allow_official_anomalies=True,
+        anomaly_report=anomalies,
+    )
+
+    assert [row["name"] for row in document["tags"]] == ["solo"]
+    assert anomalies == [
+        {
+            "file": "tags.csv",
+            "line": 3,
+            "kind": "tag_name",
+            "message": "tag name is padded with whitespace: ' bad_tag '",
+            "id": "2",
+            "name": " bad_tag ",
+            "category": "0",
+        }
+    ]
+
+
 def test_build_snapshot_rejects_missing_column(tmp_path):
     """A missing required column names the column instead of failing obscurely."""
     tags_csv = tmp_path / "tags.csv"

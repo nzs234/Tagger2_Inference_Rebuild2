@@ -1,5 +1,6 @@
 ﻿"""Import the designated e621 replacement index into the workflow resource catalog."""
 
+import argparse
 import sys
 from pathlib import Path
 
@@ -7,33 +8,42 @@ from pathlib import Path
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
+# ruff: noqa: E402 - repository backend is added before imports.
 from backend.tagger2.workflow.resources import WorkflowResourceCatalog
 from backend.tagger2.workflow.replacement_index import validate_replacement_index
 
 
-DESIGNATED_CSV_PATH = Path(r"D:\QQ相关\下载\E621tag替换索引\e621_general_tag_replacement_index.csv")
-RESOURCE_ID = "e621-replacement-index-v1"
+DEFAULT_CSV_PATH = Path(r"D:\QQ相关\下载\E621tag替换索引\e621_general_tag_replacement_index.csv")
+# Keep the historical ``replace-`` prefix used by the V2 default contract.
+# The catalog may also contain the canonical alias ``e621-replacement-index-v1``
+# for older jobs, but new installs should provision this ID.
+RESOURCE_ID = "replace-e621-index-v1"
 CATEGORY = "replacement_index"
 
 
-def main():
-    if not DESIGNATED_CSV_PATH.exists():
-        print(f"ERROR: Designated CSV not found: {DESIGNATED_CSV_PATH}")
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("csv_path", type=Path, nargs="?", default=DEFAULT_CSV_PATH)
+    parser.add_argument("--resource-id", default=RESOURCE_ID)
+    args = parser.parse_args()
+    source_path = args.csv_path.expanduser().resolve()
+    if not source_path.exists():
+        print(f"ERROR: Designated CSV not found: {source_path}")
         return 1
     
     catalog = WorkflowResourceCatalog(project_root / "data" / "workflows" / "resources")
     
     # Check if already imported
-    existing = catalog.get_manifest(RESOURCE_ID)
+    existing = catalog.get_manifest(args.resource_id)
     if existing:
-        print(f"Resource already imported: {RESOURCE_ID}")
+        print(f"Resource already imported: {args.resource_id}")
         print(f"  Fingerprint: {existing.resource_fingerprint}")
         print(f"  Created: {existing.created_at}")
         return 0
     
     # Validate before import
-    print(f"Validating {DESIGNATED_CSV_PATH}...")
-    report = validate_replacement_index(DESIGNATED_CSV_PATH)
+    print(f"Validating {source_path}...")
+    report = validate_replacement_index(source_path)
     
     if not report.valid:
         print("Validation FAILED:")
@@ -52,11 +62,13 @@ def main():
     print(f"  Pipe replacements: {report.pipe_replacement_count}")
     
     # Import
-    print(f"\nImporting to catalog as '{RESOURCE_ID}'...")
+    print(f"\nImporting to catalog as '{args.resource_id}'...")
     manifest = catalog.import_resource(
-        source_path=DESIGNATED_CSV_PATH,
-        resource_id=RESOURCE_ID,
+        source_path=source_path,
+        resource_id=args.resource_id,
         category=CATEGORY,
+        source_url="local-designated-index",
+        builder_version="replacement-index-v1",
     )
     
     print("Import complete:")
@@ -66,7 +78,7 @@ def main():
     print(f"  Created: {manifest.created_at}")
     
     # Verify we can load it
-    resource_path = catalog.get_resource_path(RESOURCE_ID)
+    resource_path = catalog.get_resource_path(args.resource_id)
     if not resource_path:
         print("ERROR: Resource imported but path not found")
         return 1

@@ -36,6 +36,42 @@ values are loaded at startup; `TAGGER2_*` environment variables take
 precedence. LAN binding requires `lan_access = true` and a token in the
 environment variable named by `access_token_env`.
 
+### Dataset Workflow resources
+
+The first e621 profile requires four local, content-addressed resources. They
+are kept under the ignored `data/workflows/resources` directory and must be
+provisioned explicitly; the workflow never guesses a resource or downloads one
+during a job.
+
+```powershell
+# Official e621 exports (the command accepts .csv.gz directly).
+.\runtime\python.exe scripts\import_classification_snapshot.py `
+  --profile e621 `
+  --tags-csv C:\snapshots\e621\tags.csv.gz `
+  --aliases-csv C:\snapshots\e621\tag_aliases.csv.gz `
+  --implications-csv C:\snapshots\e621\tag_implications.csv.gz `
+  --resource-id classify-e621-20260812-v1 `
+  --source-url https://e621.net/db_export/ `
+  --allow-official-anomalies `
+  --anomaly-report C:\snapshots\e621\quarantine.json
+
+# A serialized Qwen3 tokenizer.json (weights are not required for counting).
+.\runtime\python.exe scripts\import_tokenizer_resource.py `
+  C:\snapshots\qwen3-0.6b\tokenizer.json `
+  --source-url https://huggingface.co/Qwen/Qwen3-0.6B/resolve/main/tokenizer.json
+
+# Isolated CPU OCR runtime and its provisioned det/rec/cls model cache.
+powershell -ExecutionPolicy Bypass -File .\scripts\setup_ocr_runtime.ps1
+.\runtime_ocr\Scripts\python.exe scripts\import_ocr_runtime_resource.py
+```
+
+The official e621 export currently contains a small number of malformed tag
+names. `--allow-official-anomalies` does not repair them: it quarantines the
+exact source rows in the requested report and records the count in snapshot
+metadata. Omitting the flag keeps the importer strict and fails closed. The
+designated replacement index is imported with
+`scripts/import_designated_replacement_index.py`.
+
 Runtime lock files pin every direct and transitive dependency with SHA-256
 hashes. The `.txt` files are source manifests, not deployment inputs. Update
 all locks on Python 3.12 with:

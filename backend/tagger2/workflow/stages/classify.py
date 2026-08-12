@@ -22,7 +22,7 @@ class ClassifyError(RuntimeError):
 class TagRecord:
     """One tag from the official tags table."""
     name: str
-    category: str  # "general", "artist", "copyright", "character", "species", "meta"
+    category: str  # includes e621's "contributor" category
     post_count: int = 0
 
 

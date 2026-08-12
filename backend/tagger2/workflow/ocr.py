@@ -61,6 +61,235 @@ class OCRResult:
     error: str | None = None
 
 
+@dataclass(frozen=True)
+class OCRModelPaths:
+    """Resolved PaddleOCR model directories for one isolated runtime."""
+
+    cache_dir: Path
+    detection: Path
+    recognition: Path
+    classification: Path
+
+    @property
+    def cache_key(self) -> str:
+        """Digest the model files, not merely their directory names."""
+
+        digest = hashlib.sha256()
+        for path in sorted(self.cache_dir.rglob("*")):
+            if not path.is_file():
+                continue
+            digest.update(path.relative_to(self.cache_dir).as_posix().encode())
+            digest.update(str(path.stat().st_size).encode("ascii"))
+            with path.open("rb") as stream:
+                for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                    digest.update(chunk)
+        return digest.hexdigest()
+
+
+def build_ocr_runtime_manifest(
+    runtime_python: Path | None = None,
+    model_dir: Path | None = None,
+) -> dict[str, Any]:
+    """Build a local, deterministic descriptor for the OCR runtime.
+
+    The descriptor is intentionally generated on demand and is not a model
+    resource itself.  It records the executable digest, package versions and
+    model-cache fingerprint so preflight/release diagnostics can prove which
+    runtime was used.  No network access or model download occurs here.
+    """
+
+    engine = PaddleOCREngine(runtime_python=runtime_python, model_dir=model_dir)
+    result = subprocess.run(
+        [
+            str(engine.runtime_python),
+            "-c",
+            (
+                "import json, sys, paddle, paddleocr; "
+                "print(json.dumps({'python': sys.version.split()[0], "
+                "'paddle': getattr(paddle, '__version__', None), "
+                "'paddleocr': getattr(paddleocr, '__version__', None)}, "
+                "sort_keys=True))"
+            ),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"Unable to probe OCR runtime versions: {result.stderr}")
+    try:
+        versions = json.loads(result.stdout.strip().splitlines()[-1])
+    except (IndexError, json.JSONDecodeError) as exc:
+        raise RuntimeError("OCR runtime returned an invalid version probe") from exc
+
+    model_paths = engine.model_paths
+    if model_paths is None:  # pragma: no cover - PaddleOCREngine enforces this
+        raise RuntimeError("OCR model cache was not resolved")
+    return {
+        "schema_version": "ocr-runtime-v1",
+        "runtime_python": str(engine.runtime_python),
+        "runtime_sha256": _sha256_file(engine.runtime_python),
+        "versions": versions,
+        "model_cache": {
+            "root": str(model_paths.cache_dir),
+            "fingerprint": model_paths.cache_key,
+            "detection": str(model_paths.detection),
+            "recognition": str(model_paths.recognition),
+            "classification": str(model_paths.classification),
+        },
+    }
+
+
+def write_ocr_runtime_manifest(
+    output_path: Path,
+    runtime_python: Path | None = None,
+    model_dir: Path | None = None,
+) -> dict[str, Any]:
+    """Atomically write :func:`build_ocr_runtime_manifest` as JSON."""
+
+    manifest = build_ocr_runtime_manifest(runtime_python, model_dir)
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = output_path.with_name(f".{output_path.name}.tmp")
+    temporary.write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    temporary.replace(output_path)
+    return manifest
+
+
+def discover_ocr_model_paths(cache_dir: Path | None = None) -> OCRModelPaths:
+    """Find the bundled PaddleOCR model cache without downloading anything.
+
+    PaddleOCR 2.x stores its default English models below ``~/.paddleocr``.
+    An explicit ``PADDLEOCR_HOME`` (or ``cache_dir``) is preferred so the
+    runtime can be pointed at a provisioned, content-addressed cache.  The
+    three model families are required because this stage enables angle
+    classification and must never silently trigger a network download.
+    """
+
+    candidates: list[Path] = []
+    if cache_dir is not None:
+        # An explicit cache is an operator decision.  Do not silently fall
+        # back to a different user's cache when it is incomplete.
+        candidates.append(Path(cache_dir).expanduser())
+    else:
+        configured = os.environ.get("PADDLEOCR_HOME")
+        if configured:
+            candidates.append(Path(configured).expanduser())
+        candidates.append(Path.home() / ".paddleocr")
+
+    for candidate in candidates:
+        root = candidate.resolve()
+        if not root.is_dir():
+            continue
+        model_files = [path for path in root.rglob("inference.pdmodel") if path.is_file()]
+        groups: dict[str, Path] = {}
+        for model_file in model_files:
+            name = model_file.parent.name.lower()
+            if "det" in name and "det" not in groups:
+                groups["det"] = model_file.parent
+            elif "rec" in name and "rec" not in groups:
+                groups["rec"] = model_file.parent
+            elif "cls" in name and "cls" not in groups:
+                groups["cls"] = model_file.parent
+        if set(groups) == {"det", "rec", "cls"}:
+            return OCRModelPaths(
+                cache_dir=root,
+                detection=groups["det"],
+                recognition=groups["rec"],
+                classification=groups["cls"],
+            )
+
+    expected = ", ".join(str(path) for path in candidates)
+    raise RuntimeError(
+        "OCR model cache not found or incomplete; expected detection, "
+        f"recognition and classification models below one of: {expected}. "
+        "Provision models explicitly; automatic downloads are disabled."
+    )
+
+
+def validate_ocr_resource(path: Path) -> dict[str, Any]:
+    """Validate an OCR runtime descriptor without touching the dataset.
+
+    OCR model files live in the isolated runtime/cache and are intentionally
+    not copied into the application resource catalog.  The descriptor binds
+    the job to the runtime profile and its model-cache fingerprint; the
+    execution probe below still verifies that PaddleOCR can be imported.
+    """
+
+    try:
+        raw = Path(path).read_bytes()
+        document = json.loads(raw.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        return {"valid": False, "errors": [f"OCR descriptor is not valid JSON: {exc}"], "line_count": 0}
+    if not isinstance(document, dict) or document.get("schema_version") != "ocr-runtime-v1":
+        return {
+            "valid": False,
+            "errors": ["OCR descriptor schema_version must be 'ocr-runtime-v1'"],
+            "line_count": 0,
+        }
+    model_cache = document.get("model_cache")
+    required = ("runtime_python", "runtime_sha256")
+    missing = [key for key in required if not isinstance(document.get(key), str) or not document[key]]
+    if not isinstance(model_cache, dict):
+        missing.append("model_cache")
+    elif not isinstance(model_cache.get("fingerprint"), str) or not model_cache["fingerprint"]:
+        missing.append("model_cache.fingerprint")
+    if missing:
+        return {
+            "valid": False,
+            "errors": [f"OCR descriptor missing required field(s): {', '.join(missing)}"],
+            "line_count": 0,
+        }
+    assert isinstance(model_cache, dict)
+    try:
+        runtime_python = Path(str(document["runtime_python"])).expanduser()
+        cache_root = Path(str(model_cache["root"])).expanduser()
+        engine = PaddleOCREngine(runtime_python=runtime_python, model_dir=cache_root)
+    except RuntimeError as exc:
+        return {"valid": False, "errors": [f"OCR runtime unavailable: {exc}"], "line_count": 0}
+    model_paths = engine.model_paths
+    if model_paths is None:  # pragma: no cover - constructor enforces this
+        return {"valid": False, "errors": ["OCR model cache was not resolved"], "line_count": 0}
+    errors: list[str] = []
+    try:
+        runtime_digest = _sha256_file(engine.runtime_python)
+    except OSError:
+        runtime_digest = ""
+    if str(document["runtime_sha256"]) != runtime_digest:
+        errors.append("OCR runtime executable digest differs from descriptor")
+    if str(model_cache["fingerprint"]) != model_paths.cache_key:
+        errors.append("OCR model-cache fingerprint differs from descriptor")
+    return {
+        "valid": not errors,
+        "errors": errors,
+        "line_count": 1 if not errors else 0,
+        "profile": "paddleocr-cpu-en",
+    }
+
+
+def load_ocr_engine_from_resource(path: Path) -> PaddleOCREngine:
+    """Load an OCR engine using the runtime/cache identities in a descriptor."""
+
+    try:
+        document = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("OCR resource descriptor cannot be read") from exc
+    report = validate_ocr_resource(path)
+    if not report.get("valid"):
+        raise RuntimeError("OCR resource descriptor failed validation")
+    model_cache = document.get("model_cache")
+    if not isinstance(model_cache, dict):  # pragma: no cover - validator guards this
+        raise RuntimeError("OCR resource descriptor has no model cache")
+    return PaddleOCREngine(
+        runtime_python=Path(str(document["runtime_python"])),
+        model_dir=Path(str(model_cache["root"])),
+    )
+
+
 class PaddleOCREngine:
     """
     PaddleOCR engine using isolated runtime.
@@ -74,6 +303,7 @@ class PaddleOCREngine:
         runtime_python: Path | None = None,
         model_dir: Path | None = None,
         timeout_seconds: float = 30.0,
+        require_model_cache: bool = True,
     ):
         """
         Initialize PaddleOCR engine.
@@ -98,7 +328,10 @@ class PaddleOCREngine:
         )
         self.model_dir = model_dir
         self.timeout_seconds = timeout_seconds
+        self.model_paths: OCRModelPaths | None = None
         self._validate_runtime()
+        if require_model_cache:
+            self.model_paths = discover_ocr_model_paths(model_dir)
 
     def _find_paddle_runtime(self) -> Path:
         """Find PaddleOCR runtime Python interpreter."""
@@ -161,6 +394,8 @@ class PaddleOCREngine:
             digest.update(b"missing")
         digest.update(platform.python_implementation().encode("ascii"))
         digest.update(str(self.model_dir or "").encode("utf-8"))
+        if self.model_paths is not None:
+            digest.update(self.model_paths.cache_key.encode("ascii"))
         digest.update(b"paddleocr:v1:lang=en:angle_cls=true")
         return digest.hexdigest()
 
@@ -242,6 +477,13 @@ class PaddleOCREngine:
             List of detected text regions
         """
         # Create a JSONL protocol script for PaddleOCR
+        model_args = ""
+        if self.model_paths is not None:
+            model_args = (
+                f"det_model_dir={json.dumps(str(self.model_paths.detection))}, "
+                f"rec_model_dir={json.dumps(str(self.model_paths.recognition))}, "
+                f"cls_model_dir={json.dumps(str(self.model_paths.classification))}, "
+            )
         script = f'''
 import json
 import sys
@@ -252,6 +494,7 @@ def main():
         use_angle_cls=True,
         lang="en",
         show_log=False,
+        {model_args}
     )
     
     image_path = {json.dumps(str(image_path))}

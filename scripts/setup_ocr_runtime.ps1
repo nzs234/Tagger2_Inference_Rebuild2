@@ -32,6 +32,7 @@ $venvPython = Join-Path $runtimeDir "Scripts\python.exe"
 
 # Pinned so an OCR upgrade is a deliberate change, not an accident of install date.
 $packages = @(
+    "setuptools==84.0.0",
     "paddlepaddle==3.0.0",
     "paddleocr==2.9.1"
 )
@@ -63,6 +64,13 @@ Write-Host "Verifying the runtime can import paddleocr ..."
 & $venvPython -c "import paddleocr; print('paddleocr', paddleocr.__version__)"
 if ($LASTEXITCODE -ne 0) {
     throw "paddleocr is installed but cannot be imported; OCR will report ocr_unavailable"
+}
+
+Write-Host "Probing the provisioned model cache ..."
+$probe = Join-Path $projectRoot "scripts\probe_ocr_runtime.py"
+& $venvPython $probe --output (Join-Path $runtimeDir "ocr-runtime.manifest.json")
+if ($LASTEXITCODE -ne 0) {
+    throw "PaddleOCR imports but its model cache is missing or incomplete"
 }
 
 Write-Host ""

@@ -47,7 +47,9 @@ migrated or rewritten.
 manifest recording provenance. Model assets are referenced, never copied. The
 category selects the validating reader: `classify` reads a
 `classify-snapshot-v1` bundle, `replace` / `replacement_index` read the index
-CSV, and an unknown category is refused rather than guessed at.
+CSV, `tokenizer` probes a serialized `tokenizer.json`, and `ocr` validates an
+isolated CPU PaddleOCR runtime descriptor. An unknown category is refused
+rather than guessed at.
 
 **Per-job workspace.** `data/workflows/jobs/<job-id>/` holds the immutable input
 manifest, the frozen config snapshot, the staging tree, the issue log, the
@@ -79,11 +81,15 @@ store. The rest of the application remains Chinese.
 - That runtime puts only `backend` on `sys.path`. Import as `tagger2.*` at module
   level in tests; a module-level `backend.tagger2.*` import passes under a system
   Python and fails under the project runtime.
-- OCR needs a separate interpreter. Build it with
-  `.\scripts\setup_ocr_runtime.ps1`; without it OCR reports `ocr_unavailable`
-  as a non-blocking warning.
+- OCR needs a separate interpreter and provisioned det/rec/cls model cache.
+  Build it with `.\scripts\setup_ocr_runtime.ps1`, then register its descriptor
+  with `scripts/import_ocr_runtime_resource.py`; runtime or model digest drift
+  blocks a job before any sample is touched.
 - Register a classification snapshot with
   `scripts/import_classification_snapshot.py --dry-run` first, then without it.
+- Register the Qwen tokenizer with `scripts/import_tokenizer_resource.py` and
+  the designated replacement index with
+  `scripts/import_designated_replacement_index.py`.
 - Keep ported files verbatim. If a source algorithm needs changing, change the
   caller instead, so rule-stage output stays comparable to the source project.
 - Any new stage must write into the workspace staging tree and commit through

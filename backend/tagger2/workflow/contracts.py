@@ -348,7 +348,7 @@ class WorkflowJobConfigV1:
     # Classify configuration
     classify: dict[str, Any] = field(default_factory=lambda: {
         "enabled": True,
-        "resource_id": "classify-e621-20260724-v1",
+        "resource_id": "classify-e621-20260812-v1",
         "overwrite_json": False,
         "overwrite_count": False,
     })
@@ -356,13 +356,16 @@ class WorkflowJobConfigV1:
     # Replace configuration
     replace: dict[str, Any] = field(default_factory=lambda: {
         "enabled": True,
-        "resource_id": "replace-e621-20260726-v2",
+        # Keep the historical ``replace-`` prefix for V1 clients while the
+        # catalog stores the immutable e621 replacement digest under this
+        # compatibility ID as well as its canonical ID.
+        "resource_id": "replace-e621-index-v1",
     })
     
     # OCR configuration
     ocr: dict[str, Any] = field(default_factory=lambda: {
         "enabled": False,
-        "resource_id": "ocr-ppocrv5-server-paddle-v1",
+        "resource_id": "ocr-paddleocr-2-9-1-cpu-v1",
         "min_confidence": 0.5,
         "force_reprocess": False,
     })
@@ -404,7 +407,7 @@ class WorkflowJobConfigV1:
     # Token budget configuration
     token_budget: dict[str, Any] = field(default_factory=lambda: {
         "enabled": True,
-        "tokenizer_resource_id": "Qwen/Qwen3-0.6B",
+        "tokenizer_resource_id": "tokenizer-qwen3-0-6b-tokenizer-v1",
         "max_tokens": 512,
     })
     
@@ -504,6 +507,24 @@ class WorkflowJobConfigV1:
             merged = dict(getattr(defaults, section))
             merged.update(supplied)
             values[section] = merged
+
+        # The old default used a Hugging Face repository name, which is not a
+        # content-addressed resource ID and could trigger an implicit network
+        # lookup.  Keep old job snapshots readable while forcing all new
+        # execution paths through the local immutable catalog resource.
+        token_budget = values.get("token_budget")
+        if isinstance(token_budget, dict):
+            legacy_id = token_budget.get("tokenizer_resource_id")
+            if legacy_id in {
+                "Qwen/Qwen3-0.6B",
+                "tokenizer-qwen3-0.6b-anima-v1",
+                "tokenizer-qwen3-0.6b-tokenizer-v1",
+            }:
+                migrated_budget = dict(token_budget)
+                migrated_budget["tokenizer_resource_id"] = (
+                    "tokenizer-qwen3-0-6b-tokenizer-v1"
+                )
+                values["token_budget"] = migrated_budget
 
         return cls(**values)
 

@@ -25,7 +25,7 @@ unimplemented.
 
 ## Verification
 
-- Backend: `407 passed, 1 skipped`.
+- Backend: `415 passed, 1 skipped`.
 - Frontend: `38 passed`; ESLint and TypeScript/Vite build pass.
 - Workflow mypy gate (the changed workflow modules): pass.
 - Explicit Ruff gate (`E4`, `E7`, `E9`, `F`): pass.
@@ -45,10 +45,25 @@ unimplemented.
   limit; the lock remains authoritative and the isolated Ruff/mypy tools pass.
 - Full repository mypy outside the changed workflow modules still has legacy
   errors; this is not claimed as a release-gate pass.
-- Real e621 classification snapshot, replacement index, tokenizer and CPU OCR
-  runtime are not bundled. Missing resources must report `blocked_resource`.
+- Local e621 resources are provisioned and digest-verified: classification
+  snapshot `classify-e621-20260812-v1`, replacement index
+  `replace-e621-index-v1`, Qwen tokenizer
+  `tokenizer-qwen3-0-6b-tokenizer-v1`, and CPU PaddleOCR descriptor
+  `ocr-paddleocr-2-9-1-cpu-v1`. The resource bytes remain outside Git under
+  ignored `data/`; setup/import commands are documented in `README.md`.
 - Stage-run persistence currently covers pipeline/import/export/review with
   checkpoints; finer per-module/per-batch orchestration, long-lived SSE,
-  pressure/chaos tests, and real OCR/GPU acceptance remain future work.
+  pressure/chaos tests, and GPU-specific acceptance remain future work.
 - Pressure/chaos testing was intentionally skipped for this delivery pass per
   request; only the small real-material flow gate was required.
+
+## Resource acceptance update
+
+- Random three-image smoke with all four resources enabled: `3/3` exported,
+  `3/3` OCR processed, `3/3` token counts within budget, no issues.
+- FastAPI resource smoke: `pending -> queued -> completed`, one image,
+  classification/replacement/tokenizer/OCR resource fingerprints persisted in
+  the report; target output contained three files and no source mutation.
+- The full repository mypy gate still reports legacy errors outside the changed
+  workflow modules; changed workflow modules and resource scripts pass mypy and
+  Ruff.

@@ -288,6 +288,39 @@ def create_workflow_router(
 
     preflight_service = WorkflowPreflightService(allowlist, resource_catalog, database)
 
+    def _token_counter_for_config(config: WorkflowJobConfigV2):
+        """Resolve the immutable tokenizer resource for one job.
+
+        Tests may inject a counter explicitly, but production jobs always load
+        the content-addressed tokenizer from the resource catalog.  There is
+        intentionally no repository/model-name fallback and no network lookup.
+        """
+
+        if not bool(config.token_budget.get("enabled")):
+            return None
+        if token_counter is not None:
+            return token_counter
+        resource_id = str(config.token_budget.get("tokenizer_resource_id") or "")
+        if not resource_id:
+            raise ValueError("token budget is enabled but no tokenizer resource is configured")
+        manifest = resource_catalog.get_manifest(resource_id)
+        path = resource_catalog.get_resource_path(resource_id)
+        if manifest is None or manifest.category != "tokenizer" or path is None:
+            raise ValueError(f"tokenizer resource is unavailable: {resource_id}")
+        from .tokenizer_resource import load_tokenizer_counter
+
+        return load_tokenizer_counter(path)
+
+    def _token_counter_for_job(job_id: str):
+        job = database.get_job(job_id)
+        if job is None:
+            return None
+        try:
+            config = WorkflowJobConfigV2.from_payload(json.loads(str(job["config_json"])))
+            return _token_counter_for_config(config)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+
     def _record_job_failure(job_id: str, exc: BaseException, trace: str) -> None:
         """Fail a job without leaking internals to the client.
 
@@ -478,12 +511,21 @@ def create_workflow_router(
             # non-blocking warning rather than failing the job.
             ocr_engine = None
             if config.ocr.get("enabled"):
-                from .ocr import PaddleOCREngine
+                from .ocr import load_ocr_engine_from_resource
 
                 try:
-                    ocr_engine = await asyncio.to_thread(PaddleOCREngine)
-                except RuntimeError:
-                    ocr_engine = None
+                    ocr_resource_id = str(config.ocr.get("resource_id") or "")
+                    ocr_resource_path = resource_catalog.get_resource_path(ocr_resource_id)
+                    if ocr_resource_path is None:
+                        raise RuntimeError(f"OCR resource is unavailable: {ocr_resource_id}")
+                    ocr_engine = await asyncio.to_thread(
+                        load_ocr_engine_from_resource, ocr_resource_path
+                    )
+                except RuntimeError as exc:
+                    # Preflight normally catches this.  Re-checking at the
+                    # execution boundary prevents a cache/runtime drift race
+                    # from degrading into a warning-only OCR skip.
+                    raise ValueError(f"OCR resource failed execution probe: {exc}") from exc
 
             # NL client if provider configured
             nl_client = None
@@ -543,8 +585,9 @@ def create_workflow_router(
                 except Exception as exc:
                     raise ValueError(f"invalid policy configuration: {exc}") from exc
 
-            # Token counter passed through if available
-            token_counter_arg = token_counter if config.token_budget.get("enabled") else None
+            # Resolve the frozen tokenizer resource unless a test explicitly
+            # injected a deterministic counter.
+            token_counter_arg = _token_counter_for_config(config)
 
             report = await asyncio.to_thread(
                 run_offline_pipeline,
@@ -1363,7 +1406,8 @@ def create_workflow_router(
         )
 
         store = _token_store(job_id)
-        if token_counter is None and request.action != "apply":
+        effective_token_counter = _token_counter_for_job(job_id)
+        if effective_token_counter is None and request.action != "apply":
             # No tokenizer resource, so report unavailable rather than guess.
             raise HTTPException(
                 status_code=503,
@@ -1378,7 +1422,7 @@ def create_workflow_router(
                 action=request.action,
                 expected_status=request.expected_status,
                 text=request.text,
-                count_tokens=token_counter,
+                count_tokens=effective_token_counter,
             )
         except TokenBudgetReviewConflictError as exc:
             raise HTTPException(

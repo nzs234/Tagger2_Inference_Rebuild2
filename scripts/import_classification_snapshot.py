@@ -33,12 +33,12 @@ from pathlib import Path
 project_root = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(project_root / "backend"))
 
-from tagger2.workflow.classify_snapshot import (
+from tagger2.workflow.classify_snapshot import (  # noqa: E402
     ClassifySnapshotError,
     build_snapshot_from_official_csv,
     validate_classify_snapshot,
 )
-from tagger2.workflow.resources import WorkflowResourceCatalog
+from tagger2.workflow.resources import WorkflowResourceCatalog  # noqa: E402
 
 CATEGORY = "classify"
 
@@ -52,6 +52,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--resource-id", required=True)
     parser.add_argument("--source-url", default=None)
     parser.add_argument("--source-timestamp", default=None)
+    parser.add_argument(
+        "--allow-official-anomalies",
+        action="store_true",
+        help=(
+            "quarantine malformed rows found in the official export instead of "
+            "aborting; no row is repaired or trimmed"
+        ),
+    )
+    parser.add_argument(
+        "--anomaly-report",
+        type=Path,
+        default=None,
+        help="write the exact quarantined source rows as JSON",
+    )
     parser.add_argument(
         "--out",
         type=Path,
@@ -78,6 +92,7 @@ def main() -> int:
         return 1
 
     print(f"Building {args.profile} snapshot...")
+    anomalies: list[dict[str, object]] = []
     try:
         document = build_snapshot_from_official_csv(
             profile=args.profile,
@@ -86,6 +101,8 @@ def main() -> int:
             implications_csv=args.implications_csv,
             source_url=args.source_url,
             source_timestamp=args.source_timestamp,
+            allow_official_anomalies=args.allow_official_anomalies,
+            anomaly_report=anomalies,
         )
     except ClassifySnapshotError as exc:
         print(f"ERROR: {exc}")
@@ -94,6 +111,14 @@ def main() -> int:
     print(f"  tags:         {len(document['tags']):,}")
     print(f"  aliases:      {len(document['aliases']):,}")
     print(f"  implications: {len(document['implications']):,}")
+    if anomalies:
+        print(f"  quarantined official anomalies: {len(anomalies):,}")
+        if args.anomaly_report is not None:
+            args.anomaly_report.parent.mkdir(parents=True, exist_ok=True)
+            args.anomaly_report.write_text(
+                json.dumps(anomalies, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            print(f"  anomaly report written to {args.anomaly_report}")
 
     with tempfile.TemporaryDirectory() as tmpdir:
         staged = Path(tmpdir) / "snapshot.json"
@@ -137,6 +162,8 @@ def main() -> int:
             category=CATEGORY,
             source_url=args.source_url,
             source_timestamp=args.source_timestamp,
+            builder_version="classify-snapshot-v1",
+            profile=args.profile,
         )
 
     print("Registered:")
