@@ -5,6 +5,8 @@ import {
   CheckCircle2,
   Database,
   Pause,
+  Pin,
+  PinOff,
   Play,
   RefreshCw,
   RotateCcw,
@@ -17,6 +19,7 @@ import { useMemo, useState } from 'react'
 import { Button, EmptyState, Field, Notice, Panel, StatusBadge } from '../components/ui'
 import { api, ApiError } from '../lib/api'
 import { copyFor } from '../lib/workflowCopy'
+import { useWorkflowEvents } from '../hooks/useWorkflowEvents'
 import { usePreferences } from '../store/app'
 import type {
   WorkflowCountDecision,
@@ -260,6 +263,14 @@ export function DatasetWorkflow() {
     onError: (error: Error) => setCountError(error.message),
   })
 
+  const pinJob = useMutation({
+    mutationFn: (pinned: boolean) => api.workflowPinJob(selectedJobId as string, pinned),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ['workflow', 'jobs'] })
+    },
+    onError: (error: Error) => setCountError(error.message),
+  })
+
   const repairJob = useMutation({
     mutationFn: () => api.workflowRepairJob(selectedJobId as string),
     onSuccess: (report) => {
@@ -308,6 +319,14 @@ export function DatasetWorkflow() {
   })
 
   const selectedJob = jobs.data?.find((job) => job.job_id === selectedJobId)
+  const workflowEvents = useWorkflowEvents(selectedJobId, {
+    enabled: Boolean(selectedJobId),
+    onEvent: () => {
+      // Event replay is the low-latency path; the regular query remains the
+      // source of truth for the complete job summary and status controls.
+      void queryClient.invalidateQueries({ queryKey: ['workflow', 'jobs'] })
+    },
+  })
 
   // A repair report and a review error belong to one job, so clear them on switch.
   function selectJob(jobId: string) {
@@ -665,6 +684,7 @@ export function DatasetWorkflow() {
                 <th>{text.samples}</th>
                 <th>{text.module}</th>
                 <th>{text.created}</th>
+                <th>{text.pinJob}</th>
               </tr>
             </thead>
             <tbody>
@@ -684,6 +704,11 @@ export function DatasetWorkflow() {
                   </td>
                   <td>{job.current_module_id ?? '—'}</td>
                   <td className="workflow-mono">{job.created_at}</td>
+                  <td>
+                    {job.pinned ? (
+                      <Pin size={15} aria-label={text.pinnedJob} />
+                    ) : null}
+                  </td>
                 </tr>
               ))}
             </tbody>
@@ -698,6 +723,20 @@ export function DatasetWorkflow() {
           {countError && <Notice tone="danger">{countError}</Notice>}
           <div className="workflow-actions">
             <StatusBadge state={selectedJob.status} />
+            <Button
+              variant="quiet"
+              onClick={() => pinJob.mutate(!selectedJob.pinned)}
+              disabled={pinJob.isPending}
+              aria-pressed={Boolean(selectedJob.pinned)}
+              title={selectedJob.pinned ? text.unpinJob : text.pinJob}
+            >
+              {selectedJob.pinned ? (
+                <PinOff size={15} aria-hidden="true" />
+              ) : (
+                <Pin size={15} aria-hidden="true" />
+              )}
+              {selectedJob.pinned ? text.unpinJob : text.pinJob}
+            </Button>
             {selectedJob.status === 'pending' && (
               <Button
                 onClick={() => startJob.mutate()}
@@ -765,7 +804,8 @@ export function DatasetWorkflow() {
               <Button
                 variant="quiet"
                 onClick={() => discardJob.mutate()}
-                disabled={discardJob.isPending}
+                disabled={discardJob.isPending || selectedJob.pinned === true}
+                title={selectedJob.pinned ? text.discardPinnedHint : undefined}
               >
                 <Archive size={15} aria-hidden="true" />
                 {text.discardJob}
@@ -780,6 +820,11 @@ export function DatasetWorkflow() {
               {text.repairJob}
             </Button>
           </div>
+          {selectedJob.pinned && (
+            <Notice tone="info">
+              <Pin size={14} aria-hidden="true" /> {text.discardPinnedHint}
+            </Notice>
+          )}
           {repair && (
             <dl className="workflow-summary" aria-label={text.repairResult}>
               <div>
@@ -803,6 +848,36 @@ export function DatasetWorkflow() {
                 <dd className="workflow-mono">{repair.journal_state}</dd>
               </div>
             </dl>
+          )}
+        </Panel>
+      )}
+
+      {selectedJobId && (
+        <Panel
+          title={text.eventsTitle}
+          eyebrow={`${text.eventCursor} ${workflowEvents.cursor}`}
+        >
+          {workflowEvents.error && <Notice tone="warning">{text.eventsError}</Notice>}
+          {workflowEvents.events.length === 0 ? (
+            <EmptyState icon={<RefreshCw size={20} />} title={text.eventsEmpty} />
+          ) : (
+            <div className="workflow-review-list" aria-live="polite">
+              {workflowEvents.events.map((event) => (
+                <article key={`${event.event_id ?? event.seq ?? 0}-${event.event_type}`} className="workflow-review-card">
+                  <div className="workflow-actions">
+                    <strong>{event.event_type ?? 'workflow'}</strong>
+                    {event.to_status && <StatusBadge state={event.to_status} />}
+                    <span className="workflow-mono">#{event.event_id ?? event.seq ?? '—'}</span>
+                  </div>
+                  <div className="workflow-hint">
+                    {event.from_status && event.to_status
+                      ? `${event.from_status} → ${event.to_status}`
+                      : event.to_status ?? event.from_status ?? ''}
+                    {event.created_at ? ` · ${event.created_at}` : ''}
+                  </div>
+                </article>
+              ))}
+            </div>
           )}
         </Panel>
       )}

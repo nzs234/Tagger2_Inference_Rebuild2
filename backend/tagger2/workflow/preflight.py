@@ -168,10 +168,16 @@ class WorkflowPreflightService:
 
         if config.replace.get("enabled"):
             resource_id = config.replace.get("resource_id")
-            if resource_id:
+            if not resource_id:
+                missing_resources.append("Replace is enabled but no replacement resource_id is selected")
+            else:
                 manifest = self.resource_catalog.get_manifest(resource_id)
                 if not manifest:
                     missing_resources.append(f"Replace resource not found: {resource_id}")
+                elif manifest.category not in {"replace", "replacement_index"}:
+                    missing_resources.append(
+                        f"Replace resource {resource_id} has incompatible category {manifest.category!r}"
+                    )
 
         if config.ocr.get("enabled"):
             resource_id = config.ocr.get("resource_id")
@@ -179,6 +185,10 @@ class WorkflowPreflightService:
                 manifest = self.resource_catalog.get_manifest(resource_id)
                 if not manifest:
                     missing_resources.append(f"OCR resource not found: {resource_id}")
+                elif manifest.category != "ocr":
+                    missing_resources.append(
+                        f"OCR resource {resource_id} has incompatible category {manifest.category!r}"
+                    )
             else:
                 missing_resources.append("OCR is enabled but no OCR resource_id is selected")
 
@@ -197,6 +207,12 @@ class WorkflowPreflightService:
                 missing_resources.append("Token budget is enabled but no tokenizer resource_id is selected")
             elif not self.resource_catalog.get_manifest(str(resource_id)):
                 missing_resources.append(f"Tokenizer resource not found: {resource_id}")
+            else:
+                manifest = self.resource_catalog.get_manifest(str(resource_id))
+                if manifest is not None and manifest.category != "tokenizer":
+                    missing_resources.append(
+                        f"Tokenizer resource {resource_id} has incompatible category {manifest.category!r}"
+                    )
 
         if missing_resources:
             errors.extend(missing_resources)

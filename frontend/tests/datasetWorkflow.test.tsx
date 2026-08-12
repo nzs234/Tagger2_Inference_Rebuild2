@@ -166,6 +166,24 @@ describe('DatasetWorkflow count review and job controls', () => {
           }
           return json({ job_id: 'job-1', status: 'paused' })
         }
+        if (url.includes('/events?')) {
+          return json({
+            job_id: 'job-1',
+            events: [
+              {
+                event_id: 12,
+                job_id: 'job-1',
+                event_type: 'stage_started',
+                from_status: 'queued',
+                to_status: 'running',
+                payload: {},
+                created_at: '2026-08-11T00:00:01Z',
+              },
+            ],
+            next_after_event_id: 12,
+            has_more: false,
+          })
+        }
         if (url.includes('/count-review')) {
           return json({ items: [{ ...decision, status: pending ? 'pending' : 'confirmed' }], pending })
         }
@@ -204,6 +222,17 @@ describe('DatasetWorkflow count review and job controls', () => {
               total_samples: 3,
               current_module_id: null,
               created_at: '2026-08-11T02:00:00Z',
+            },
+            {
+              job_id: 'job-4',
+              status: 'completed',
+              profile: 'e621',
+              work_mode: 'in_place',
+              pinned: true,
+              processed_samples: 3,
+              total_samples: 3,
+              current_module_id: null,
+              created_at: '2026-08-11T03:00:00Z',
             },
           ])
         }
@@ -318,6 +347,22 @@ describe('DatasetWorkflow count review and job controls', () => {
     await waitFor(() => {
       expect(posts.some((post) => post.url.endsWith('/start'))).toBe(true)
     })
+  })
+
+  it('replays durable events with a cursor for the selected job', async () => {
+    await selectJob()
+    expect(await screen.findByRole('heading', { name: '事件' })).toBeInTheDocument()
+    expect(await screen.findByText('stage_started')).toBeInTheDocument()
+    expect(screen.getByText(/游标 12/)).toBeInTheDocument()
+  })
+
+  it('prevents discarding a pinned terminal job', async () => {
+    renderPage()
+    fireEvent.click(await screen.findByText(/job-4/))
+
+    const discard = await screen.findByRole('button', { name: /丢弃工作区/ })
+    expect(discard).toBeDisabled()
+    expect(screen.getByText(/取消固定后才能丢弃工作区/)).toBeInTheDocument()
   })
 })
 

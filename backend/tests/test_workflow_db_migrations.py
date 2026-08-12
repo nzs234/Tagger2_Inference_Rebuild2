@@ -93,3 +93,75 @@ def test_v2_to_v3_preserves_parent_and_all_child_rows(tmp_path: Path):
 
     # A recoverable copy is retained for operator rollback/diagnostics.
     assert db_path.with_name("workflow.sqlite3.pre-migration.bak").exists()
+
+
+def test_v3_repairs_legacy_global_operation_idempotency(tmp_path: Path):
+    """Existing v3 operation rows keep raw keys while becoming job-scoped."""
+    from tagger2.workflow.db_schema import SCHEMA_SQL, apply_migrations
+
+    db_path = tmp_path / "workflow.sqlite3"
+    connection = sqlite3.connect(db_path)
+    connection.executescript(SCHEMA_SQL)
+    # Emulate the first v3 schema, where the column itself was UNIQUE.
+    connection.execute("DROP INDEX idx_workflow_operations_idempotency")
+    connection.execute("DROP TABLE workflow_operations")
+    connection.execute(
+        """
+        CREATE TABLE workflow_operations (
+            operation_id TEXT PRIMARY KEY,
+            job_id TEXT NOT NULL REFERENCES workflow_jobs(job_id) ON DELETE CASCADE,
+            operation_type TEXT NOT NULL,
+            status TEXT NOT NULL,
+            idempotency_key TEXT NOT NULL UNIQUE,
+            payload_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL,
+            finished_at TEXT
+        )
+        """
+    )
+    connection.execute(
+        """
+        INSERT INTO workflow_jobs (
+            job_id, config_version, config_json, config_hash, profile,
+            work_mode, overwrite_mode, source_root_id, output_root_id,
+            workspace_path, status, created_at
+        ) VALUES ('job-a', 1, '{}', 'hash', 'e621', 'full_copy', 'incremental',
+                  'input', 'output', 'workspace-a', 'pending', 'now')
+        """
+    )
+    connection.execute(
+        """
+        INSERT INTO workflow_operations
+            (operation_id, job_id, operation_type, status, idempotency_key,
+             payload_json, created_at)
+        VALUES ('op-a', 'job-a', 'restore', 'completed', 'retry', '{}', 'now')
+        """
+    )
+    connection.commit()
+    connection.close()
+
+    apply_migrations(db_path)
+
+    connection = sqlite3.connect(db_path)
+    try:
+        assert connection.execute(
+            "SELECT idempotency_key FROM workflow_operations WHERE operation_id = 'op-a'"
+        ).fetchone()[0] == "retry"
+        indexes = connection.execute(
+            "PRAGMA index_list(workflow_operations)"
+        ).fetchall()
+        unique_columns = []
+        for row in indexes:
+            if int(row[2]) == 1:
+                unique_columns.append(
+                    [
+                        str(info[2])
+                        for info in connection.execute(
+                            f"PRAGMA index_info('{str(row[1]).replace(chr(39), chr(39) * 2)}')"
+                        ).fetchall()
+                    ]
+                )
+        assert ["job_id", "operation_type", "idempotency_key"] in unique_columns
+        assert ["idempotency_key"] not in unique_columns
+    finally:
+        connection.close()

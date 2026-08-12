@@ -1,6 +1,7 @@
 """Tests for job lifecycle: pause/resume, leases and interrupted-run repair."""
 
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -266,6 +267,86 @@ def test_unknown_job_and_sample_are_errors():
             lifecycle.claim_sample(999, owner="worker-a")
         with pytest.raises(LifecycleError):
             lifecycle.release_sample(0, status="teleported")
+
+
+def test_operation_idempotency_is_scoped_to_job_and_operation_type():
+    """A caller key may be reused by independent workflow operations."""
+    from backend.tagger2.workflow.db import WorkflowDatabase
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        database = WorkflowDatabase(Path(tmpdir) / "workflows.sqlite3")
+        jobs = []
+        for index in range(2):
+            job_id, _ = database.create_job(
+                config_json={},
+                config_hash=str(index),
+                profile="e621",
+                work_mode="full_copy",
+                overwrite_mode="incremental",
+                source_root_id=f"input-{index}",
+                output_root_id=f"output-{index}",
+                workspace_root=Path(tmpdir) / "jobs",
+            )
+            jobs.append(job_id)
+
+        first = database.record_operation(
+            jobs[0], "restore", idempotency_key="retry-1", payload={"step": 1}
+        )
+        replay = database.record_operation(
+            jobs[0], "restore", idempotency_key="retry-1", payload={"step": 2}
+        )
+        other_job = database.record_operation(
+            jobs[1], "restore", idempotency_key="retry-1"
+        )
+        other_type = database.record_operation(
+            jobs[0], "discard", idempotency_key="retry-1"
+        )
+
+        assert replay == first
+        assert len({first, other_job, other_type}) == 3
+        with database.connection() as conn:
+            rows = conn.execute(
+                "SELECT job_id, operation_type, idempotency_key, payload_json "
+                "FROM workflow_operations ORDER BY created_at, operation_id"
+            ).fetchall()
+        assert len(rows) == 3
+        assert {str(row[2]) for row in rows} == {"retry-1"}
+        assert any(str(row[3]) == '{"step":2}' for row in rows)
+
+
+def test_commit_journal_sequence_is_unique_under_concurrent_writers():
+    """MAX(sequence)+1 allocation is serialized for one job."""
+    from backend.tagger2.workflow.db import WorkflowDatabase
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        database = WorkflowDatabase(Path(tmpdir) / "workflows.sqlite3")
+        job_id, _ = database.create_job(
+            config_json={},
+            config_hash="hash",
+            profile="e621",
+            work_mode="full_copy",
+            overwrite_mode="incremental",
+            source_root_id="input",
+            output_root_id="output",
+            workspace_root=Path(tmpdir) / "jobs",
+        )
+
+        def append(index: int) -> int:
+            return database.record_commit_journal(
+                job_id, "file_committed", payload={"index": index}
+            )
+
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            sequences = list(executor.map(append, range(32)))
+
+        assert sorted(sequences) == list(range(32))
+        with database.connection() as conn:
+            rows = conn.execute(
+                "SELECT sequence FROM workflow_commit_journals "
+                "WHERE job_id = ? ORDER BY sequence",
+                (job_id,),
+            ).fetchall()
+        assert [int(row[0]) for row in rows] == list(range(32))
 
 
 if __name__ == "__main__":

@@ -94,7 +94,10 @@ SECTION_SCHEMA: dict[str, dict[str, Any]] = {
         "max_tokens": ("int", 1, 32768),
     },
     "export": {
-        "format": ("enum", ("json", "txt", "flat_txt", "both")),
+        # ``flat_txt`` is an implementation detail of the normalizer.  The
+        # public workflow contract intentionally exposes the stable ``txt``
+        # spelling only; the pipeline maps it at the serialization boundary.
+        "format": ("enum", ("json", "txt", "both")),
     },
 }
 
@@ -433,6 +436,8 @@ class WorkflowJobConfigV1:
         values = dict(payload)
 
         schema_version = values.get("schema_version", 1)
+        if isinstance(schema_version, bool) or not isinstance(schema_version, int):
+            raise ValueError("schema_version must be an integer")
         if schema_version == 1:
             # Deterministic V1 -> V2 migration.  V1 remains readable for old
             # jobs, but new rows always store the explicit V2 shape.
@@ -442,6 +447,14 @@ class WorkflowJobConfigV1:
                 caption = dict(caption)
                 caption["model_id"] = caption.pop("resource_id")
                 values["caption"] = caption
+            export = values.get("export")
+            if isinstance(export, Mapping) and export.get("format") == "flat_txt":
+                # V1 used the normalizer's internal spelling.  Keep the
+                # migration deterministic while ensuring all newly persisted
+                # snapshots use the public ``txt`` value.
+                export = dict(export)
+                export["format"] = "txt"
+                values["export"] = export
         elif schema_version == WORKFLOW_CONFIG_V2_VERSION:
             # V2 is accepted by the same immutable reader while the dedicated
             # V2 public alias is rolled out.  The normalized in-memory contract
@@ -490,8 +503,6 @@ class WorkflowJobConfigV1:
             _validate_section(section, supplied)
             merged = dict(getattr(defaults, section))
             merged.update(supplied)
-            if section == "export" and merged.get("format") == "flat_txt":
-                merged["format"] = "txt"
             values[section] = merged
 
         return cls(**values)

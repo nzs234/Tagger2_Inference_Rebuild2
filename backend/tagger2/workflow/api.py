@@ -394,11 +394,14 @@ def create_workflow_router(
             # digest is persisted with the job so recovery can detect drift.
             resource_fingerprints: dict[str, str] = {}
 
+            frozen_manifests: dict[str, dict[str, Any]] = {}
+
             def freeze_resource(resource_id: str) -> None:
                 manifest = resource_catalog.get_manifest(resource_id)
                 if manifest is None or resource_catalog.get_resource_path(resource_id) is None:
                     raise ValueError(f"resource digest verification failed: {resource_id}")
                 resource_fingerprints[resource_id] = manifest.resource_fingerprint
+                frozen_manifests[resource_id] = dict(manifest.__dict__)
 
             for section_name, resource_key in (
                 ("classify", "resource_id"),
@@ -527,7 +530,10 @@ def create_workflow_router(
                     
                     # Create provider instance
                     provider = create_provider(ProviderConfig.from_mapping(cfg))
-                    nl_client = ProviderNlAdapter(provider)
+                    nl_client = ProviderNlAdapter(
+                        provider,
+                        model=(str(config.nl.get("model")) if config.nl.get("model") else None),
+                    )
 
             # Policy config converted to dataclass if enabled
             policy_config_arg = None
@@ -548,6 +554,7 @@ def create_workflow_router(
                 workspace=workspace,
                 replacement_index_path=replacement_index_path,
                 resource_fingerprints=resource_fingerprints,
+                resource_manifests=frozen_manifests,
                 tag_predictor=tag_predictor,
                 classification_rules=classification_rules,
                 policy_config=policy_config_arg,

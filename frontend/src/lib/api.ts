@@ -272,9 +272,10 @@ export const api = {
       `/workflows/jobs/${encodeURIComponent(id)}/pin`,
       { method: 'POST', body: JSON.stringify({ pinned }) },
     ),
-  workflowJobEvents: (id: string, afterEventId = 0, limit = 100) =>
+  workflowJobEvents: (id: string, afterEventId = 0, limit = 100, signal?: AbortSignal) =>
     request<{ job_id: string; events: WorkflowJobEvent[]; next_after_event_id: number; has_more: boolean }>(
       `/workflows/jobs/${encodeURIComponent(id)}/events?after_event_id=${afterEventId}&limit=${limit}`,
+      signal ? { signal } : undefined,
     ),
   workflowRepairJob: (id: string) =>
     request<WorkflowRepairReport>(`/workflows/jobs/${encodeURIComponent(id)}/repair`, {

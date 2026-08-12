@@ -1,5 +1,6 @@
 # Runtime and local data
 .venv/
+.venv-dev/
 venv/
 data/
 logs/

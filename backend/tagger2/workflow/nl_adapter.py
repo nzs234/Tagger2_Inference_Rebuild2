@@ -9,8 +9,9 @@ from .stages.nl import NlRequest
 class ProviderNlAdapter:
     """Wraps an async VisionProvider to provide sync NlClient interface."""
 
-    def __init__(self, provider: VisionProvider):
+    def __init__(self, provider: VisionProvider, *, model: str | None = None):
         self._provider = provider
+        self._model = model.strip() if isinstance(model, str) and model.strip() else None
 
     def complete(self, request: NlRequest) -> bytes:
         """Synchronously call the async provider and return raw JSON bytes.
@@ -20,11 +21,11 @@ class ProviderNlAdapter:
         into the provider's generate call and returns the result as JSON bytes.
         """
         
-        # Extract the user prompt from the payload
-        # The NL stage builds a JSON payload with the annotation data
-        user_prompt = request.system_prompt
-        if request.payload:
-            user_prompt += f"\n\nAnnotation data: {json.dumps(request.payload)}"
+        # Keep the frozen prompt in the provider's system channel and send the
+        # sample projection as data in the user channel.  The model override is
+        # part of the immutable NL contract; an empty value deliberately keeps
+        # the provider profile's primary/fallback model selection.
+        user_prompt = json.dumps(request.payload, ensure_ascii=False, sort_keys=True)
         
         # Run the async provider in a new event loop
         # (The NL stage runs in a worker thread, so there's no active event loop)
@@ -38,15 +39,17 @@ class ProviderNlAdapter:
                     self._provider.generate(
                         image=str(request.image_path),
                         prompt=user_prompt,
+                        model=self._model,
+                        system_prompt=request.system_prompt,
                     )
                 )
             else:
-                # For text-only, we still need to call generate but with no image
-                # This may not work for all providers - may need enhancement
                 result = loop.run_until_complete(
                     self._provider.generate(
-                        image="",  # Empty image
+                        image=None,
                         prompt=user_prompt,
+                        model=self._model,
+                        system_prompt=request.system_prompt,
                     )
                 )
             

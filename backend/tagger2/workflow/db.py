@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import json
 import sqlite3
+import threading
 import uuid
 from collections.abc import Iterator
 from pathlib import Path
@@ -34,6 +35,13 @@ class WorkflowDatabase:
     def __init__(self, db_path: Path | str):
         self.db_path = Path(db_path)
         self._memory_conn: sqlite3.Connection | None = None
+        # A memory database is backed by one shared connection.  SQLite does
+        # not permit two ``BEGIN IMMEDIATE`` statements on that connection at
+        # once, so serialize the small write transactions that implement the
+        # durable control-plane records.  File-backed databases still rely on
+        # SQLite's database lock, while this lock also avoids needless retries
+        # for callers sharing one ``WorkflowDatabase`` instance.
+        self._write_lock = threading.RLock()
         
         # For :memory: databases, create and hold a persistent connection
         if str(db_path) == ":memory:":
@@ -326,39 +334,45 @@ class WorkflowDatabase:
         operation_id = uuid.uuid4().hex
         now = utc_now()
         finished_at = now if status in {"completed", "failed", "cancelled"} else None
-        with self.connection() as conn:
-            existing = conn.execute(
-                "SELECT operation_id, job_id, operation_type FROM workflow_operations "
-                "WHERE idempotency_key = ?",
-                (idempotency_key,),
-            ).fetchone()
-            if existing is not None:
-                if str(existing["job_id"]) != job_id or str(existing["operation_type"]) != operation_type:
-                    raise DatabaseConcurrencyError(
-                        "idempotency key is already bound to another workflow operation"
+        with self._write_lock:
+            with self.connection() as conn:
+                # Take the writer lock before checking for an existing row.
+                # Without this, two processes can both observe no row and
+                # race to insert the same idempotency key.
+                conn.execute("BEGIN IMMEDIATE")
+                existing = conn.execute(
+                    "SELECT operation_id, job_id, operation_type FROM workflow_operations "
+                    "WHERE job_id = ? AND operation_type = ? AND idempotency_key = ?",
+                    (job_id, operation_type, idempotency_key),
+                ).fetchone()
+                if existing is not None:
+                    operation_id = str(existing["operation_id"])
+                    conn.execute(
+                        "UPDATE workflow_operations SET status = ?, payload_json = ?, "
+                        "finished_at = COALESCE(?, finished_at) WHERE operation_id = ?",
+                        (
+                            status,
+                            canonical_json(payload or {}),
+                            finished_at,
+                            operation_id,
+                        ),
                     )
-                operation_id = str(existing["operation_id"])
-                conn.execute(
-                    "UPDATE workflow_operations SET status = ?, payload_json = ?, "
-                    "finished_at = COALESCE(?, finished_at) WHERE operation_id = ?",
-                    (status, canonical_json(payload or {}), finished_at, operation_id),
-                )
-            else:
-                conn.execute(
-                    "INSERT INTO workflow_operations "
-                    "(operation_id, job_id, operation_type, status, idempotency_key, "
-                    "payload_json, created_at, finished_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                    (
-                        operation_id,
-                        job_id,
-                        operation_type,
-                        status,
-                        idempotency_key,
-                        canonical_json(payload or {}),
-                        now,
-                        finished_at,
-                    ),
-                )
+                else:
+                    conn.execute(
+                        "INSERT INTO workflow_operations "
+                        "(operation_id, job_id, operation_type, status, idempotency_key, "
+                        "payload_json, created_at, finished_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            operation_id,
+                            job_id,
+                            operation_type,
+                            status,
+                            idempotency_key,
+                            canonical_json(payload or {}),
+                            now,
+                            finished_at,
+                        ),
+                    )
         return operation_id
 
     def record_stage_run(
@@ -436,20 +450,24 @@ class WorkflowDatabase:
 
         if not event_type or any(char.isspace() for char in event_type):
             raise ValueError("event_type must be a non-empty token")
-        with self.connection() as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            row = conn.execute(
-                "SELECT COALESCE(MAX(sequence), -1) + 1 AS next_sequence "
-                "FROM workflow_commit_journals WHERE job_id = ?",
-                (job_id,),
-            ).fetchone()
-            sequence = int(row["next_sequence"] if row is not None else 0)
-            conn.execute(
-                "INSERT INTO workflow_commit_journals "
-                "(job_id, sequence, event_type, payload_json, created_at) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (job_id, sequence, event_type, canonical_json(payload or {}), utc_now()),
-            )
+        with self._write_lock:
+            with self.connection() as conn:
+                # The immediate transaction makes MAX(sequence)+1 an atomic
+                # per-job allocation for separate file-backed connections;
+                # ``_write_lock`` covers the shared :memory: connection case.
+                conn.execute("BEGIN IMMEDIATE")
+                row = conn.execute(
+                    "SELECT COALESCE(MAX(sequence), -1) + 1 AS next_sequence "
+                    "FROM workflow_commit_journals WHERE job_id = ?",
+                    (job_id,),
+                ).fetchone()
+                sequence = int(row["next_sequence"] if row is not None else 0)
+                conn.execute(
+                    "INSERT INTO workflow_commit_journals "
+                    "(job_id, sequence, event_type, payload_json, created_at) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (job_id, sequence, event_type, canonical_json(payload or {}), utc_now()),
+                )
         return sequence
 
     def record_artifact(

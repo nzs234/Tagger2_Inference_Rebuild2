@@ -63,6 +63,9 @@ export interface WorkflowCopy {
   restoreJob: string
   discardJob: string
   pinJob: string
+  unpinJob: string
+  pinnedJob: string
+  discardPinnedHint: string
   preflightOk: string
   preflightFailed: string
   warnings: string
@@ -122,6 +125,10 @@ export interface WorkflowCopy {
   tokenStale: string
   tokenUnavailable: string
   tokenNotApplied: string
+  eventsTitle: string
+  eventsEmpty: string
+  eventsError: string
+  eventCursor: string
 }
 
 export const workflowCopy: Record<WorkflowLanguage, WorkflowCopy> = {
@@ -183,6 +190,9 @@ export const workflowCopy: Record<WorkflowLanguage, WorkflowCopy> = {
     restoreJob: '恢复数据集',
     discardJob: '丢弃工作区',
     pinJob: '固定任务',
+    unpinJob: '取消固定',
+    pinnedJob: '已固定',
+    discardPinnedHint: '任务已固定；取消固定后才能丢弃工作区。',
     preflightOk: '预检通过',
     preflightFailed: '预检失败',
     warnings: '警告',
@@ -245,6 +255,10 @@ export const workflowCopy: Record<WorkflowLanguage, WorkflowCopy> = {
     tokenStale: '该条目已被他处修改，请刷新后重试。',
     tokenUnavailable: '未注册 Tokenizer 资源，无法计数，相关操作已停用。',
     tokenNotApplied: '候选文本在应用前不会写入最终 JSON。',
+    eventsTitle: '事件',
+    eventsEmpty: '尚无持久化事件。',
+    eventsError: '事件暂时不可用，正在重试。',
+    eventCursor: '游标',
   },
   en: {
     navLabel: 'Dataset Workflow',
@@ -304,6 +318,9 @@ export const workflowCopy: Record<WorkflowLanguage, WorkflowCopy> = {
     restoreJob: 'Restore dataset',
     discardJob: 'Discard workspace',
     pinJob: 'Pin job',
+    unpinJob: 'Unpin job',
+    pinnedJob: 'Pinned',
+    discardPinnedHint: 'This job is pinned. Unpin it before discarding the workspace.',
     preflightOk: 'Preflight passed',
     preflightFailed: 'Preflight failed',
     warnings: 'Warnings',
@@ -366,6 +383,10 @@ export const workflowCopy: Record<WorkflowLanguage, WorkflowCopy> = {
     tokenStale: 'This entry changed elsewhere. Refresh and try again.',
     tokenUnavailable: 'No tokenizer resource is registered, so counting actions are disabled.',
     tokenNotApplied: 'A proposal is never written into the final JSON until it is applied.',
+    eventsTitle: 'Events',
+    eventsEmpty: 'No durable events yet.',
+    eventsError: 'Events are temporarily unavailable; retrying.',
+    eventCursor: 'Cursor',
   },
 }
 

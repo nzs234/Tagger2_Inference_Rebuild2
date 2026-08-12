@@ -207,6 +207,7 @@ def run_offline_pipeline(
     workspace: Path,
     replacement_index_path: Path | None = None,
     resource_fingerprints: dict[str, str] | None = None,
+    resource_manifests: Mapping[str, Mapping[str, Any]] | None = None,
     tag_predictor: TagPredictor | None = None,
     policy_config: Any | None = None,
     token_counter: Any | None = None,
@@ -349,8 +350,15 @@ def run_offline_pipeline(
         json.dumps(config.to_dict(), ensure_ascii=False, indent=2, sort_keys=True, default=str),
         encoding="utf-8",
     )
+    resource_snapshot = {
+        resource_id: {
+            "fingerprint": fingerprint,
+            "manifest": dict((resource_manifests or {}).get(resource_id, {})),
+        }
+        for resource_id, fingerprint in (resource_fingerprints or {}).items()
+    }
     (workspace / "resource_snapshot.json").write_text(
-        json.dumps(dict(resource_fingerprints or {}), ensure_ascii=False, indent=2, sort_keys=True),
+        json.dumps(resource_snapshot, ensure_ascii=False, indent=2, sort_keys=True),
         encoding="utf-8",
     )
     if database is not None and job_id is not None:
@@ -360,7 +368,13 @@ def run_offline_pipeline(
                     "INSERT OR REPLACE INTO workflow_resource_snapshots "
                     "(job_id, resource_id, resource_fingerprint, manifest_json, created_at) "
                     "VALUES (?, ?, ?, ?, ?)",
-                    (job_id, resource_id, fingerprint, "{}", utc_now()),
+                    (
+                        job_id,
+                        resource_id,
+                        fingerprint,
+                        canonical_json((resource_manifests or {}).get(resource_id, {})),
+                        utc_now(),
+                    ),
                 )
 
     caption_tags: dict[str, tuple[str, ...]] = {}
@@ -683,7 +697,12 @@ def run_offline_pipeline(
             # later parks this sample for human review.
             review_projections[str(sample.sample_id)] = dict(projection)
 
-            if token_counter is not None:
+            # ``token_counter`` is an injected capability, but the stage is
+            # still controlled by the immutable job contract.  A caller may
+            # provide a tokenizer for another reason (or reuse a pipeline
+            # helper) without accidentally enabling token review on a job that
+            # explicitly disabled it.
+            if config.token_budget.get("enabled") and token_counter is not None:
                 caption_format = {
                     "replaceUnderscoresWithSpaces": policy.replace_underscores_with_spaces,
                     "preserveEscapes": policy.preserve_escapes,

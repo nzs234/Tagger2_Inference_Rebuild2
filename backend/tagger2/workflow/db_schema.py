@@ -95,7 +95,7 @@ CREATE TABLE IF NOT EXISTS workflow_operations (
     job_id TEXT NOT NULL REFERENCES workflow_jobs(job_id) ON DELETE CASCADE,
     operation_type TEXT NOT NULL,
     status TEXT NOT NULL,
-    idempotency_key TEXT NOT NULL UNIQUE,
+    idempotency_key TEXT NOT NULL,
     payload_json TEXT NOT NULL DEFAULT '{}',
     created_at TEXT NOT NULL,
     finished_at TEXT
@@ -226,6 +226,8 @@ CREATE INDEX IF NOT EXISTS idx_workflow_events_job_cursor ON workflow_events(job
 CREATE INDEX IF NOT EXISTS idx_workflow_job_pins_pinned_at ON workflow_job_pins(pinned_at);
 CREATE INDEX IF NOT EXISTS idx_workflow_stage_runs_job ON workflow_stage_runs(job_id, stage_id);
 CREATE INDEX IF NOT EXISTS idx_workflow_operations_job ON workflow_operations(job_id, created_at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_workflow_operations_idempotency
+    ON workflow_operations(job_id, operation_type, idempotency_key);
 CREATE INDEX IF NOT EXISTS idx_workflow_artifacts_job ON workflow_artifacts(job_id, kind);
 CREATE INDEX IF NOT EXISTS idx_workflow_dataset_locks_job ON workflow_dataset_locks(job_id, released_at);
 CREATE INDEX IF NOT EXISTS idx_workflow_samples_lease ON workflow_samples(job_id, lease_expires_at);
@@ -274,6 +276,91 @@ def schema_fingerprint(conn: sqlite3.Connection) -> str:
         f"{str(row[0])}\0{str(row[1])}\0{str(row[2])}" for row in rows
     ).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()
+
+
+def _has_scoped_operation_idempotency_index(conn: sqlite3.Connection) -> bool:
+    """Return whether operation retries are scoped by job and operation type.
+
+    V3 initially declared ``idempotency_key`` as a table-level UNIQUE column,
+    which incorrectly made a key collide across independent jobs.  Looking at
+    the index shape (rather than the SQL text) also handles SQLite's generated
+    names and databases created by different SQLite versions.
+    """
+
+    table = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='workflow_operations'"
+    ).fetchone()
+    if table is None:
+        # Older pre-v3 databases may not have the operation projection yet;
+        # the idempotent SCHEMA_SQL below will create the current shape.
+        return True
+    scoped = False
+    global_key = False
+    for row in conn.execute("PRAGMA index_list(workflow_operations)").fetchall():
+        # index_list columns are seq, name, unique, origin, partial.
+        if len(row) < 3 or int(row[2]) != 1:
+            continue
+        index_name = str(row[1]).replace("'", "''")
+        columns = [
+            str(index_row[2])
+            for index_row in conn.execute(
+                f"PRAGMA index_info('{index_name}')"
+            ).fetchall()
+        ]
+        if columns == ["job_id", "operation_type", "idempotency_key"]:
+            scoped = True
+        elif columns == ["idempotency_key"]:
+            global_key = True
+    return scoped and not global_key
+
+
+def _rebuild_operation_table_for_scoped_idempotency(conn: sqlite3.Connection) -> None:
+    """Replace the original v3 operation table without losing audit rows."""
+
+    # The table has no child tables today, but disable FK enforcement for the
+    # rename/drop sequence so this remains safe if a future schema adds one.
+    conn.commit()
+    conn.execute("PRAGMA foreign_keys=OFF")
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        conn.execute(
+            """
+            CREATE TABLE workflow_operations_scoped (
+                operation_id TEXT PRIMARY KEY,
+                job_id TEXT NOT NULL REFERENCES workflow_jobs(job_id) ON DELETE CASCADE,
+                operation_type TEXT NOT NULL,
+                status TEXT NOT NULL,
+                idempotency_key TEXT NOT NULL,
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                finished_at TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO workflow_operations_scoped
+                (operation_id, job_id, operation_type, status, idempotency_key,
+                 payload_json, created_at, finished_at)
+            SELECT operation_id, job_id, operation_type, status, idempotency_key,
+                   payload_json, created_at, finished_at
+              FROM workflow_operations
+            """
+        )
+        conn.execute("DROP TABLE workflow_operations")
+        conn.execute(
+            "ALTER TABLE workflow_operations_scoped RENAME TO workflow_operations"
+        )
+        conn.execute(
+            "CREATE UNIQUE INDEX idx_workflow_operations_idempotency "
+            "ON workflow_operations(job_id, operation_type, idempotency_key)"
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.execute("PRAGMA foreign_keys=ON")
 
 
 def apply_migrations(db_path: Path) -> None:
@@ -430,6 +517,12 @@ def apply_migrations(db_path: Path) -> None:
                 conn.execute("PRAGMA foreign_keys=ON")
 
         # Keep the remaining DDL idempotent so a partially created database heals.
+        # Existing v3 databases may still have the old table-level UNIQUE key.
+        # Repair that shape in place (without bumping the public schema version)
+        # while retaining every operation row and its raw caller key.
+        if not _has_scoped_operation_idempotency_index(conn):
+            backup = backup or _backup_before_migration(Path(db_path))
+            _rebuild_operation_table_for_scoped_idempotency(conn)
         conn.executescript(SCHEMA_SQL)
         # Older databases may have been stamped at the current version before
         # the event table was introduced.  The idempotent DDL above creates it;
