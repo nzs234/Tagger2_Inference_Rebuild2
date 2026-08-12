@@ -1737,6 +1737,11 @@ def create_app(settings: AppConfig | None = None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
         runtime.settings.validate_runtime()
+        # A process restart cannot leave a worker attached to queued/running
+        # rows.  Mark those rows interrupted before serving requests so the
+        # operator can explicitly recover them; review/paused states remain
+        # durable operator decisions.
+        runtime.workflow_database.mark_interrupted_jobs()
         yield
         await runtime.close()
 
@@ -2000,12 +2005,13 @@ def create_app(settings: AppConfig | None = None) -> FastAPI:
             base_mode=base_mode,
         )
         provider = runtime.provider(selected_provider)
-        validator = lambda value: parse_video_prompt_response(
-            value,
-            selected_mode,
-            base_mode,
-            reference_image_count=reference_image_count,
-        )
+        def validator(value: str) -> dict[str, Any]:
+            return parse_video_prompt_response(
+                value,
+                selected_mode,
+                base_mode,
+                reference_image_count=reference_image_count,
+            )
         response = await provider.generate(
             image_data,
             prompt,

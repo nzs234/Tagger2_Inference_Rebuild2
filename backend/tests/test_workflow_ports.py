@@ -4,7 +4,6 @@ If a port genuinely needs to change, update the expected digest here in the same
 commit and record the reason in docs/workflow_compatibility_report.md.
 """
 
-import hashlib
 from pathlib import Path
 
 import pytest

@@ -52,7 +52,9 @@ describe('DatasetWorkflow page', () => {
         return json([
           {
             resource_id: 'replace-e621-local-v1',
-            category: 'replace',
+            // The on-disk catalog uses the canonical replacement_index name.
+            // The page must still expose it as a selectable replacement.
+            category: 'replacement_index',
             fingerprint: 'a'.repeat(64),
             created_at: '2026-08-11T00:00:00Z',
           },
@@ -193,6 +195,16 @@ describe('DatasetWorkflow count review and job controls', () => {
               current_module_id: null,
               created_at: '2026-08-11T01:00:00Z',
             },
+            {
+              job_id: 'job-3',
+              status: 'pending',
+              profile: 'e621',
+              work_mode: 'full_copy',
+              processed_samples: 0,
+              total_samples: 3,
+              current_module_id: null,
+              created_at: '2026-08-11T02:00:00Z',
+            },
           ])
         }
         if (url.includes('/roots')) {
@@ -294,6 +306,18 @@ describe('DatasetWorkflow count review and job controls', () => {
 
     expect(await screen.findByRole('button', { name: /继续/ })).toBeInTheDocument()
     expect(screen.queryByRole('button', { name: /暂停/ })).not.toBeInTheDocument()
+  })
+
+  it('keeps creation and execution separate with an explicit start action', async () => {
+    renderPage()
+    fireEvent.click(await screen.findByText(/job-3/))
+
+    expect(await screen.findByRole('button', { name: /开始任务/ })).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: /开始任务/ }))
+
+    await waitFor(() => {
+      expect(posts.some((post) => post.url.endsWith('/start'))).toBe(true)
+    })
   })
 })
 

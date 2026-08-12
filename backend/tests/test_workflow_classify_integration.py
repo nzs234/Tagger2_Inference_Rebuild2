@@ -3,12 +3,10 @@
 import json
 from pathlib import Path
 
-import pytest
-
 
 def test_classify_stage_maps_caption_tags_to_nine_fields(tmp_path: Path):
     """Classify stage should map raw caption tags into structured nine-field projection."""
-    from backend.tagger2.workflow.stages.classify import ClassificationRules, build_classification_rules
+    from backend.tagger2.workflow.stages.classify import build_classification_rules
     from backend.tagger2.workflow.pipeline import run_offline_pipeline
     from backend.tagger2.workflow.contracts import WorkflowJobConfigV1
 

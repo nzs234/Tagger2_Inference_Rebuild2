@@ -19,10 +19,12 @@
   WorkflowImportPreview,
   WorkflowIssue,
   WorkflowJobReport,
+  WorkflowJobEvent,
   WorkflowJobSummary,
   WorkflowPreflightReport,
   WorkflowRepairReport,
   WorkflowResource,
+  WorkflowJobStatus,
   WorkflowTokenReviewAction,
   WorkflowTokenReviewItem,
   WorkflowTokenReviewPage,
@@ -213,10 +215,16 @@ export const api = {
       body: JSON.stringify(config),
     }),
   workflowCreateJob: (config: Record<string, unknown>) =>
-    request<{ job_id: string; status: string }>('/workflows/jobs', {
+    request<{ job_id: string; status: WorkflowJobStatus }>('/workflows/jobs', {
       method: 'POST',
       body: JSON.stringify({ config }),
     }),
+  /** Creation is intentionally separate from execution. */
+  workflowStartJob: (id: string) =>
+    request<{ job_id: string; status: WorkflowJobStatus }>(
+      `/workflows/jobs/${encodeURIComponent(id)}/start`,
+      { method: 'POST', body: '{}' },
+    ),
   workflowJobs: (limit = 50) =>
     request<WorkflowJobSummary[]>(`/workflows/jobs?limit=${limit}`),
   workflowJob: (id: string) =>
@@ -244,10 +252,29 @@ export const api = {
       `/workflows/jobs/${encodeURIComponent(id)}/count-review/confirm`,
       { method: 'POST', body: JSON.stringify({ confirmed: true }) },
     ),
-  workflowJobAction: (id: string, action: 'pause' | 'resume') =>
-    request<{ job_id: string; status: string }>(
+  workflowJobAction: (id: string, action: 'pause' | 'resume' | 'cancel' | 'recover') =>
+    request<{ job_id: string; status: WorkflowJobStatus }>(
       `/workflows/jobs/${encodeURIComponent(id)}/${action}`,
       { method: 'POST', body: '{}' },
+    ),
+  workflowRestoreJob: (id: string) =>
+    request<{ job_id: string; restored_files: number; root_id?: string }>(
+      `/workflows/jobs/${encodeURIComponent(id)}/restore`,
+      { method: 'POST', body: '{}' },
+    ),
+  workflowDiscardJob: (id: string) =>
+    request<{ job_id: string; discarded: boolean }>(
+      `/workflows/jobs/${encodeURIComponent(id)}/discard`,
+      { method: 'POST', body: '{}' },
+    ),
+  workflowPinJob: (id: string, pinned = true) =>
+    request<{ job_id: string; pinned: boolean }>(
+      `/workflows/jobs/${encodeURIComponent(id)}/pin`,
+      { method: 'POST', body: JSON.stringify({ pinned }) },
+    ),
+  workflowJobEvents: (id: string, afterEventId = 0, limit = 100) =>
+    request<{ job_id: string; events: WorkflowJobEvent[]; next_after_event_id: number; has_more: boolean }>(
+      `/workflows/jobs/${encodeURIComponent(id)}/events?after_event_id=${afterEventId}&limit=${limit}`,
     ),
   workflowRepairJob: (id: string) =>
     request<WorkflowRepairReport>(`/workflows/jobs/${encodeURIComponent(id)}/repair`, {

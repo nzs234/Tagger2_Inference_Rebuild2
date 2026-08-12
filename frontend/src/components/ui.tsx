@@ -62,10 +62,12 @@ export function Panel({ title, eyebrow, actions, children, className = '' }: {
 
 export function StatusBadge({ state }: { state: JobState | QueueState | string }) {
   const label: Record<string, string> = {
+    pending: 'Pending', waiting_count_review: 'Count review', waiting_token_review: 'Token review',
+    committing: 'Committing', pausing: 'Pausing', rollback_required: 'Rollback required', restoring: 'Restoring',
     ready: '待处理', uploading: '上传中', queued: '排队中', processing: '处理中', done: '完成', error: '失败',
     running: '运行中', paused: '已暂停', cancelling: '取消中', cancelled: '已取消', succeeded: '成功', failed: '失败', interrupted: '已中断',
   }
-  const icon = ['running', 'uploading', 'processing', 'queued', 'cancelling'].includes(state)
+  const icon = ['running', 'uploading', 'processing', 'queued', 'cancelling', 'committing', 'pausing', 'restoring'].includes(state)
     ? <LoaderCircle size={13} className="spin" aria-hidden="true" />
     : ['done', 'succeeded'].includes(state)
       ? <Check size={13} aria-hidden="true" />

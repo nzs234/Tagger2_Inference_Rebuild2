@@ -16,7 +16,11 @@ output, so review cannot loop into repeated rewrites.
 
 from __future__ import annotations
 
-from typing import Any, Callable, Iterable, Sequence
+import json
+import os
+from collections.abc import Callable, Iterable, Sequence
+from pathlib import Path
+from typing import Any
 
 from .contracts import utc_now
 
@@ -214,6 +218,12 @@ class TokenBudgetReviewStore:
                 ),
             )
 
+            # Keep the reviewed NL value in the job-local overlay as soon as
+            # it is applied.  The target dataset remains untouched until the
+            # orchestrator observes that every review row is terminal.
+            if status == TERMINAL_STATUS:
+                self._write_overlay(sample_id, nl_text)
+
         return {
             "sample_id": sample_id,
             "status": status,
@@ -223,6 +233,24 @@ class TokenBudgetReviewStore:
             "proposal_text": proposal_text,
             "proposal_token_count": proposal_tokens,
         }
+
+    def _write_overlay(self, sample_id: int, text: str) -> None:
+        job = self.database.get_job(self.job_id)
+        if not job:
+            return
+        path = Path(str(job["workspace_path"])) / "review_overlay.json"
+        payload: dict[str, Any] = {"count": {}, "nl": {}}
+        try:
+            if path.is_file():
+                raw = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(raw, dict):
+                    payload.update({key: value for key, value in raw.items() if isinstance(value, dict)})
+        except (OSError, json.JSONDecodeError):
+            payload = {"count": {}, "nl": {}}
+        payload.setdefault("nl", {})[str(sample_id)] = text
+        temporary = path.with_suffix(path.suffix + ".partial")
+        temporary.write_text(json.dumps(payload, ensure_ascii=False, sort_keys=True), encoding="utf-8")
+        os.replace(temporary, path)
 
     def unresolved_count(self) -> int:
         with self.database.connection() as conn:

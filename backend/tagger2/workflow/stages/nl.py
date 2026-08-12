@@ -16,7 +16,8 @@ import json
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Protocol, Sequence, runtime_checkable
+from collections.abc import Mapping, Sequence
+from typing import Any, Protocol, runtime_checkable
 
 from .nl_validation import NlValidationError, validate_nl
 
@@ -160,6 +161,7 @@ def run_nl_stage(
     reuse_original_nl: bool = True,
     use_image: bool = True,
     use_full_json: bool = False,
+    ocr_by_path: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> NlStageReport:
     """Generate NL for every sample that needs it.
 
@@ -188,7 +190,14 @@ def run_nl_stage(
             relative_image_path=relative,
             system_prompt=system_prompt,
             payload=build_payload(
-                projection, use_full_json=use_full_json, current_nl=existing
+                projection,
+                use_full_json=use_full_json,
+                current_nl=existing,
+                ocr=(
+                    dict((ocr_by_path or {}).get(relative, {}))
+                    if relative in (ocr_by_path or {})
+                    else None
+                ),
             ),
             image_path=(source_root / relative) if use_image else None,
         )

@@ -312,6 +312,41 @@ def test_offline_pipeline_blocking_issue_prevents_commit():
         assert "commit_skipped" in (workspace / "commit_journal.jsonl").read_text(encoding="utf-8")
 
 
+def test_in_place_pipeline_fails_closed_on_baseline_drift():
+    """A source edit after backup creation must never be overwritten."""
+    from backend.tagger2.workflow.pipeline import run_offline_pipeline
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+        source = root / "src"
+        source.mkdir()
+        _write_image(source / "a.png")
+        (source / "a.txt").write_text("male, anthro", encoding="utf-8")
+        workspace = root / "ws"
+        config = _config(source, source, work_mode="in_place")
+
+        first = run_offline_pipeline(
+            config,
+            source_root=source,
+            output_root=source,
+            workspace=workspace,
+            replacement_index_path=_index(root / "index.csv"),
+        )
+        assert first.committed_files == 2
+        (source / "a.txt").write_text("operator edit", encoding="utf-8")
+
+        second = run_offline_pipeline(
+            config,
+            source_root=source,
+            output_root=source,
+            workspace=workspace,
+            replacement_index_path=_index(root / "index2.csv"),
+        )
+        assert second.committed_files == 0
+        assert any(issue.code == "baseline_drift" for issue in second.issues)
+        assert (source / "a.txt").read_text(encoding="utf-8") == "operator edit"
+
+
 def test_offline_pipeline_requires_index_when_replace_enabled():
     """Enabling replace without an index is a hard configuration error."""
     from backend.tagger2.workflow.pipeline import PipelineError, run_offline_pipeline

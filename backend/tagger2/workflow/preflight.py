@@ -6,8 +6,8 @@ from typing import Any
 
 from ..security import PathAllowlist, PathNotAllowedError
 from .contracts import WorkflowJobConfigV1
-from .resources import WorkflowResourceCatalog
 from .db import WorkflowDatabase
+from .resources import WorkflowResourceCatalog
 
 
 class WorkflowPreflightError(Exception):
@@ -83,9 +83,13 @@ class WorkflowPreflightService:
         except PathNotAllowedError as e:
             errors.append(f"Source path not allowed: {e}")
 
-        # Dataset lock: an in-flight job already owns this source root, so a
-        # second job would race it on the same files.
-        active_jobs = self.database.get_active_jobs_for_path(config.source_root.root_id)
+        # Dataset lock: mirror the authoritative start-time scope calculation
+        # for an early diagnostic.  The transaction in ``start_job`` remains
+        # the final arbiter because preflight can race another request.
+        scopes = [(config.source_root.root_id, config.source_root.relative_path)]
+        if config.output_root is not None:
+            scopes.append((config.output_root.root_id, config.output_root.relative_path))
+        active_jobs = self.database.get_active_jobs_for_scopes(scopes)
         if active_jobs:
             job_ids = [str(job["job_id"])[:8] for job in active_jobs]
             errors.append(
@@ -131,11 +135,9 @@ class WorkflowPreflightService:
         missing_resources: list[str] = []
         
         if config.caption.get("enabled"):
-            resource_id = config.caption.get("resource_id")
-            if resource_id:
-                manifest = self.resource_catalog.get_manifest(resource_id)
-                if not manifest:
-                    missing_resources.append(f"Caption resource not found: {resource_id}")
+            model_id = config.caption.get("model_id") or config.caption.get("resource_id")
+            if not model_id:
+                missing_resources.append("Caption is enabled but no model_id is selected")
 
         if config.classify.get("enabled"):
             resource_id = config.classify.get("resource_id")
@@ -177,13 +179,24 @@ class WorkflowPreflightService:
                 manifest = self.resource_catalog.get_manifest(resource_id)
                 if not manifest:
                     missing_resources.append(f"OCR resource not found: {resource_id}")
-                    warnings.append("OCR runtime may not be installed")
+            else:
+                missing_resources.append("OCR is enabled but no OCR resource_id is selected")
+
+            # OCR is an isolated runtime, not an optional warning in a
+            # production job.  A missing interpreter must fail closed before
+            # any sample is touched.
+            from .ocr import PaddleOCREngine
+            try:
+                PaddleOCREngine()
+            except RuntimeError as exc:
+                missing_resources.append(f"OCR runtime unavailable: {exc}")
 
         if config.token_budget.get("enabled"):
             resource_id = config.token_budget.get("tokenizer_resource_id")
-            if resource_id:
-                # Tokenizer resources may be downloaded on-demand
-                warnings.append(f"Tokenizer resource will be downloaded if not present: {resource_id}")
+            if not resource_id:
+                missing_resources.append("Token budget is enabled but no tokenizer resource_id is selected")
+            elif not self.resource_catalog.get_manifest(str(resource_id)):
+                missing_resources.append(f"Tokenizer resource not found: {resource_id}")
 
         if missing_resources:
             errors.extend(missing_resources)

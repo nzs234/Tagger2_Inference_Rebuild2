@@ -94,11 +94,10 @@ def test_restore_returns_original_annotations(env):
 
     response = env["client"].post(f"/api/v1/workflows/jobs/{job_id}/restore")
 
-    assert response.status_code == 200
-    body = response.json()
-    assert body["restored_files"] > 0
-    assert body["root_id"] == "out"
-    assert (env["output"] / "a.json").read_bytes() == ORIGINAL
+    # Full-copy jobs never mutate the source dataset and therefore have no
+    # in-place restore operation.  The output remains an independent artifact.
+    assert response.status_code == 400
+    assert response.json()["detail"]["code"] == "restore_not_applicable"
 
 
 def test_restore_targets_source_root_for_in_place(env):
@@ -120,8 +119,8 @@ def test_restore_without_backup_is_404(env):
 
     response = env["client"].post(f"/api/v1/workflows/jobs/{job_id}/restore")
 
-    assert response.status_code == 404
-    assert response.json()["detail"]["code"] == "backup_not_found"
+    assert response.status_code == 400
+    assert response.json()["detail"]["code"] == "restore_not_applicable"
 
 
 def test_restore_response_hides_absolute_paths(env):

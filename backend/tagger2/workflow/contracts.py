@@ -8,12 +8,14 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field, fields
-from datetime import datetime, timezone
-from typing import Any, Literal, Mapping
+from datetime import UTC, datetime
+from typing import Any, Literal
 
 # Schema versions
 WORKFLOW_CONFIG_VERSION = 1
+WORKFLOW_CONFIG_V2_VERSION = 2
 WORKFLOW_MANIFEST_VERSION = 1
 WORKFLOW_ISSUE_VERSION = 1
 
@@ -39,7 +41,7 @@ _UNIT = ("num", 0.0, 1.0)
 SECTION_SCHEMA: dict[str, dict[str, Any]] = {
     "caption": {
         "enabled": bool,
-        "resource_id": "str?",
+        "model_id": "str?",
         "threshold_mode": ("enum", ("model_default", "manual")),
         "threshold": ("num", 0.0, 1.0),
         "overwrite_txt": bool,
@@ -63,6 +65,8 @@ SECTION_SCHEMA: dict[str, dict[str, Any]] = {
     },
     "nl": {
         "enabled": bool,
+        "provider_id": "str?",
+        "model": "str?",
         "reuse_original_nl": bool,
         "api_enabled": bool,
         "use_image": bool,
@@ -90,7 +94,7 @@ SECTION_SCHEMA: dict[str, dict[str, Any]] = {
         "max_tokens": ("int", 1, 32768),
     },
     "export": {
-        "format": ("enum", ("json", "flat_txt", "both")),
+        "format": ("enum", ("json", "txt", "flat_txt", "both")),
     },
 }
 
@@ -161,7 +165,7 @@ RESOURCE_FINGERPRINT_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 
 def utc_now() -> str:
     """Return current UTC time in ISO 8601 format."""
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    return datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
 def canonical_json(value: Any) -> str:
@@ -197,12 +201,25 @@ except ImportError:
     from typing_extensions import TypedDict  # type: ignore[assignment]
 
 
-class NineFieldAnnotation(TypedDict, total=False):
+class NineFieldAnnotation(TypedDict):
     """Type-safe nine-field annotation payload.
     
-    ``total=False`` allows partial payloads during construction; validation
-    happens at export time via ``normalize_json_bytes``.
+    All nine keys are required at the export boundary.  Stages that build a
+    partial projection use ``PartialNineFieldAnnotation`` and normalize it
+    before it crosses this contract.
     """
+    quality: list[str]
+    count: str
+    character: str
+    series: str
+    artist: str
+    appearance: list[str]
+    tags: list[str]
+    environment: list[str]
+    nl: str
+
+
+class PartialNineFieldAnnotation(TypedDict, total=False):
     quality: list[str]
     count: str
     character: str
@@ -236,7 +253,7 @@ def _path_ref(value: Any, field_name: str) -> WorkflowPathRef:
     if isinstance(value, WorkflowPathRef):
         return value
     if not isinstance(value, Mapping):
-        raise ValueError(f"{field_name} must be an object with root_id and relative_path")
+        raise TypeError(f"{field_name} must be an object with root_id and relative_path")
     unknown = sorted(set(value) - {"root_id", "relative_path"})
     if unknown:
         raise ValueError(f"{field_name} has unknown fields: {', '.join(unknown)}")
@@ -245,7 +262,7 @@ def _path_ref(value: Any, field_name: str) -> WorkflowPathRef:
         raise ValueError(f"{field_name}.root_id must be a non-empty string")
     relative_path = value.get("relative_path", "")
     if not isinstance(relative_path, str):
-        raise ValueError(f"{field_name}.relative_path must be a string")
+        raise TypeError(f"{field_name}.relative_path must be a string")
     return WorkflowPathRef(root_id=root_id, relative_path=relative_path)
 
 
@@ -259,12 +276,18 @@ class WorkflowResourceManifestV1:
     source_url: str | None = None
     source_timestamp: str | None = None
     builder_version: str | None = None
+    size_bytes: int = 0
+    profile: str | None = None
+    license_status: str = "unknown"
+    source_digest: str | None = None
 
     def __post_init__(self) -> None:
         if not RESOURCE_ID_PATTERN.match(self.resource_id):
             raise ValueError(f"invalid resource_id: {self.resource_id}")
         if not RESOURCE_FINGERPRINT_PATTERN.match(self.resource_fingerprint):
             raise ValueError(f"invalid resource_fingerprint: {self.resource_fingerprint}")
+        if self.size_bytes < 0:
+            raise ValueError("size_bytes cannot be negative")
 
 
 @dataclass(frozen=True)
@@ -313,7 +336,7 @@ class WorkflowJobConfigV1:
     # Caption configuration
     caption: dict[str, Any] = field(default_factory=lambda: {
         "enabled": True,
-        "resource_id": "caption-e621-eva02-large-full-v1",
+        "model_id": "caption-e621-eva02-large-full-v1",
         "threshold_mode": "model_default",
         "overwrite_txt": False,
         "input_txt_mode": "tag",  # "tag" or "nl"
@@ -346,6 +369,8 @@ class WorkflowJobConfigV1:
         "enabled": True,
         "reuse_original_nl": True,
         "api_enabled": True,
+        "provider_id": None,
+        "model": None,
         "use_image": True,
         "use_full_json": False,
         "prompt_preset": "general",
@@ -354,7 +379,10 @@ class WorkflowJobConfigV1:
     
     # Count review configuration
     count_review: dict[str, Any] = field(default_factory=lambda: {
-        "enabled": True,
+        # Review is an explicit opt-in stage.  Legacy jobs that omit this
+        # section must remain runnable; production profiles enable it in their
+        # immutable V2 snapshot.
+        "enabled": False,
     })
     
     # Policy configuration
@@ -386,7 +414,7 @@ class WorkflowJobConfigV1:
     schema_version: int = WORKFLOW_CONFIG_VERSION
 
     @classmethod
-    def from_payload(cls, payload: Mapping[str, Any]) -> "WorkflowJobConfigV1":
+    def from_payload(cls, payload: Mapping[str, Any]) -> WorkflowJobConfigV1:
         """Build a config from a decoded JSON object.
 
         Nested path references arrive as plain objects, so they are converted
@@ -395,7 +423,7 @@ class WorkflowJobConfigV1:
         """
 
         if not isinstance(payload, Mapping):
-            raise ValueError("job config must be an object")
+            raise TypeError("job config must be an object")
 
         known = {field_info.name for field_info in fields(cls)}
         unknown = sorted(set(payload) - known)
@@ -404,11 +432,23 @@ class WorkflowJobConfigV1:
 
         values = dict(payload)
 
-        schema_version = values.get("schema_version", WORKFLOW_CONFIG_VERSION)
-        if schema_version != WORKFLOW_CONFIG_VERSION:
-            raise ValueError(
-                f"unsupported job config schema_version: {schema_version!r}"
-            )
+        schema_version = values.get("schema_version", 1)
+        if schema_version == 1:
+            # Deterministic V1 -> V2 migration.  V1 remains readable for old
+            # jobs, but new rows always store the explicit V2 shape.
+            values["schema_version"] = WORKFLOW_CONFIG_VERSION
+            caption = values.get("caption")
+            if isinstance(caption, Mapping) and "resource_id" in caption and "model_id" not in caption:
+                caption = dict(caption)
+                caption["model_id"] = caption.pop("resource_id")
+                values["caption"] = caption
+        elif schema_version == WORKFLOW_CONFIG_V2_VERSION:
+            # V2 is accepted by the same immutable reader while the dedicated
+            # V2 public alias is rolled out.  The normalized in-memory contract
+            # remains backward compatible with V1 callers.
+            values["schema_version"] = WORKFLOW_CONFIG_V2_VERSION
+        elif schema_version != WORKFLOW_CONFIG_VERSION:
+            raise ValueError(f"unsupported job config schema_version: {schema_version!r}")
 
         if "source_root" not in values:
             raise ValueError("job config requires source_root")
@@ -450,6 +490,8 @@ class WorkflowJobConfigV1:
             _validate_section(section, supplied)
             merged = dict(getattr(defaults, section))
             merged.update(supplied)
+            if section == "export" and merged.get("format") == "flat_txt":
+                merged["format"] = "txt"
             values[section] = merged
 
         return cls(**values)
@@ -467,20 +509,40 @@ class WorkflowJobConfigV1:
         return sha256_json(self.to_dict())
 
 
+@dataclass(frozen=True)
+class WorkflowJobConfigV2(WorkflowJobConfigV1):
+    """Strict current job contract with a normalized schema-2 snapshot."""
+
+    schema_version: int = WORKFLOW_CONFIG_V2_VERSION
+
+    @classmethod
+    def from_payload(cls, payload: Mapping[str, Any]) -> WorkflowJobConfigV2:
+        # The V1 reader is retained solely as the deterministic migration path;
+        # every newly-created V2 instance is stored with schema_version=2.
+        legacy = WorkflowJobConfigV1.from_payload(payload)
+        values = dict(legacy.__dict__)
+        values["schema_version"] = WORKFLOW_CONFIG_V2_VERSION
+        return cls(**values)
+
+
 __all__ = [
+    "WORKFLOW_CONFIG_V2_VERSION",
     "WORKFLOW_CONFIG_VERSION",
-    "WORKFLOW_MANIFEST_VERSION",
     "WORKFLOW_ISSUE_VERSION",
+    "WORKFLOW_MANIFEST_VERSION",
+    "ModuleId",
+    "NineFieldAnnotation",
+    "OverwriteMode",
+    "PartialNineFieldAnnotation",
     "Profile",
     "WorkMode",
-    "OverwriteMode",
-    "ModuleId",
-    "utc_now",
-    "canonical_json",
-    "sha256_json",
+    "WorkflowIssueV1",
+    "WorkflowJobConfigV1",
+    "WorkflowJobConfigV2",
     "WorkflowPathRef",
     "WorkflowResourceManifestV1",
-    "WorkflowIssueV1",
     "WorkflowSnapshotV1",
-    "WorkflowJobConfigV1",
+    "canonical_json",
+    "sha256_json",
+    "utc_now",
 ]

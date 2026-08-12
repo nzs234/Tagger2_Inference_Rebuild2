@@ -12,24 +12,26 @@ This module provides a complete workflow system for dataset annotation:
 __version__ = "1.0.0"
 
 from .contracts import (
-    WorkflowJobConfigV1,
-    WorkflowPathRef,
-    WorkflowResourceManifestV1,
-    WorkflowIssueV1,
-    WorkflowSnapshotV1,
+    OverwriteMode,
     Profile,
     WorkMode,
-    OverwriteMode,
+    WorkflowIssueV1,
+    WorkflowJobConfigV1,
+    WorkflowJobConfigV2,
+    WorkflowPathRef,
+    WorkflowResourceManifestV1,
+    WorkflowSnapshotV1,
 )
 
 __all__ = [
-    "__version__",
-    "WorkflowJobConfigV1",
-    "WorkflowPathRef",
-    "WorkflowResourceManifestV1",
-    "WorkflowIssueV1",
-    "WorkflowSnapshotV1",
+    "OverwriteMode",
     "Profile",
     "WorkMode",
-    "OverwriteMode",
+    "WorkflowIssueV1",
+    "WorkflowJobConfigV1",
+    "WorkflowJobConfigV2",
+    "WorkflowPathRef",
+    "WorkflowResourceManifestV1",
+    "WorkflowSnapshotV1",
+    "__version__",
 ]

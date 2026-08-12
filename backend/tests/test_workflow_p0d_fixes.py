@@ -2,7 +2,7 @@
 
 import pytest
 from tagger2.workflow.policy_config_parser import parse_policy_config
-from tagger2.workflow.stages.policy import PolicyConfig, CoupledProbabilities, PolicyError
+from tagger2.workflow.stages.policy import PolicyConfig, PolicyError
 
 
 class TestPolicyConfigParser:

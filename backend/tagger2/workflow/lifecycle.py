@@ -12,7 +12,7 @@ failing is parked rather than retried without limit.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -20,14 +20,32 @@ from .commit import CommitJournal
 
 # Terminal states cannot transition further; a paused job resumes to running.
 ALLOWED_JOB_TRANSITIONS: dict[str, frozenset[str]] = {
-    "pending": frozenset({"running", "cancelled", "failed"}),
-    "running": frozenset({"paused", "waiting_count_review", "waiting_token_review", "completed", "failed", "cancelled"}),
-    "paused": frozenset({"running", "cancelled", "failed"}),
-    "waiting_count_review": frozenset({"running", "cancelled", "failed"}),
-    "waiting_token_review": frozenset({"running", "cancelled", "failed"}),
-    "completed": frozenset(),
-    "failed": frozenset({"running"}),
-    "cancelled": frozenset(),
+    # ``running`` is retained as a legal pending shortcut for old callers;
+    # new API callers should use ``pending -> queued -> running`` via
+    # ``WorkflowDatabase.start_job``.  Every transition is guarded by a
+    # compare-and-set in :meth:`JobLifecycle.transition`.
+    "pending": frozenset({"queued", "running", "cancelled", "failed"}),
+    "queued": frozenset({"running", "pausing", "paused", "cancelling", "cancelled", "failed", "interrupted"}),
+    "running": frozenset({
+        "pausing", "paused", "waiting_count_review", "waiting_token_review",
+        "committing", "completed", "failed", "cancelling", "cancelled", "interrupted",
+    }),
+    "pausing": frozenset({"paused", "cancelling", "cancelled", "failed", "interrupted"}),
+    "paused": frozenset({"queued", "running", "cancelling", "cancelled", "failed", "interrupted"}),
+    "waiting_count_review": frozenset({"queued", "running", "cancelling", "cancelled", "failed", "interrupted"}),
+    "waiting_token_review": frozenset({"queued", "running", "cancelling", "cancelled", "failed", "interrupted"}),
+    "committing": frozenset({"completed", "failed", "rollback_required", "cancelling", "cancelled", "interrupted"}),
+    "restoring": frozenset({"completed", "failed", "rollback_required", "interrupted"}),
+    "interrupted": frozenset({"queued", "running", "restoring", "failed", "cancelled", "rollback_required"}),
+    "rollback_required": frozenset({"restoring", "failed", "cancelled"}),
+    "cancelling": frozenset({"cancelled", "failed", "interrupted"}),
+    # Failed work can be explicitly recovered and re-queued after an operator
+    # has inspected the durable issue/lease state.
+    "failed": frozenset({"queued", "running", "restoring"}),
+    # Restore is an auditable operation and therefore may move a terminal job
+    # through ``restoring`` before returning to completed.
+    "completed": frozenset({"restoring"}),
+    "cancelled": frozenset({"restoring"}),
 }
 TERMINAL_JOB_STATES = frozenset({"completed", "cancelled"})
 DEFAULT_LEASE_SECONDS = 300
@@ -39,7 +57,7 @@ class LifecycleError(RuntimeError):
 
 
 def _now() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 def _iso(value: datetime) -> str:
@@ -54,7 +72,7 @@ def _parse(value: str | None) -> datetime | None:
         parsed = datetime.fromisoformat(text)
     except ValueError:
         return None
-    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
 
 
 @dataclass(frozen=True)
@@ -101,14 +119,57 @@ class JobLifecycle:
                 f"cannot move job from {current!r} to {target!r};"
                 f" allowed: {sorted(allowed) or 'none'}"
             )
-        self.database.update_job_status(self.job_id, target)
+        updated = self.database.update_job_status(
+            self.job_id,
+            target,
+            expected_status=current,
+        )
+        if not updated:
+            # Another worker won the race after our read.  Do not silently
+            # report success: callers must reload state and decide whether to
+            # retry the operation.
+            raise LifecycleError(
+                f"concurrent lifecycle update lost for job {self.job_id!r}"
+            )
         return target
 
+    def start(self) -> str:
+        """Queue a pending job at the explicit start boundary.
+
+        Dataset lock acquisition belongs to ``WorkflowDatabase.start_job``;
+        this method is useful for workers/tests that already hold that lock or
+        for legacy in-process callers that do not have a queue service.
+        """
+
+        return self.transition("queued")
+
     def pause(self) -> str:
+        # Keep the historical synchronous API while allowing the state machine
+        # to expose ``pausing`` to a queue worker when it is used explicitly.
         return self.transition("paused")
+
+    def request_pause(self) -> str:
+        """Request a pause at the next batch boundary."""
+
+        return self.transition("pausing")
 
     def resume(self) -> str:
         return self.transition("running")
+
+    def cancel(self) -> str:
+        """Mark a job cancelled, preserving the legacy immediate semantics."""
+
+        return self.transition("cancelled")
+
+    def request_cancel(self) -> str:
+        """Request cancellation at the next batch boundary."""
+
+        return self.transition("cancelling")
+
+    def recover(self) -> str:
+        """Re-queue an interrupted/failed job after durable-state repair."""
+
+        return self.transition("queued")
 
     def claim_sample(
         self,
@@ -126,6 +187,10 @@ class JobLifecycle:
         now = _now()
         expires = _iso(now + timedelta(seconds=lease_seconds))
         with self.database.connection() as conn:
+            # Serialise the read/claim pair.  The old SELECT followed by an
+            # unconstrained UPDATE allowed two workers to claim the same
+            # pending row when they raced on a busy SQLite database.
+            conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
                 "SELECT status, lease_owner, lease_expires_at, attempt_count"
                 " FROM workflow_samples WHERE job_id = ? AND sample_id = ?",
@@ -160,6 +225,7 @@ class JobLifecycle:
         if status not in {"completed", "failed", "pending", "skipped"}:
             raise LifecycleError(f"unsupported sample status: {status!r}")
         with self.database.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             conn.execute(
                 "UPDATE workflow_samples"
                 " SET status = ?, error = ?, lease_owner = NULL, lease_expires_at = NULL,"
@@ -201,13 +267,23 @@ class JobLifecycle:
         now = _iso(_now())
 
         with self.database.connection() as conn:
-            for sample_id in self.expired_leases():
-                row = conn.execute(
-                    "SELECT attempt_count FROM workflow_samples"
-                    " WHERE job_id = ? AND sample_id = ?",
-                    (self.job_id, sample_id),
-                ).fetchone()
-                attempts = int(row["attempt_count"]) if row else 0
+            conn.execute("BEGIN IMMEDIATE")
+            # Query on the same write transaction so a second repair worker
+            # cannot observe and reclaim the same lease concurrently.
+            now_dt = _now()
+            expired_rows = conn.execute(
+                "SELECT sample_id, lease_expires_at, attempt_count"
+                " FROM workflow_samples WHERE job_id = ? AND status = 'processing'",
+                (self.job_id,),
+            ).fetchall()
+            expired = []
+            for row in expired_rows:
+                expiry = _parse(row["lease_expires_at"])
+                if expiry is None or expiry <= now_dt:
+                    expired.append(row)
+            for expired_row in expired:
+                sample_id = int(expired_row["sample_id"])
+                attempts = int(expired_row["attempt_count"])
                 if attempts >= MAX_ATTEMPTS:
                     conn.execute(
                         "UPDATE workflow_samples"

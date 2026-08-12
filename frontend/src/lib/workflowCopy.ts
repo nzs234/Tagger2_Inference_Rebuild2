@@ -57,6 +57,12 @@ export interface WorkflowCopy {
   ocrUnavailableHint: string
   preflight: string
   createJob: string
+  startJob: string
+  cancelJob: string
+  recoverJob: string
+  restoreJob: string
+  discardJob: string
+  pinJob: string
   preflightOk: string
   preflightFailed: string
   warnings: string
@@ -171,6 +177,12 @@ export const workflowCopy: Record<WorkflowLanguage, WorkflowCopy> = {
     ocrUnavailableHint: 'OCR 运行时缺失或识别失败时只记录警告，不会中断流程。',
     preflight: '预检',
     createJob: '创建任务',
+    startJob: '开始任务',
+    cancelJob: '取消任务',
+    recoverJob: '恢复任务',
+    restoreJob: '恢复数据集',
+    discardJob: '丢弃工作区',
+    pinJob: '固定任务',
     preflightOk: '预检通过',
     preflightFailed: '预检失败',
     warnings: '警告',
@@ -286,6 +298,12 @@ export const workflowCopy: Record<WorkflowLanguage, WorkflowCopy> = {
     ocrUnavailableHint: 'A missing OCR runtime or a failed image is recorded as a warning and never blocks the run.',
     preflight: 'Preflight',
     createJob: 'Create job',
+    startJob: 'Start job',
+    cancelJob: 'Cancel job',
+    recoverJob: 'Recover job',
+    restoreJob: 'Restore dataset',
+    discardJob: 'Discard workspace',
+    pinJob: 'Pin job',
     preflightOk: 'Preflight passed',
     preflightFailed: 'Preflight failed',
     warnings: 'Warnings',

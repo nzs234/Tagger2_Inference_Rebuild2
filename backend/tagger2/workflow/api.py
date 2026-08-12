@@ -1,20 +1,19 @@
 ﻿"""Workflow API routes."""
 
-from fastapi import APIRouter, HTTPException, BackgroundTasks
-from typing import Any, Callable, Literal, Sequence
+import json
+from collections.abc import Callable, Sequence
+from pathlib import Path
+from typing import Any, Literal
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, BackgroundTasks, HTTPException
 from pydantic import BaseModel
 
-import json
-from pathlib import Path
-
 from ..security import PathAllowlist, PathNotAllowedError
-from .contracts import WorkflowJobConfigV1, utc_now
+from .contracts import WorkflowJobConfigV2, utc_now
 from .db import WorkflowDatabase, default_workflow_database_path
+from .policy_config_parser import parse_policy_config
 from .preflight import WorkflowPreflightError, WorkflowPreflightService
 from .resources import WorkflowResourceCatalog
-from .policy_config_parser import parse_policy_config
 
 
 def _build_public_error_codes() -> dict[type, str]:
@@ -116,6 +115,7 @@ class WorkflowJobSummaryResponse(BaseModel):
     started_at: str | None
     finished_at: str | None
     error_code: str | None
+    pinned: bool = False
 
 
 class WorkflowJobIssueResponse(BaseModel):
@@ -140,7 +140,7 @@ class WorkflowJobReportResponse(BaseModel):
     report: dict[str, Any] | None = None
 
 
-def _job_summary(job: dict[str, Any]) -> WorkflowJobSummaryResponse:
+def _job_summary(job: dict[str, Any], *, pinned: bool = False) -> WorkflowJobSummaryResponse:
     """Project a `workflow_jobs` row onto the public summary.
 
     Whitelists fields explicitly, so a future column added to the table cannot
@@ -165,6 +165,7 @@ def _job_summary(job: dict[str, Any]) -> WorkflowJobSummaryResponse:
         started_at=job["started_at"],
         finished_at=job["finished_at"],
         error_code=job["error"],
+        pinned=pinned,
     )
 
 
@@ -187,6 +188,12 @@ class WorkflowCountConfirmRequest(BaseModel):
     """Explicitly confirm that count review is complete."""
 
     confirmed: bool
+
+
+class WorkflowPinRequest(BaseModel):
+    """Pin/unpin a job for workspace retention."""
+
+    pinned: bool = True
 
 
 class WorkflowTokenReviewRequest(BaseModel):
@@ -273,6 +280,12 @@ def create_workflow_router(
     if database is None:
         database = WorkflowDatabase(default_workflow_database_path())
 
+    # The workflow executor is currently process-local.  If the host was
+    # restarted, queued/running rows no longer have a worker behind them.  Make
+    # that fact durable before serving routes so operators can recover them
+    # instead of observing jobs stuck forever in ``running``.
+    database.mark_interrupted_jobs()
+
     preflight_service = WorkflowPreflightService(allowlist, resource_catalog, database)
 
     def _record_job_failure(job_id: str, exc: BaseException, trace: str) -> None:
@@ -295,38 +308,65 @@ def create_workflow_router(
                     f"{utc_now()} {type(exc).__name__}: {exc}\n\n{trace}",
                     encoding="utf-8",
                 )
-        except Exception:
+        except OSError:
             # Losing the diagnostic file must not mask the original failure or
             # leave the job stuck in `running`.
             pass
 
         try:
             JobLifecycle(database, job_id).transition("failed")
-        except Exception:
+        except Exception:  # noqa: BLE001, S110
             pass
         try:
             database.update_job_status(job_id, status="failed", error=code)
-        except Exception:
+        except Exception:  # noqa: BLE001, S110
+            pass
+        try:
+            with database.connection() as conn:
+                conn.execute(
+                    "UPDATE workflow_stage_runs SET status = 'failed', finished_at = ? "
+                    "WHERE job_id = ? AND status IN ('pending', 'running')",
+                    (utc_now(), job_id),
+                )
+        except Exception:  # noqa: BLE001, S110
             pass
 
     async def _execute_job_async(job_id: str) -> None:
         """Execute a workflow job in the background, updating status and seeding reviews."""
-        from .lifecycle import JobLifecycle
-        from .pipeline import run_offline_pipeline
-        from .count_review import CountReviewStore
-        from .token_budget_review import TokenBudgetReviewStore
         import asyncio
         import traceback
+
+        from .count_review import CountReviewStore
+        from .lifecycle import JobLifecycle
+        from .pipeline import run_offline_pipeline
+        from .token_budget_review import TokenBudgetReviewStore
     
         try:
             job = database.get_job(job_id)
             if job is None:
                 return
+            initial_status = str(job["status"])
+            if initial_status == "cancelling":
+                lifecycle = JobLifecycle(database, job_id)
+                lifecycle.transition("cancelled")
+                return
+            if initial_status == "pausing":
+                lifecycle = JobLifecycle(database, job_id)
+                lifecycle.transition("paused")
+                return
+            if initial_status in {"cancelled", "paused", "interrupted"}:
+                return
     
             lifecycle = JobLifecycle(database, job_id)
-            lifecycle.transition("running")
+            # A queued job is the normal path.  Keep a compatibility fallback
+            # for jobs created against the old pending->running lifecycle.
+            try:
+                lifecycle.transition("running")
+            except Exception:
+                if str(job["status"]) != "running":
+                    raise
     
-            config = WorkflowJobConfigV1.from_payload(json.loads(job["config_json"]))
+            config = WorkflowJobConfigV2.from_payload(json.loads(job["config_json"]))
             workspace = Path(job["workspace_path"])
     
             # Resolve physical paths from root references
@@ -347,10 +387,31 @@ def create_workflow_router(
                 else:
                     raise ValueError("full_copy requires output_root")
             except PathNotAllowedError as exc:
-                lifecycle.transition("failed")
-                database.update_job_status(job_id, status="failed", error=f"path not allowed: {exc}")
+                _record_job_failure(job_id, exc, str(exc))
                 return
     
+            # Freeze content-addressed resources before stage execution.  The
+            # digest is persisted with the job so recovery can detect drift.
+            resource_fingerprints: dict[str, str] = {}
+
+            def freeze_resource(resource_id: str) -> None:
+                manifest = resource_catalog.get_manifest(resource_id)
+                if manifest is None or resource_catalog.get_resource_path(resource_id) is None:
+                    raise ValueError(f"resource digest verification failed: {resource_id}")
+                resource_fingerprints[resource_id] = manifest.resource_fingerprint
+
+            for section_name, resource_key in (
+                ("classify", "resource_id"),
+                ("replace", "resource_id"),
+                ("ocr", "resource_id"),
+                ("token_budget", "tokenizer_resource_id"),
+            ):
+                section = getattr(config, section_name)
+                if section.get("enabled"):
+                    resource_id = str(section.get(resource_key, ""))
+                    if resource_id:
+                        freeze_resource(resource_id)
+
             # Wire up resources from catalog
             replacement_index_path = None
             if config.replace.get("enabled"):
@@ -427,6 +488,7 @@ def create_workflow_router(
                 provider_id = str(config.nl.get("provider_id", ""))
                 if provider_id:
                     from tagger2.providers import ProviderConfig, create_provider
+
                     from .nl_adapter import ProviderNlAdapter
                     
                     assert storage is not None  # Type narrowing
@@ -459,7 +521,7 @@ def create_workflow_router(
                             raw_keys = secret_store.get(secret_ref)
                             if raw_keys:
                                 keys = [k.strip() for k in raw_keys.replace(",", "\n").split("\n") if k.strip()]
-                        except Exception:
+                        except Exception:  # noqa: BLE001, S110
                             pass
                     cfg["api_keys"] = tuple(keys)
                     
@@ -485,12 +547,15 @@ def create_workflow_router(
                 output_root=output_path,
                 workspace=workspace,
                 replacement_index_path=replacement_index_path,
+                resource_fingerprints=resource_fingerprints,
                 tag_predictor=tag_predictor,
                 classification_rules=classification_rules,
                 policy_config=policy_config_arg,
                 token_counter=token_counter_arg,
                 ocr_engine=ocr_engine,
                 nl_client=nl_client,
+                database=database,
+                job_id=job_id,
             )
     
             # Persist the stage report so the UI can read per-stage counters
@@ -504,14 +569,19 @@ def create_workflow_router(
                 # A missing report must not fail an otherwise successful run.
                 pass
 
-            # Count review is seeded during policy stage, not from pipeline report
-    
-            # Seed token review if overflows exist
-            if report.token_overflows:
-                token_store = TokenBudgetReviewStore(database, job_id)
-                token_store.initialize(report.token_overflows)
-    
             # Check if human review is needed before marking as completed
+            latest = database.get_job(job_id)
+            if latest is None:
+                return
+            latest_status = str(latest["status"])
+            if latest_status == "cancelling":
+                lifecycle.transition("cancelled")
+                return
+            if latest_status == "pausing":
+                lifecycle.transition("paused")
+                return
+            if latest_status in {"cancelled", "paused", "interrupted"}:
+                return
             count_store = CountReviewStore(database, job_id)
             token_store_check = TokenBudgetReviewStore(database, job_id)
             
@@ -525,9 +595,9 @@ def create_workflow_router(
             # Determine final status based on blocking issues and pending reviews
             if has_blocking:
                 final_status = "failed"
-            elif pending_count > 0:
+            elif bool(config.count_review.get("enabled")) and pending_count > 0:
                 final_status = "waiting_count_review"
-            elif pending_token > 0:
+            elif bool(config.token_budget.get("enabled")) and pending_token > 0:
                 final_status = "waiting_token_review"
             else:
                 final_status = "completed"
@@ -536,10 +606,46 @@ def create_workflow_router(
     
             # Issues are already persisted in the issues table via report
 
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             # The traceback is operator data, not client data: write it to the
             # job workspace and store only a stable code on the job row.
             _record_job_failure(job_id, exc, traceback.format_exc())
+
+    async def _schedule_job(job_id: str, background_tasks: BackgroundTasks) -> str:
+        """Queue one execution, preserving idempotency for UI retries."""
+
+        from .lifecycle import LifecycleError
+
+        lifecycle, job = _lifecycle(job_id)
+        status = str(job["status"])
+        if status in {"completed", "cancelled", "failed", "running", "queued"}:
+            if status == "queued":
+                background_tasks.add_task(_execute_job_async, job_id)
+            return status
+        try:
+            queued = lifecycle.transition("queued")
+        except LifecycleError:
+            # Compatibility with a database created by the pre-queued schema;
+            # the current lifecycle implementation accepts ``queued``.
+            queued = lifecycle.transition("running")
+        background_tasks.add_task(_execute_job_async, job_id)
+        return queued
+
+    async def _requeue_after_review(job_id: str, background_tasks: BackgroundTasks) -> str:
+        """Re-enter the worker after a review checkpoint is complete."""
+
+        lifecycle, job = _lifecycle(job_id)
+        status = str(job["status"])
+        if status not in {"waiting_count_review", "waiting_token_review", "paused"}:
+            return status
+        from .lifecycle import LifecycleError
+
+        try:
+            queued = lifecycle.transition("queued")
+        except LifecycleError:
+            queued = lifecycle.transition("running")
+        background_tasks.add_task(_execute_job_async, job_id)
+        return queued
     
 
 
@@ -666,7 +772,7 @@ def create_workflow_router(
 
         lifecycle, _job = _lifecycle(job_id)
         try:
-            return {"job_id": job_id, "status": lifecycle.pause()}
+            return {"job_id": job_id, "status": lifecycle.request_pause()}
         except LifecycleError as exc:
             raise HTTPException(
                 status_code=409,
@@ -674,18 +780,41 @@ def create_workflow_router(
             ) from exc
 
     @router.post("/jobs/{job_id}/resume")
-    async def resume_job(job_id: str) -> dict[str, Any]:
+    async def resume_job(job_id: str, background_tasks: BackgroundTasks) -> dict[str, Any]:
         """Resume a paused job."""
         from .lifecycle import LifecycleError
 
-        lifecycle, _job = _lifecycle(job_id)
+        lifecycle, job = _lifecycle(job_id)
+        if str(job["status"]) == "pending":
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "invalid_transition",
+                    "message": "pending jobs must be explicitly started",
+                },
+            )
         try:
-            return {"job_id": job_id, "status": lifecycle.resume()}
+            status = lifecycle.resume()
+            background_tasks.add_task(_execute_job_async, job_id)
+            return {"job_id": job_id, "status": status}
         except LifecycleError as exc:
             raise HTTPException(
                 status_code=409,
                 detail={"code": "invalid_transition", "message": str(exc)},
             ) from exc
+
+    @router.post("/jobs/{job_id}/start")
+    async def start_job(job_id: str, background_tasks: BackgroundTasks) -> dict[str, Any]:
+        """Acquire the dataset lock and explicitly queue a pending job."""
+        job = database.get_job(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail={"code": "job_not_found", "message": "job not found"})
+        if str(job["status"]) != "pending":
+            raise HTTPException(status_code=409, detail={"code": "invalid_state_for_start", "message": f"job is already {job['status']}"})
+        if not database.start_job(job_id, expected_status="pending"):
+            raise HTTPException(status_code=409, detail={"code": "dataset_locked", "message": "dataset scope is already active"})
+        background_tasks.add_task(_execute_job_async, job_id)
+        return {"job_id": job_id, "status": "queued"}
 
     
     @router.post("/jobs/{job_id}/cancel")
@@ -695,7 +824,14 @@ def create_workflow_router(
 
         lifecycle, _job = _lifecycle(job_id)
         try:
-            return {"job_id": job_id, "status": lifecycle.transition("cancelled")}
+            status = str(_job["status"])
+            if status in {"queued", "running", "pausing"}:
+                target = lifecycle.request_cancel()
+            elif status in {"pending", "paused", "waiting_count_review", "waiting_token_review"}:
+                target = lifecycle.transition("cancelled")
+            else:
+                target = lifecycle.transition("cancelled")
+            return {"job_id": job_id, "status": target}
         except LifecycleError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
     @router.post("/jobs/{job_id}/repair")
@@ -709,6 +845,39 @@ def create_workflow_router(
             "resumable_samples": len(lifecycle.resumable_samples()),
         }
 
+    @router.post("/jobs/{job_id}/recover")
+    async def recover_job(job_id: str, background_tasks: BackgroundTasks) -> dict[str, Any]:
+        """Repair expired sample leases and queue an interrupted job."""
+
+        lifecycle, job = _lifecycle(job_id)
+        status = str(job["status"])
+        if status not in {"interrupted", "failed", "paused"}:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "invalid_state_for_recover", "message": f"Cannot recover {status}"},
+            )
+        lifecycle.repair(Path(str(job["workspace_path"])))
+        try:
+            queued = lifecycle.transition("queued")
+        except Exception as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "invalid_transition", "message": str(exc)},
+            ) from exc
+        background_tasks.add_task(_execute_job_async, job_id)
+        return {"job_id": job_id, "status": queued}
+
+    @router.post("/jobs/{job_id}/pin")
+    async def pin_job(job_id: str, request: WorkflowPinRequest) -> dict[str, Any]:
+        """Pin or unpin a job workspace for retention."""
+
+        if not database.set_job_pinned(job_id, request.pinned):
+            raise HTTPException(
+                status_code=404,
+                detail={"code": "job_not_found", "message": f"unknown job: {job_id}"},
+            )
+        return {"job_id": job_id, "pinned": request.pinned}
+
 
     @router.post("/jobs/{job_id}/restore")
     async def restore_job(job_id: str) -> dict[str, Any]:
@@ -718,13 +887,13 @@ def create_workflow_router(
         the backup created during job initialization. The job must be in a
         terminal state (completed or failed) or explicitly cancelled.
         """
-        from .commit import restore_annotation_backup, CommitError
+        from .commit import CommitError, restore_annotation_backup
         
-        lifecycle, job = _lifecycle(job_id)
+        _lifecycle_obj, job = _lifecycle(job_id)
         status = str(job["status"])
         
         # Only allow restore from terminal or cancelled states
-        if status not in ("completed", "failed", "cancelled"):
+        if status not in ("completed", "failed", "cancelled", "interrupted", "rollback_required"):
             raise HTTPException(
                 status_code=400,
                 detail={
@@ -732,9 +901,23 @@ def create_workflow_router(
                     "message": f"Cannot restore from state: {status}"
                 }
             )
-        
+
+        if str(job["work_mode"]) != "in_place":
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "code": "restore_not_applicable",
+                    "message": "restore is only available for in_place jobs",
+                },
+            )
+
         workspace = Path(str(job["workspace_path"]))
-        backup_zip = workspace / "backup.zip"
+        backup_zip = workspace / "backup" / "annotations.zip"
+        if not backup_zip.exists():
+            # Compatibility with archives created by the first workflow
+            # vertical.  New commits always use the nested artifact path.
+            legacy = workspace / "backup.zip"
+            backup_zip = legacy if legacy.exists() else backup_zip
         
         if not backup_zip.exists():
             raise HTTPException(
@@ -745,10 +928,10 @@ def create_workflow_router(
                 }
             )
         
-        # The dataset that was written is the output root for full_copy and the
-        # source root for in_place, so restore has to target the same one.
-        work_mode = str(job["work_mode"])
-        root_id = str(job["output_root_id"] or "") if work_mode == "full_copy" else str(job["source_root_id"])
+        # Restore is intentionally limited to in_place jobs.  A full-copy
+        # result has an independent output dataset and is never allowed to
+        # mutate the source during restore.
+        root_id = str(job["source_root_id"])
         if not root_id:
             raise HTTPException(
                 status_code=400,
@@ -759,7 +942,10 @@ def create_workflow_router(
             )
 
         try:
-            dataset_root = allowlist.get(root_id).path
+            payload = json.loads(str(job["config_json"]))
+            source = payload.get("source_root", {}) if isinstance(payload, dict) else {}
+            relative_path = str(source.get("relative_path", "")) if isinstance(source, dict) else ""
+            dataset_root = Path(allowlist.resolve(root_id, relative_path, must_exist=True, expect="dir"))
         except PathNotAllowedError as exc:
             raise HTTPException(
                 status_code=400,
@@ -770,13 +956,36 @@ def create_workflow_router(
             ) from exc
         
         try:
+            # Serialize Restore against new starts. The terminal job released
+            # its execution lock, so reacquire the exact source scope at the
+            # operation boundary before touching dataset files.
+            if not database.start_job(job_id, expected_status=status):
+                raise HTTPException(
+                    status_code=409,
+                    detail={"code": "restore_locked", "message": "dataset is busy"},
+                )
+            if not database.update_job_status(job_id, "restoring", expected_status="queued"):
+                database.release_dataset_locks(job_id)
+                raise HTTPException(
+                    status_code=409,
+                    detail={"code": "restore_state_race", "message": "job changed during restore"},
+                )
             restored_count = restore_annotation_backup(backup_zip, dataset_root)
+            database.record_operation(
+                job_id,
+                "restore",
+                idempotency_key=f"restore:{job_id}:{backup_zip.stat().st_mtime_ns}",
+                payload={"restored_files": restored_count},
+            )
+            database.record_event(job_id, "restore_completed", payload={"restored_files": restored_count})
+            database.update_job_status(job_id, "completed", expected_status="restoring")
             return {
                 "job_id": job_id,
                 "root_id": root_id,
                 "restored_files": restored_count,
             }
         except CommitError as exc:
+            database.update_job_status(job_id, "rollback_required", expected_status="restoring")
             raise HTTPException(
                 status_code=500,
                 detail={
@@ -784,6 +993,9 @@ def create_workflow_router(
                     "message": str(exc)
                 }
             ) from exc
+        except HTTPException:
+            database.release_dataset_locks(job_id)
+            raise
 
     @router.post("/jobs/{job_id}/discard")
     async def discard_job(job_id: str) -> dict[str, Any]:
@@ -797,11 +1009,17 @@ def create_workflow_router(
         """
         import shutil
         
-        lifecycle, job = _lifecycle(job_id)
+        _lifecycle_obj, job = _lifecycle(job_id)
         status = str(job["status"])
+
+        if database.is_job_pinned(job_id):
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "job_pinned", "message": "unpin the job before discarding its workspace"},
+            )
         
         # Only allow discard from terminal states
-        if status not in ("completed", "failed", "cancelled"):
+        if status not in ("completed", "failed", "cancelled", "interrupted", "rollback_required"):
             raise HTTPException(
                 status_code=400,
                 detail={
@@ -823,6 +1041,13 @@ def create_workflow_router(
         try:
             # Remove the entire workspace directory
             shutil.rmtree(workspace)
+            database.record_operation(
+                job_id,
+                "discard",
+                idempotency_key=f"discard:{job_id}",
+                payload={"workspace": workspace.name},
+            )
+            database.record_event(job_id, "workspace_discarded")
             
             # Update job record to mark as discarded
             # Note: This is a simple implementation. Full version would update
@@ -933,6 +1158,7 @@ def create_workflow_router(
     async def confirm_count_review(
         job_id: str,
         request: WorkflowCountConfirmRequest,
+        background_tasks: BackgroundTasks,
     ) -> dict[str, Any]:
         """Gate export on an explicit confirmation with nothing left pending."""
         from .count_review import CountReviewError
@@ -953,7 +1179,8 @@ def create_workflow_router(
                 status_code=409,
                 detail={"code": "count_review_incomplete", "message": str(exc)},
             ) from exc
-        return {"job_id": job_id, "confirmed": True, "pending": 0}
+        status = await _requeue_after_review(job_id, background_tasks)
+        return {"job_id": job_id, "confirmed": True, "pending": 0, "status": status}
 
 
     def _token_store(job_id: str):
@@ -1025,6 +1252,7 @@ def create_workflow_router(
     async def confirm_token_review(
         job_id: str,
         request: WorkflowCountConfirmRequest,
+        background_tasks: BackgroundTasks,
     ) -> dict[str, Any]:
         """Gate export on every overflow having been applied."""
         from .token_budget_review import TokenBudgetReviewError
@@ -1045,12 +1273,13 @@ def create_workflow_router(
                 status_code=409,
                 detail={"code": "token_review_incomplete", "message": str(exc)},
             ) from exc
-        return {"job_id": job_id, "confirmed": True, "unresolved": 0}
+        status = await _requeue_after_review(job_id, background_tasks)
+        return {"job_id": job_id, "confirmed": True, "unresolved": 0, "status": status}
     @router.post("/jobs/preflight")
     async def preflight_job(config: dict[str, Any]) -> dict[str, Any]:
         """Validate job configuration before creation."""
         try:
-            job_config = WorkflowJobConfigV1.from_payload(config)
+            job_config = WorkflowJobConfigV2.from_payload(config)
             report = preflight_service.validate_config(job_config)
             return report
         except WorkflowPreflightError as exc:
@@ -1062,10 +1291,10 @@ def create_workflow_router(
             ) from exc
 
     @router.post("/jobs", response_model=WorkflowJobCreateResponse)
-    async def create_job(request: WorkflowJobCreateRequest, background_tasks: BackgroundTasks) -> WorkflowJobCreateResponse:
-        """Create a new workflow job."""
+    async def create_job(request: WorkflowJobCreateRequest) -> WorkflowJobCreateResponse:
+        """Create a draft workflow job; execution requires an explicit start."""
         try:
-            job_config = WorkflowJobConfigV1.from_payload(request.config)
+            job_config = WorkflowJobConfigV2.from_payload(request.config)
             
             # Run preflight validation
             preflight_service.validate_config(job_config)
@@ -1073,8 +1302,9 @@ def create_workflow_router(
             workspace_root = database.db_path.parent / "jobs"
             workspace_root.mkdir(parents=True, exist_ok=True)
 
+            stored_config = job_config.to_dict()
             job_id, _workspace = database.create_job(
-                config_json=request.config,
+                config_json=stored_config,
                 config_hash=job_config.config_hash(),
                 profile=job_config.profile,
                 work_mode=job_config.work_mode,
@@ -1083,11 +1313,6 @@ def create_workflow_router(
                 output_root_id=job_config.output_root.root_id if job_config.output_root else None,
                 workspace_root=workspace_root,
             )
-            
-            
-            # Start execution in background
-            background_tasks.add_task(_execute_job_async, job_id)
-            
             return WorkflowJobCreateResponse(job_id=job_id, status="pending")
         
         except WorkflowPreflightError as exc:
@@ -1104,7 +1329,8 @@ def create_workflow_router(
         limit = max(1, min(limit, 200))
         offset = max(0, offset)
         return [
-            _job_summary(job) for job in database.list_jobs(limit=limit, offset=offset)
+            _job_summary(job, pinned=database.is_job_pinned(str(job["job_id"])))
+            for job in database.list_jobs(limit=limit, offset=offset)
         ]
 
     @router.get("/jobs/{job_id}", response_model=WorkflowJobStatusResponse)
@@ -1189,6 +1415,81 @@ def create_workflow_router(
             )
             for issue in database.list_issues(job_id, blocking_only=blocking_only)
         ]
+
+    @router.get("/jobs/{job_id}/events")
+    async def list_job_events(
+        job_id: str,
+        after_event_id: int = 0,
+        limit: int = 100,
+    ) -> dict[str, Any]:
+        """Return a bounded replay page for the workflow control-plane.
+
+        The cursor is deliberately an integer database sequence rather than a
+        timestamp, so clients can reconnect without missing events that share
+        the same clock tick.  This JSON endpoint is also the persistence layer
+        used by a future SSE adapter.
+        """
+
+        if database.get_job(job_id) is None:
+            raise HTTPException(
+                status_code=404,
+                detail={"code": "job_not_found", "message": f"unknown job: {job_id}"},
+            )
+        if after_event_id < 0:
+            raise HTTPException(
+                status_code=400,
+                detail={"code": "invalid_event_cursor", "message": "after_event_id must be non-negative"},
+            )
+        bounded_limit = max(1, min(int(limit), 500))
+        events = database.list_events(
+            job_id,
+            after_event_id=after_event_id,
+            limit=bounded_limit,
+        )
+        next_cursor = events[-1]["event_id"] if events else after_event_id
+        return {
+            "job_id": job_id,
+            "events": events,
+            "next_after_event_id": next_cursor,
+            "has_more": len(events) >= bounded_limit,
+        }
+
+    @router.get("/jobs/{job_id}/events/stream")
+    async def stream_job_events(job_id: str, after_event_id: int = 0):
+        """Replay durable workflow events as an SSE stream.
+
+        The stream is finite at the current cursor and can be reconnected with
+        the last event id.  This keeps the API responsive without a long-lived
+        database polling task; clients reconnect while a job is active.
+        """
+
+        from fastapi.responses import StreamingResponse
+
+        if database.get_job(job_id) is None:
+            raise HTTPException(
+                status_code=404,
+                detail={"code": "job_not_found", "message": f"unknown job: {job_id}"},
+            )
+        if after_event_id < 0:
+            raise HTTPException(
+                status_code=400,
+                detail={"code": "invalid_event_cursor", "message": "after_event_id must be non-negative"},
+            )
+        events = database.list_events(job_id, after_event_id=after_event_id, limit=500)
+
+        async def body():
+            for event in events:
+                yield (
+                    f"id: {event['event_id']}\n"
+                    "event: workflow\n"
+                    f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+                )
+
+        return StreamingResponse(
+            body(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
 
     return router
 

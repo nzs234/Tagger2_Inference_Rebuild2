@@ -1,7 +1,7 @@
 """Tests for job lifecycle: pause/resume, leases and interrupted-run repair."""
 
 import tempfile
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -34,7 +34,7 @@ def test_schema_v2_adds_lease_columns():
     assert SCHEMA_VERSION == 3
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        database, job_id, _workspace, _lifecycle = _setup(tmpdir)
+        database, _job_id, _workspace, _lifecycle = _setup(tmpdir)
         with database.connection() as conn:
             columns = {
                 str(row[1])
@@ -71,6 +71,67 @@ def test_transition_to_same_state_is_a_noop():
         assert lifecycle.resume() == "running"
 
 
+def test_job_status_compare_and_set_rejects_stale_writer():
+    """A stale pause/cancel request cannot overwrite a newer state."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        database, job_id, _workspace, _lifecycle = _setup(tmpdir, sample_count=0)
+
+        assert database.update_job_status(job_id, "running", expected_status="pending") is True
+        assert database.update_job_status(job_id, "paused", expected_status="pending") is False
+        current = database.get_job(job_id)
+        assert current is not None
+        assert current["status"] == "running"
+
+
+def test_explicit_start_serializes_overlapping_dataset_scopes():
+    """Only one queued job may own an overlapping source path at a time."""
+    from backend.tagger2.workflow.db import WorkflowDatabase
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        database = WorkflowDatabase(Path(tmpdir) / "workflows.sqlite3")
+        workspace_root = Path(tmpdir) / "jobs"
+        common = {
+            "schema_version": 2,
+            "profile": "e621",
+            "work_mode": "full_copy",
+            "overwrite_mode": "incremental",
+            "source_root": {"root_id": "input", "relative_path": "images"},
+        }
+        first, _ = database.create_job(
+            config_json=common,
+            config_hash="a",
+            profile="e621",
+            work_mode="full_copy",
+            overwrite_mode="incremental",
+            source_root_id="input",
+            output_root_id="output",
+            workspace_root=workspace_root,
+        )
+        second_config = dict(common)
+        second_config["source_root"] = {"root_id": "input", "relative_path": "images/subset"}
+        second, _ = database.create_job(
+            config_json=second_config,
+            config_hash="b",
+            profile="e621",
+            work_mode="full_copy",
+            overwrite_mode="incremental",
+            source_root_id="input",
+            output_root_id="output",
+            workspace_root=workspace_root,
+        )
+
+        assert database.start_job(first) is True
+        assert database.start_job(second) is False
+        first_row = database.get_job(first)
+        second_row = database.get_job(second)
+        assert first_row is not None and first_row["status"] == "queued"
+        assert second_row is not None and second_row["status"] == "pending"
+
+        # Once the owner reaches a terminal state, a pending sibling can start.
+        assert database.update_job_status(first, "completed", expected_status="queued") is True
+        assert database.start_job(second) is True
+
+
 def test_lease_prevents_two_workers_claiming_one_sample():
     """A live lease blocks a second claim; the same owner may re-claim."""
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -88,7 +149,7 @@ def test_expired_lease_is_reclaimable():
         database, job_id, _workspace, lifecycle = _setup(tmpdir)
 
         lifecycle.claim_sample(0, owner="worker-a", lease_seconds=300)
-        stale = (datetime.now(timezone.utc) - timedelta(seconds=10)).isoformat()
+        stale = (datetime.now(UTC) - timedelta(seconds=10)).isoformat()
         with database.connection() as conn:
             conn.execute(
                 "UPDATE workflow_samples SET lease_expires_at = ?"
@@ -132,7 +193,7 @@ def test_repair_reclaims_then_parks_after_max_attempts():
         database, job_id, workspace, lifecycle = _setup(tmpdir, sample_count=1)
 
         def expire():
-            stale = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+            stale = (datetime.now(UTC) - timedelta(seconds=1)).isoformat()
             with database.connection() as conn:
                 conn.execute(
                     "UPDATE workflow_samples SET lease_expires_at = ?"

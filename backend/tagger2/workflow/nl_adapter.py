@@ -2,10 +2,8 @@
 
 import asyncio
 import json
-from typing import Any
-
 from ..providers.client import VisionProvider
-from .stages.nl import NlClient, NlRequest
+from .stages.nl import NlRequest
 
 
 class ProviderNlAdapter:

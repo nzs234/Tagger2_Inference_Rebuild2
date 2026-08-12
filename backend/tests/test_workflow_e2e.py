@@ -77,6 +77,8 @@ def test_job_executes_to_completion_without_caption(e2e_client):
     assert created.status_code == 200, created.text
     job_id = created.json()["job_id"]
     assert created.json()["status"] == "pending"
+    started = client.post(f"/api/v1/workflows/jobs/{job_id}/start")
+    assert started.status_code == 200, started.text
 
     # Poll until job completes (with timeout)
     max_wait = 30

@@ -335,7 +335,27 @@ export type WorkflowProfile = 'e621' | 'danbooru'
 export type WorkflowWorkMode = 'in_place' | 'full_copy'
 export type WorkflowOverwriteMode = 'incremental' | 'rebuild'
 export type WorkflowExportFormat = 'json' | 'txt' | 'both'
-export type WorkflowJobStatus = 'pending' | 'running' | 'paused' | 'completed' | 'failed' | 'cancelled'
+/**
+ * Public workflow state names.  Keep these aligned with the workflow
+ * lifecycle rather than collapsing waiting/transition states into `running`:
+ * the UI uses them to decide which destructive controls are safe to show.
+ */
+export type WorkflowJobStatus =
+  | 'pending'
+  | 'queued'
+  | 'running'
+  | 'waiting_count_review'
+  | 'waiting_token_review'
+  | 'committing'
+  | 'pausing'
+  | 'paused'
+  | 'cancelling'
+  | 'cancelled'
+  | 'interrupted'
+  | 'rollback_required'
+  | 'restoring'
+  | 'completed'
+  | 'failed'
 
 export interface WorkflowPathRef {
   root_id: string
@@ -344,7 +364,9 @@ export interface WorkflowPathRef {
 
 export interface WorkflowResource {
   resource_id: string
-  category: string
+  /** Resource manifests historically used both `replace` and
+   * `replacement_index`; both identify the same replacement-index contract. */
+  category: 'classify' | 'replace' | 'replacement_index' | 'ocr' | 'tokenizer' | string
   fingerprint: string
   source_url?: string | null
   created_at?: string
@@ -405,6 +427,23 @@ export interface WorkflowJobSummary {
   finished_at: string | null
   /** Stable public code, never an exception message or traceback. */
   error_code: string | null
+  pinned?: boolean
+}
+
+export interface WorkflowJobEvent {
+  seq?: number
+  event_id?: number
+  job_id: string
+  status?: WorkflowJobStatus
+  event_type?: string
+  from_status?: WorkflowJobStatus | null
+  to_status?: WorkflowJobStatus | null
+  payload?: Record<string, unknown>
+  module_id?: string | null
+  processed_samples?: number
+  total_samples?: number
+  message?: string | null
+  created_at?: string
 }
 
 export interface WorkflowIssue {

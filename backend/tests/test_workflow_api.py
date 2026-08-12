@@ -1,9 +1,7 @@
 """Contract tests for the mounted Dataset Workflow API surface."""
 
 import json
-import os
 import tempfile
-import threading
 from pathlib import Path
 
 import pytest
@@ -470,9 +468,21 @@ def test_job_pause_resume_and_repair(workflow_client):
     assert early.status_code == 409
     assert early.json()["code"] == "invalid_transition"
 
+    queued = client.post(f"/api/v1/workflows/jobs/{job_id}/start")
+    assert queued.status_code == 200
+    assert queued.json()["status"] == "queued"
     assert client.post(f"/api/v1/workflows/jobs/{job_id}/resume").json()["status"] == "running"
-    assert client.post(f"/api/v1/workflows/jobs/{job_id}/pause").json()["status"] == "paused"
-    assert client.post(f"/api/v1/workflows/jobs/{job_id}/resume").json()["status"] == "running"
+    pause = client.post(f"/api/v1/workflows/jobs/{job_id}/pause")
+    if pause.status_code == 200:
+        assert pause.json()["status"] == "pausing"
+        # The worker observes the request at a batch boundary and transitions
+        # to paused; model that boundary without racing the background worker.
+        runtime.workflow_database.update_job_status(job_id, "paused", expected_status="pausing")
+        assert client.post(f"/api/v1/workflows/jobs/{job_id}/resume").json()["status"] == "running"
+    else:
+        # An already-finished background run is a valid race at this point;
+        # pause must fail closed rather than resurrect terminal work.
+        assert pause.status_code == 409
 
     repaired = client.post(f"/api/v1/workflows/jobs/{job_id}/repair")
     assert repaired.status_code == 200, repaired.text
@@ -588,6 +598,8 @@ def test_pipeline_does_not_run_on_the_event_loop(workflow_client, monkeypatch):
 
     created = client.post("/api/v1/workflows/jobs", json={"config": config})
     assert created.status_code == 200, created.text
+    started = client.post(f"/api/v1/workflows/jobs/{created.json()['job_id']}/start")
+    assert started.status_code == 200, started.text
 
     assert observed, "pipeline was never invoked"
     assert observed["on_event_loop"] is False, (

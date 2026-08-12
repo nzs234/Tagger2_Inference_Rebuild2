@@ -1,6 +1,5 @@
 ﻿"""Test workflow foundation: contracts, database, resources, preflight, API."""
 
-import json
 import tempfile
 from pathlib import Path
 
@@ -14,7 +13,6 @@ def test_workflow_contracts():
         WorkflowPathRef,
         WorkflowResourceManifestV1,
         utc_now,
-        sha256_json,
     )
     
     # Test WorkflowPathRef
@@ -53,7 +51,6 @@ def test_workflow_contracts():
 def test_workflow_database():
     """Test workflow database operations."""
     from backend.tagger2.workflow.db import WorkflowDatabase
-    from backend.tagger2.workflow.db_schema import SCHEMA_VERSION
     
     with tempfile.TemporaryDirectory() as tmpdir:
         db_path = Path(tmpdir) / "test_workflow.sqlite3"

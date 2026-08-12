@@ -4,7 +4,6 @@ import pytest
 
 from tagger2.workflow.stages.classify import (
     ClassifyError,
-    TagRecord,
     build_classification_rules,
     classify_tags,
 )

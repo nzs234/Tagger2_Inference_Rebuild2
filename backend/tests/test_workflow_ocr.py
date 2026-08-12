@@ -6,9 +6,9 @@ import json
 from pathlib import Path
 from unittest.mock import Mock
 
-
 from tagger2.workflow.ocr import (
     OCRIssue,
+    PaddleOCREngine,
     load_ocr_sidecar,
     run_ocr_stage,
 )
@@ -43,6 +43,46 @@ def test_ocr_disabled(tmp_path):
 
     assert len(results) == 0
     assert len(issues) == 0
+
+
+def test_ocr_missing_isolated_runtime_fails_closed(tmp_path, monkeypatch):
+    """Enabled OCR must report an unavailable stage without using host Python."""
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    image_path = tmp_path / "image.jpg"
+    image_path.write_bytes(b"fake image data")
+
+    missing_runtime = tmp_path / "runtime_ocr" / "Scripts" / "python.exe"
+    monkeypatch.setattr(
+        PaddleOCREngine,
+        "_find_paddle_runtime",
+        lambda self: missing_runtime,
+    )
+
+    results, issues = run_ocr_stage(
+        workspace,
+        {"image.jpg": image_path},
+        {"enabled": True},
+    )
+
+    assert results == {}
+    assert len(issues) == 1
+    assert issues[0].code == "ocr_unavailable"
+    assert "runtime interpreter not found" in issues[0].message
+    assert not (workspace / "ocr_sidecars").exists()
+
+
+def test_ocr_explicit_missing_runtime_never_falls_back(tmp_path):
+    """An explicit invalid interpreter is rejected instead of falling back."""
+
+    missing_runtime = tmp_path / "does-not-exist" / "python.exe"
+    try:
+        PaddleOCREngine(runtime_python=missing_runtime)
+    except RuntimeError as exc:
+        assert str(missing_runtime.resolve()) in str(exc)
+    else:  # pragma: no cover - protects the fail-closed contract
+        raise AssertionError("missing OCR runtime unexpectedly initialized")
 
 
 def test_ocr_basic_recognition(tmp_path):
@@ -116,7 +156,7 @@ def test_ocr_confidence_filtering(tmp_path):
         "min_confidence": 0.5,
     }
 
-    results, issues = run_ocr_stage(workspace, samples, ocr_config, mock_engine)
+    _results, _issues = run_ocr_stage(workspace, samples, ocr_config, mock_engine)
 
     # MockEngine returns all regions, but in real scenario PaddleOCR would filter
     # Here we just verify the call was made with correct min_confidence
@@ -158,7 +198,7 @@ def test_ocr_sidecar_reuse(tmp_path):
         "force_reprocess": False,
     }
 
-    results, issues = run_ocr_stage(workspace, samples, ocr_config, mock_engine)
+    results, _issues = run_ocr_stage(workspace, samples, ocr_config, mock_engine)
 
     # Should use cached result, not call engine
     assert len(mock_engine.calls) == 0
@@ -198,7 +238,7 @@ def test_ocr_force_reprocess(tmp_path):
         "force_reprocess": True,
     }
 
-    results, issues = run_ocr_stage(workspace, samples, ocr_config, mock_engine)
+    results, _issues = run_ocr_stage(workspace, samples, ocr_config, mock_engine)
 
     # Should call engine and get new result
     assert len(mock_engine.calls) == 1
@@ -325,7 +365,7 @@ def test_ocr_nested_paths(tmp_path):
         "min_confidence": 0.5,
     }
 
-    results, issues = run_ocr_stage(workspace, samples, ocr_config, mock_engine)
+    results, _issues = run_ocr_stage(workspace, samples, ocr_config, mock_engine)
 
     assert "subdir/image.jpg" in results
     

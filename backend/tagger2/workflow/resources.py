@@ -7,8 +7,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from .contracts import WorkflowResourceManifestV1, utc_now, RESOURCE_ID_PATTERN
-
+from .contracts import RESOURCE_ID_PATTERN, WorkflowResourceManifestV1, utc_now
 
 # Category names carried by the resource manifest. ``classify`` selects the
 # snapshot reader; the replacement categories select the index CSV reader.
@@ -49,6 +48,11 @@ class WorkflowResourceCatalog:
         
         # Compute fingerprint
         fingerprint = self.fingerprint_file(source_path)
+        existing = self.get_manifest(resource_id)
+        if existing is not None and existing.resource_fingerprint != fingerprint:
+            raise ValueError(
+                f"resource_id {resource_id!r} is immutable; existing digest differs"
+            )
         
         # Copy to content-addressed location
         target_dir = self.resource_dir / category
@@ -68,6 +72,8 @@ class WorkflowResourceCatalog:
             source_url=source_url,
             source_timestamp=source_timestamp,
             builder_version=builder_version,
+            size_bytes=source_path.stat().st_size,
+            source_digest=fingerprint,
         )
         
         # Write manifest
@@ -114,8 +120,13 @@ class WorkflowResourceCatalog:
         
         category_dir = self.resource_dir / manifest.category
         resource_path = category_dir / f"{resource_id}.{manifest.resource_fingerprint[:16]}"
-        
-        return resource_path if resource_path.exists() else None
+        if not resource_path.is_file():
+            return None
+        if resource_path.stat().st_size != manifest.size_bytes:
+            return None
+        # Verify the digest at the execution boundary; a modified resource is
+        # never silently accepted just because its manifest still exists.
+        return resource_path if self.fingerprint_file(resource_path) == manifest.resource_fingerprint else None
 
     def validate_csv_resource(self, csv_path: Path) -> dict[str, Any]:
         """Validate a replacement index CSV before import.
@@ -154,9 +165,11 @@ class WorkflowResourceCatalog:
         return {
             "valid": False,
             "errors": [
-                f"unsupported resource category: {category!r};"
-                f" expected {CLASSIFY_RESOURCE_CATEGORY!r} or one of"
-                f" {sorted(REPLACEMENT_RESOURCE_CATEGORIES)}"
+                (
+                    f"unsupported resource category: {category!r};"
+                    f" expected {CLASSIFY_RESOURCE_CATEGORY!r} or one of"
+                    f" {sorted(REPLACEMENT_RESOURCE_CATEGORIES)}"
+                ),
             ],
             "line_count": 0,
         }

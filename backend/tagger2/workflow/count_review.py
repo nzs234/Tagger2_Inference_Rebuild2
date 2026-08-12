@@ -13,10 +13,12 @@ module owns the reviewable state around it:
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any
 
 from .contracts import canonical_json, utc_now
 from .stages.count_rules import (
@@ -267,7 +269,36 @@ class CountReviewStore:
                 " WHERE job_id = ? AND sample_id = ?",
                 (count, canonical_json(decision), now, self.job_id, sample_id),
             )
+        self._write_overlay(sample_id, count)
         return {"sample_id": sample_id, "count_value": count, "version": decision["version"]}
+
+    def _write_overlay(self, sample_id: int, count: str) -> None:
+        """Persist the reviewed value in the private job workspace.
+
+        The database row remains authoritative, but a small JSON overlay makes
+        the checkpoint inspectable and lets recovery tools rebuild staged output
+        without exposing server paths through the API.
+        """
+
+        job = self.database.get_job(self.job_id)
+        if not job:
+            return
+        path = Path(str(job["workspace_path"])) / "review_overlay.json"
+        payload: dict[str, Any] = {"count": {}, "nl": {}}
+        try:
+            if path.is_file():
+                raw = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(raw, dict):
+                    payload.update({key: value for key, value in raw.items() if isinstance(value, dict)})
+        except (OSError, json.JSONDecodeError):
+            # A malformed private artifact is not allowed to corrupt the
+            # authoritative review transaction; the next pipeline run rewrites
+            # it from SQLite.
+            payload = {"count": {}, "nl": {}}
+        payload.setdefault("count", {})[str(sample_id)] = count
+        temporary = path.with_suffix(path.suffix + ".partial")
+        temporary.write_text(json.dumps(payload, ensure_ascii=False, sort_keys=True), encoding="utf-8")
+        os.replace(temporary, path)
 
     def pending_count(self) -> int:
         with self.database.connection() as conn:

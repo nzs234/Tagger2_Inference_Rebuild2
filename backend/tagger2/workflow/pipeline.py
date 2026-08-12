@@ -13,9 +13,9 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .stages.policy import PolicyConfig
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from collections.abc import Mapping
 from typing import Any
 
 from .caption_format import (
@@ -29,23 +29,30 @@ from .commit import (
     ExportStaging,
     StagedFile,
     commit_staged_files,
+    verify_annotation_backup_baseline,
     write_annotation_backup,
 )
-from .contracts import NineFieldAnnotation, WorkflowJobConfigV1, canonical_json, utc_now
+from .contracts import (
+    PartialNineFieldAnnotation,
+    WorkflowJobConfigV1,
+    canonical_json,
+    utc_now,
+)
 from .dataset_import import ImportedSample, ImportResult, import_dataset
-from .replacement_index import load_replacement_rules
 from .ocr import OCREngine, run_ocr_stage
-from .stages.nl import NlClient, run_nl_stage
-from .stages.classify import ClassificationRules, classify_tags
+from .replacement_index import load_replacement_rules
 from .stages.caption import (
     CaptionStageReport,
     TagPredictor,
     run_caption_stage,
     settings_from_config,
 )
+from .stages.classify import ClassificationRules, classify_tags
+from .stages.nl import NlClient, run_nl_stage
 from .stages.policy import PolicyError, apply_policy, merge_artists
-from .stages.token_budget import TokenBudgetError, fit as fit_token_budget
 from .stages.replacement import ReplacementError, ReplacementSummary, replace_projection
+from .stages.token_budget import TokenBudgetError
+from .stages.token_budget import fit as fit_token_budget
 
 NINE_FIELDS = (
     "quality",
@@ -106,6 +113,7 @@ class PipelineReport:
             "replacement": dict(self.replacement),
             "caption": dict(self.caption),
             "ocr": dict(self.ocr),
+            "nl": dict(self.nl),
             "policy": dict(self.policy),
             "token_budget": dict(self.token_budget),
             "token_overflows": [dict(item) for item in self.token_overflows],
@@ -136,7 +144,7 @@ def _display_policy(config: WorkflowJobConfigV1) -> CaptionDisplayPolicy:
     )
 
 
-def build_projection(sample: ImportedSample) -> NineFieldAnnotation:
+def build_projection(sample: ImportedSample) -> PartialNineFieldAnnotation:
     """Build the nine-field projection for one imported sample.
 
     A standard JSON annotation is reused as-is; a raw e621 document contributes
@@ -147,7 +155,7 @@ def build_projection(sample: ImportedSample) -> NineFieldAnnotation:
     if sample.annotation_kind == "standard_json":
         raise PipelineError("standard JSON is handled by the caller")
 
-    projection: dict[str, Any] = {
+    projection: PartialNineFieldAnnotation = {
         "quality": [],
         "count": "",
         "character": sample.character,
@@ -161,9 +169,9 @@ def build_projection(sample: ImportedSample) -> NineFieldAnnotation:
     return projection
 
 
-def _parse_policy_config(config_arg: dict[str, Any] | "PolicyConfig") -> "PolicyConfig":
+def _parse_policy_config(config_arg: dict[str, Any] | PolicyConfig) -> PolicyConfig:
     """Convert a policy config dictionary to PolicyConfig dataclass, or pass through if already a dataclass."""
-    from .stages.policy import PolicyConfig, CoupledProbabilities
+    from .stages.policy import CoupledProbabilities, PolicyConfig
     
     # If already a PolicyConfig, return it as-is
     if isinstance(config_arg, PolicyConfig):
@@ -205,6 +213,11 @@ def run_offline_pipeline(
     classification_rules: ClassificationRules | None = None,
     ocr_engine: OCREngine | None = None,
     nl_client: NlClient | None = None,
+    # The direct/offline API intentionally remains usable without a database.
+    # Production runs pass both values so that samples, issues and review gates
+    # are durable before a commit is attempted.
+    database: Any | None = None,
+    job_id: str | None = None,
 ) -> PipelineReport:
     """Run the deterministic offline vertical and commit its results.
 
@@ -220,6 +233,43 @@ def run_offline_pipeline(
 
     report = PipelineReport(resource_fingerprints=dict(resource_fingerprints or {}))
     policy = _display_policy(config)
+    pipeline_stage_run: str | None = None
+    if database is not None and job_id is not None and hasattr(database, "record_stage_run"):
+        pipeline_stage_run = database.record_stage_run(
+            job_id,
+            "pipeline",
+            status="running",
+        )
+
+    def finish_pipeline_stage(status: str, *, processed: int = 0, checkpoint: dict[str, Any] | None = None) -> None:
+        if (
+            database is not None
+            and job_id is not None
+            and pipeline_stage_run is not None
+            and hasattr(database, "record_stage_run")
+        ):
+            database.record_stage_run(
+                job_id,
+                "pipeline",
+                status=status,
+                run_id=pipeline_stage_run,
+                total=report.total_samples,
+                processed=processed,
+                issue_count=len(report.issues),
+                checkpoint=checkpoint,
+            )
+
+    confirmed_counts: dict[int, str] = {}
+    applied_token_texts: dict[int, str] = {}
+    if database is not None and job_id is not None:
+        # Reviews are overlays on the immutable import/stage result.  Loading
+        # them before processing means a resumed run produces the exact same
+        # bytes as the first run plus the reviewer's decisions.
+        from .count_review import CountReviewStore
+        from .token_budget_review import TokenBudgetReviewStore
+
+        confirmed_counts = CountReviewStore(database, job_id).confirmed_counts()
+        applied_token_texts = TokenBudgetReviewStore(database, job_id).applied_texts()
 
     imported: ImportResult = import_dataset(
         source_root,
@@ -227,6 +277,43 @@ def run_offline_pipeline(
         input_txt_mode=str(config.caption.get("input_txt_mode", "tag")),
     )
     report.total_samples = len(imported.samples)
+    if pipeline_stage_run is not None and database is not None and job_id is not None:
+        database.record_stage_run(
+            job_id,
+            "pipeline",
+            status="running",
+            run_id=pipeline_stage_run,
+            total=report.total_samples,
+            checkpoint={"checkpoint": "imported"},
+        )
+
+    if database is not None and job_id is not None:
+        # The manifest is the source of truth for the control plane.  ``INSERT
+        # OR IGNORE`` keeps a retry/recovery run idempotent and, importantly,
+        # makes samples visible before any expensive stage starts.
+        with database.connection() as conn:
+            now = utc_now()
+            for sample in imported.samples:
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO workflow_samples
+                        (job_id, sample_id, relative_image_path, image_format,
+                         status, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, 'pending', ?, ?)
+                    """,
+                    (
+                        job_id,
+                        sample.sample_id,
+                        sample.relative_image_path,
+                        sample.image_format,
+                        now,
+                        now,
+                    ),
+                )
+            conn.execute(
+                "UPDATE workflow_jobs SET total_samples = ? WHERE job_id = ?",
+                (len(imported.samples), job_id),
+            )
     for issue in imported.issues:
         report.issues.append(
             StageIssue(
@@ -262,6 +349,19 @@ def run_offline_pipeline(
         json.dumps(config.to_dict(), ensure_ascii=False, indent=2, sort_keys=True, default=str),
         encoding="utf-8",
     )
+    (workspace / "resource_snapshot.json").write_text(
+        json.dumps(dict(resource_fingerprints or {}), ensure_ascii=False, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    if database is not None and job_id is not None:
+        with database.connection() as conn:
+            for resource_id, fingerprint in (resource_fingerprints or {}).items():
+                conn.execute(
+                    "INSERT OR REPLACE INTO workflow_resource_snapshots "
+                    "(job_id, resource_id, resource_fingerprint, manifest_json, created_at) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (job_id, resource_id, fingerprint, "{}", utc_now()),
+                )
 
     caption_tags: dict[str, tuple[str, ...]] = {}
     if config.caption.get("enabled"):
@@ -272,7 +372,7 @@ def run_offline_pipeline(
             source_root=source_root,
             predictor=tag_predictor,
             settings=settings_from_config(config.caption),
-            model_id=str(config.caption.get("resource_id", "")),
+            model_id=str(config.caption.get("model_id", "")),
         )
         report.caption = {
             "captioned": caption_report.captioned,
@@ -300,6 +400,7 @@ def run_offline_pipeline(
     # OCR stage: text recognition into per-sample sidecars. It never changes
     # the nine-field payload and never blocks the run, so a missing runtime or a
     # failed image is a warning and the pipeline continues.
+    ocr_results: dict[str, Any] = {}
     if config.ocr.get("enabled"):
         ocr_results, ocr_issues = run_ocr_stage(
             workspace,
@@ -349,7 +450,7 @@ def run_offline_pipeline(
                 classified_projections[relative_path] = classify_tags(
                     list(tags), classification_rules
                 )
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 report.issues.append(
                     StageIssue(
                         sample_id=None,
@@ -371,23 +472,50 @@ def run_offline_pipeline(
 
     if config.work_mode == "in_place" and imported.samples:
         # Never modify a dataset in place without a verified backup first.
-        report.backup_path = str(
-            write_annotation_backup(
-                source_root,
-                workspace / "backup" / "annotations.zip",
-                (sample.annotation_key for sample in imported.samples),
+        backup_target = workspace / "backup" / "annotations.zip"
+        if backup_target.is_file():
+            # Review-gated retries must reuse the original pre-workflow
+            # baseline; taking a second backup would capture an intermediate
+            # overlay and make Restore semantically incorrect.
+            report.backup_path = str(backup_target)
+        else:
+            report.backup_path = str(
+                write_annotation_backup(
+                    source_root,
+                    backup_target,
+                    (sample.annotation_key for sample in imported.samples),
+                )
             )
-        )
-
     staging = ExportStaging(workspace / "staging")
-    journal = CommitJournal(workspace / "commit_journal.jsonl")
+    journal = CommitJournal(
+        workspace / "commit_journal.jsonl",
+        database=database,
+        job_id=job_id,
+    )
     staged: list[StagedFile] = []
+    exported_sample_ids: set[int] = set()
+    # Persist complete projections independently of staging.  Review actions
+    # use this immutable workspace overlay to rebuild JSON/TXT bytes without
+    # re-running model stages or touching the target dataset.
+    review_projections: dict[str, dict[str, Any]] = {}
     totals = ReplacementSummary(0, 0, 0, 0)
     policy_counts: dict[str, int] = {"artist_dropped": 0, "quality_dropped": 0}
     budget_counts: dict[str, int] = {}
+    # Public API keeps the stable ``txt`` spelling; the normalizer uses the
+    # internal ``flat_txt`` representation only at the serialization boundary.
     export_format = str(config.export.get("format", "both"))
+    if export_format == "txt":
+        export_format = "flat_txt"
     if export_format not in {"json", "flat_txt", "both"}:
         raise PipelineError(f"unsupported export format: {export_format!r}")
+
+    def control_state() -> str | None:
+        """Read the durable control state at safe batch boundaries."""
+
+        if database is None or job_id is None:
+            return None
+        current = database.get_job(job_id)
+        return None if current is None else str(current["status"])
 
 
     # NL stage: generate natural language captions
@@ -404,7 +532,7 @@ def run_offline_pipeline(
                     field_name: document.get(field_name) for field_name in NINE_FIELDS
                 }
             else:
-                projection = build_projection(sample)
+                projection = dict(build_projection(sample))
                 classified = classified_projections.get(sample.relative_image_path)
                 if classified:
                     projection['quality'] = classified.get('quality', [])
@@ -424,7 +552,7 @@ def run_offline_pipeline(
                     projection['environment'] = classified.get('environment', [])
                 elif caption_tags.get(sample.relative_image_path):
                     projection['tags'] = list(caption_tags[sample.relative_image_path])
-                temp_projections[sample.relative_image_path] = projection
+                temp_projections[sample.relative_image_path] = dict(projection)
         
         nl_report = run_nl_stage(
             imported.samples,
@@ -436,6 +564,13 @@ def run_offline_pipeline(
             reuse_original_nl=bool(config.nl.get('reuse_original_nl', True)),
             use_image=bool(config.nl.get('use_image', True)),
             use_full_json=bool(config.nl.get('use_full_json', False)),
+            ocr_by_path={
+                relative_path: {
+                    "regions": result.detected_regions,
+                    "success": result.success,
+                }
+                for relative_path, result in ocr_results.items()
+            },
         )
         nl_projections = nl_report.by_path()
         report.nl = {
@@ -445,6 +580,8 @@ def run_offline_pipeline(
         }
 
     for sample in imported.samples:
+        if control_state() in {"pausing", "paused", "cancelling", "cancelled", "interrupted"}:
+            break
         try:
             if sample.annotation_kind == "standard_json":
                 document = json.loads(
@@ -459,7 +596,7 @@ def run_offline_pipeline(
                     key: ("" if value is None else value) for key, value in projection.items()
                 }
             else:
-                projection = build_projection(sample)
+                projection = dict(build_projection(sample))
                 
                 # Use classified projection if available, otherwise fall back to raw tags
                 classified = classified_projections.get(sample.relative_image_path)
@@ -532,7 +669,19 @@ def run_offline_pipeline(
 
             # Merge NL result if available
             if nl_projections and sample.relative_image_path in nl_projections:
-                projection["nl"] = nl_projections[sample.relative_image_path]
+                projection["nl"] = nl_projections[sample.relative_image_path].nl
+
+            # Human decisions are applied as an overlay.  They are deliberately
+            # evaluated before policy/token/export so every downstream stage
+            # sees the reviewed values.
+            if sample.sample_id in confirmed_counts:
+                projection["count"] = confirmed_counts[sample.sample_id]
+            if sample.sample_id in applied_token_texts:
+                projection["nl"] = applied_token_texts[sample.sample_id]
+
+            # Preserve the pre-budget projection even when the budget stage
+            # later parks this sample for human review.
+            review_projections[str(sample.sample_id)] = dict(projection)
 
             if token_counter is not None:
                 caption_format = {
@@ -561,6 +710,7 @@ def run_offline_pipeline(
                                 "caption cannot fit the token budget without"
                                 f" emptying the payload: {exc}"
                             ),
+                            blocking=False,
                         )
                     )
                     report.token_overflows.append(
@@ -600,6 +750,7 @@ def run_offline_pipeline(
                                 f"caption needs {budget.original_tokens} tokens and cannot fit"
                                 f" the budget even after trimming"
                             ),
+                            blocking=False,
                         )
                     )
                     report.token_overflows.append(
@@ -616,6 +767,8 @@ def run_offline_pipeline(
                     report.failed_samples += 1
                     continue
                 projection = dict(budget.annotation)
+
+            review_projections[str(sample.sample_id)] = dict(projection)
 
             normalization_format = "both" if export_format == "both" else (
                 "json" if export_format == "json" else "flat_txt"
@@ -672,6 +825,7 @@ def run_offline_pipeline(
                     )
 
             report.exported_samples += 1
+            exported_sample_ids.add(sample.sample_id)
 
         except (ReplacementError, ValueError, OSError) as exc:
             report.issues.append(
@@ -694,15 +848,195 @@ def run_offline_pipeline(
         "keep_rewritten": totals.keep_rewritten,
     }
 
+    if database is not None and job_id is not None:
+        # The control plane must reflect stage completion even when the final
+        # dataset commit is deferred for review.  A sample marked completed
+        # here means its private overlay/staging bytes are valid, not that the
+        # target dataset has already changed.
+        issue_sample_ids = {
+            issue.sample_id
+            for issue in report.issues
+            if issue.sample_id is not None and issue.severity == "error"
+        }
+        with database.connection() as conn:
+            now = utc_now()
+            for sample in imported.samples:
+                if sample.sample_id in exported_sample_ids:
+                    sample_status = "completed"
+                elif sample.sample_id in issue_sample_ids:
+                    sample_status = "failed"
+                else:
+                    sample_status = "skipped"
+                conn.execute(
+                    "UPDATE workflow_samples SET status = ?, updated_at = ? WHERE job_id = ? AND sample_id = ?",
+                    (sample_status, now, job_id, sample.sample_id),
+                )
+            conn.execute(
+                """
+                UPDATE workflow_jobs
+                   SET processed_samples = ?, succeeded_samples = ?,
+                       failed_samples = ?, skipped_samples = ?
+                 WHERE job_id = ?
+                """,
+                (
+                    report.exported_samples + report.failed_samples + report.skipped_samples,
+                    report.exported_samples,
+                    report.failed_samples,
+                    report.skipped_samples,
+                    job_id,
+                ),
+            )
+
+    if database is not None and job_id is not None:
+        # Keep a durable projection snapshot for count/token review.  It is
+        # deliberately stored under the private workspace, never returned by
+        # the API, and is replaced atomically on a recovery run.
+        projection_path = workspace / "projections.json"
+        temporary = projection_path.with_suffix(".json.partial")
+        temporary.write_text(
+            json.dumps(review_projections, ensure_ascii=False, sort_keys=True),
+            encoding="utf-8",
+        )
+        temporary.replace(projection_path)
+
+        # Count review is a production gate, not a test-only helper.  The
+        # bundled wiki snapshot is optional; an empty catalog makes the rules
+        # preserve the original value and exposes the uncertainty to the
+        # reviewer instead of fabricating a count.
+        if config.count_review.get("enabled") and imported.samples:
+            from .count_review import (
+                CountReviewStore,
+                create_wiki_catalog,
+                derive_count_decisions,
+            )
+
+            wiki_db = create_wiki_catalog(workspace / "wiki_catalog.sqlite3")
+
+            class _ReviewSample:
+                def __init__(self, sample_id: int, relative_image_path: str):
+                    self.sample_id = sample_id
+                    self.relative_image_path = relative_image_path
+
+            evidence = derive_count_decisions(
+                [
+                    _ReviewSample(sample.sample_id, sample.relative_image_path)
+                    for sample in imported.samples
+                    if str(sample.sample_id) in review_projections
+                ],
+                {
+                    next(
+                        sample.relative_image_path
+                        for sample in imported.samples
+                        if sample.sample_id == int(sample_id)
+                    ): projection
+                    for sample_id, projection in review_projections.items()
+                },
+                wiki_db_path=wiki_db,
+                observations={
+                    relative_path: result.observation
+                    for relative_path, result in nl_projections.items()
+                },
+                overwrite_count=bool(config.classify.get("overwrite_count", False)),
+            )
+            CountReviewStore(database, job_id).initialize(evidence)
+
+        # Token rows are initialized here as well as by the API for backward
+        # compatibility.  ``INSERT OR IGNORE`` makes the two paths harmless.
+        if report.token_overflows:
+            from .token_budget_review import TokenBudgetReviewStore
+
+            TokenBudgetReviewStore(database, job_id).initialize(report.token_overflows)
+
+        # Every issue is visible in the control plane before the job can enter
+        # a waiting state. Keep prior rows for audit; recovery attempts get a
+        # distinct issue id and the durable event cursor preserves history.
+        for report_issue in report.issues:
+            database.create_issue(
+                job_id,
+                module_id=report_issue.module_id,
+                code=report_issue.code,
+                severity=report_issue.severity,
+                blocking=report_issue.blocking,
+                message=report_issue.message,
+                sample_id=report_issue.sample_id,
+            )
+
     blocking = [issue for issue in report.issues if issue.blocking]
     if blocking:
         # Fail closed: a blocking issue must not produce a half-written dataset.
         journal.append({"event": "commit_skipped", "blocking_issues": len(blocking)})
+        finish_pipeline_stage("failed", processed=report.exported_samples)
         _write_issue_log(workspace, report)
         return report
 
+    # In production a review-gated run must leave all output in the private
+    # staging tree.  The API resumes this checkpoint after Count/Token review
+    # and performs the sole commit then.  Direct callers (the deterministic
+    # offline tests and CLI) retain the historical immediate-commit behaviour.
+    if database is not None and job_id is not None:
+        from .count_review import CountReviewStore
+        from .token_budget_review import TokenBudgetReviewStore
+
+        if (
+            (config.count_review.get("enabled") and CountReviewStore(database, job_id).pending_count())
+            or (
+                config.token_budget.get("enabled")
+                and TokenBudgetReviewStore(database, job_id).unresolved_count()
+            )
+        ):
+            journal.append({"event": "commit_deferred_for_review"})
+            finish_pipeline_stage("skipped", processed=report.exported_samples, checkpoint={"waiting_review": True})
+            _write_issue_log(workspace, report)
+            return report
+
+    if config.work_mode == "in_place" and report.backup_path:
+        drift = verify_annotation_backup_baseline(Path(report.backup_path), dataset_root)
+        if drift:
+            drift_issue = StageIssue(
+                    sample_id=None,
+                    relative_image_path=None,
+                    module_id="commit",
+                    code="baseline_drift",
+                    message=f"dataset changed after backup: {', '.join(drift[:10])}",
+                    blocking=True,
+                )
+            report.issues.append(drift_issue)
+            if database is not None and job_id is not None:
+                database.create_issue(
+                    job_id,
+                    module_id=drift_issue.module_id,
+                    code=drift_issue.code,
+                    severity=drift_issue.severity,
+                    blocking=drift_issue.blocking,
+                    message=drift_issue.message,
+                )
+            journal.append({"event": "commit_skipped", "reason": "baseline_drift"})
+            finish_pipeline_stage("failed", processed=report.exported_samples, checkpoint={"reason": "baseline_drift"})
+            _write_issue_log(workspace, report)
+            return report
+
+    current_state = control_state()
+    if current_state in {"pausing", "paused", "cancelling", "cancelled", "interrupted"}:
+        journal.append({"event": "commit_skipped", "reason": current_state})
+        finish_pipeline_stage("skipped", processed=report.exported_samples, checkpoint={"control_state": current_state})
+        _write_issue_log(workspace, report)
+        return report
+
+    if database is not None and job_id is not None and current_state in {"running", "queued"}:
+        database.update_job_status(job_id, "committing", expected_status=current_state)
+
     dataset_root.mkdir(parents=True, exist_ok=True)
     report.committed_files = commit_staged_files(dataset_root, staging, staged, journal)
+    if database is not None and job_id is not None and hasattr(database, "record_artifact"):
+        for item in staged:
+            database.record_artifact(
+                job_id,
+                kind="staged_export",
+                relative_path=item.relative_path,
+                sha256=item.sha256,
+                size_bytes=item.size,
+            )
+    finish_pipeline_stage("completed", processed=report.exported_samples)
     _write_issue_log(workspace, report)
     return report
 

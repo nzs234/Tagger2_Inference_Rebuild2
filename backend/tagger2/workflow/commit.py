@@ -162,6 +162,36 @@ def restore_annotation_backup(backup_zip: Path, dataset_root: Path) -> int:
     return restored
 
 
+def verify_annotation_backup_baseline(backup_zip: Path, dataset_root: Path) -> list[str]:
+    """Return relative annotation paths changed since the backup was made."""
+
+    backup = Path(backup_zip)
+    root = Path(dataset_root)
+    if not backup.is_file() or not root.is_dir():
+        raise CommitError("backup baseline is unavailable")
+    drift: list[str] = []
+    with zipfile.ZipFile(backup) as archive:
+        if archive.testzip() is not None or "manifest.jsonl" not in archive.namelist():
+            raise CommitError("backup verification failed")
+        with archive.open("manifest.jsonl") as manifest:
+            for raw in manifest:
+                entry = json.loads(raw.decode("utf-8"))
+                relative = _safe_relative(str(entry["path"]))
+                target = root / Path(relative.replace("/", os.sep))
+                exists = bool(entry.get("exists"))
+                if not exists:
+                    if target.exists():
+                        drift.append(relative)
+                    continue
+                if (
+                    not target.is_file()
+                    or target.stat().st_size != int(entry.get("size", -1))
+                    or sha256_file(target) != str(entry.get("sha256", ""))
+                ):
+                    drift.append(relative)
+    return drift
+
+
 def _atomic_write(target: Path, data: bytes) -> Path:
     target.parent.mkdir(parents=True, exist_ok=True)
     handle, temporary = tempfile.mkstemp(
@@ -211,9 +241,17 @@ class ExportStaging:
 class CommitJournal:
     """Append-only record of a commit so it can be replayed or rolled back."""
 
-    def __init__(self, journal_path: Path):
+    def __init__(
+        self,
+        journal_path: Path,
+        *,
+        database: Any | None = None,
+        job_id: str | None = None,
+    ):
         self.journal_path = Path(journal_path)
         self.journal_path.parent.mkdir(parents=True, exist_ok=True)
+        self.database = database
+        self.job_id = job_id
 
     def append(self, event: dict[str, object]) -> None:
         record = dict(event)
@@ -222,6 +260,12 @@ class CommitJournal:
             stream.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
             stream.flush()
             os.fsync(stream.fileno())
+        if self.database is not None and self.job_id is not None:
+            self.database.record_commit_journal(
+                self.job_id,
+                str(record.get("event", "unknown")),
+                payload={key: value for key, value in record.items() if key != "at"},
+            )
 
     def entries(self) -> list[dict[str, object]]:
         if not self.journal_path.is_file():
@@ -373,6 +417,7 @@ __all__ = [
     "StagedFile",
     "commit_staged_files",
     "restore_annotation_backup",
+    "verify_annotation_backup_baseline",
     "sha256_bytes",
     "sha256_file",
     "write_annotation_backup",

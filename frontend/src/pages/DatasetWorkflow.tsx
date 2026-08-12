@@ -1,11 +1,15 @@
 ﻿import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   AlertTriangle,
+  Archive,
   CheckCircle2,
   Database,
   Pause,
   Play,
   RefreshCw,
+  RotateCcw,
+  Square,
+  Undo2,
   Upload,
   Wrench,
 } from 'lucide-react'
@@ -221,8 +225,32 @@ export function DatasetWorkflow() {
   })
 
   const jobAction = useMutation({
-    mutationFn: (action: 'pause' | 'resume') =>
+    mutationFn: (action: 'pause' | 'resume' | 'cancel' | 'recover') =>
       api.workflowJobAction(selectedJobId as string, action),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ['workflow', 'jobs'] })
+    },
+    onError: (error: Error) => setCountError(error.message),
+  })
+
+  const startJob = useMutation({
+    mutationFn: () => api.workflowStartJob(selectedJobId as string),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ['workflow', 'jobs'] })
+    },
+    onError: (error: Error) => setCountError(error.message),
+  })
+
+  const restoreJob = useMutation({
+    mutationFn: () => api.workflowRestoreJob(selectedJobId as string),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ['workflow', 'jobs'] })
+    },
+    onError: (error: Error) => setCountError(error.message),
+  })
+
+  const discardJob = useMutation({
+    mutationFn: () => api.workflowDiscardJob(selectedJobId as string),
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: ['workflow', 'jobs'] })
     },
@@ -527,7 +555,12 @@ export function DatasetWorkflow() {
               >
                 <option value="">—</option>
                 {(resources.data ?? [])
-                  .filter((resource) => resource.category === 'replace')
+                  // Existing catalogs use `replacement_index`; older imports
+                  // used `replace`. Both are valid replacement resources.
+                  .filter(
+                    (resource) =>
+                      resource.category === 'replace' || resource.category === 'replacement_index',
+                  )
                   .map((resource) => (
                     <option key={resource.resource_id} value={resource.resource_id}>
                       {resource.resource_id}
@@ -662,6 +695,15 @@ export function DatasetWorkflow() {
           {countError && <Notice tone="danger">{countError}</Notice>}
           <div className="workflow-actions">
             <StatusBadge state={selectedJob.status} />
+            {selectedJob.status === 'pending' && (
+              <Button
+                onClick={() => startJob.mutate()}
+                disabled={startJob.isPending}
+              >
+                <Play size={15} aria-hidden="true" />
+                {text.startJob}
+              </Button>
+            )}
             {selectedJob.status === 'running' && (
               <Button
                 variant="secondary"
@@ -676,6 +718,54 @@ export function DatasetWorkflow() {
               <Button onClick={() => jobAction.mutate('resume')} disabled={jobAction.isPending}>
                 <Play size={15} aria-hidden="true" />
                 {text.resumeJob}
+              </Button>
+            )}
+            {[
+              'queued',
+              'running',
+              'waiting_count_review',
+              'waiting_token_review',
+              'pausing',
+              'paused',
+            ].includes(selectedJob.status) && (
+              <Button
+                variant="danger"
+                onClick={() => jobAction.mutate('cancel')}
+                disabled={jobAction.isPending}
+              >
+                <Square size={14} aria-hidden="true" />
+                {text.cancelJob}
+              </Button>
+            )}
+            {['interrupted', 'failed', 'rollback_required'].includes(selectedJob.status) && (
+              <Button
+                variant="secondary"
+                onClick={() => jobAction.mutate('recover')}
+                disabled={jobAction.isPending}
+              >
+                <RotateCcw size={15} aria-hidden="true" />
+                {text.recoverJob}
+              </Button>
+            )}
+            {selectedJob.work_mode === 'in_place' &&
+              ['completed', 'failed', 'cancelled', 'interrupted', 'rollback_required'].includes(selectedJob.status) && (
+                <Button
+                  variant="outline"
+                  onClick={() => restoreJob.mutate()}
+                  disabled={restoreJob.isPending}
+                >
+                  <Undo2 size={15} aria-hidden="true" />
+                  {text.restoreJob}
+                </Button>
+              )}
+            {['completed', 'failed', 'cancelled', 'interrupted', 'rollback_required'].includes(selectedJob.status) && (
+              <Button
+                variant="quiet"
+                onClick={() => discardJob.mutate()}
+                disabled={discardJob.isPending}
+              >
+                <Archive size={15} aria-hidden="true" />
+                {text.discardJob}
               </Button>
             )}
             <Button
@@ -971,5 +1061,3 @@ export function DatasetWorkflow() {
     </div>
   )
 }
-
-
