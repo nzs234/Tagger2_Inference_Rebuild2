@@ -451,6 +451,41 @@ def test_count_review_rejects_stale_version_and_bad_input(workflow_client):
     assert refused.json()["code"] == "count_review_not_confirmed"
 
 
+def test_review_confirm_requires_waiting_checkpoint_for_v2(workflow_client):
+    """A V2 review cannot be confirmed from a draft/pending job."""
+
+    client, root, _input_root = workflow_client
+    runtime = client.app.state.runtime
+    job_id = _seed_count_review(client, root, runtime)
+    job = runtime.workflow_database.get_job(job_id)
+    payload = json.loads(job["config_json"])
+    payload["schema_version"] = 2
+    payload["count_review"] = {"enabled": True}
+    with runtime.workflow_database.connection() as conn:
+        conn.execute(
+            "UPDATE workflow_jobs SET config_version = 2, config_json = ? WHERE job_id = ?",
+            (json.dumps(payload), job_id),
+        )
+
+    # Complete the rows, but leave the lifecycle in pending.  The review gate
+    # must refuse the confirm rather than requeue work from an arbitrary state.
+    client.post(
+        f"/api/v1/workflows/jobs/{job_id}/count-review/resolve-batch",
+        json={
+            "items": [
+                {"sample_id": 0, "expected_version": 1, "count": "solo"},
+                {"sample_id": 1, "expected_version": 1, "count": "duo"},
+            ]
+        },
+    )
+    response = client.post(
+        f"/api/v1/workflows/jobs/{job_id}/count-review/confirm",
+        json={"confirmed": True},
+    )
+    assert response.status_code == 409
+    assert response.json()["code"] == "review_not_waiting"
+
+
 def test_count_review_unknown_job_is_404(workflow_client):
     client, _root, _input_root = workflow_client
     response = client.get("/api/v1/workflows/jobs/nope/count-review")

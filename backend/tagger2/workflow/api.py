@@ -638,19 +638,80 @@ def create_workflow_router(
         background_tasks.add_task(_execute_job_async, job_id)
         return queued
 
-    async def _requeue_after_review(job_id: str, background_tasks: BackgroundTasks) -> str:
-        """Re-enter the worker after a review checkpoint is complete."""
+    def _review_gate(job_id: str, section: str, waiting_status: str) -> bool:
+        """Validate the immutable review gate before a confirm transition.
+
+        Review rows can exist in old databases (and in operator-created test
+        fixtures) even when the corresponding stage is disabled.  Their
+        presence must not turn a disabled stage into an implicit gate.  The
+        status check is deliberately performed here, before reading the review
+        rows, so a confirm request can never requeue a job from ``pending`` or
+        a different checkpoint.
+        """
+
+        _lifecycle_obj, job = _lifecycle(job_id)
+        try:
+            payload = json.loads(str(job["config_json"]))
+        except (TypeError, json.JSONDecodeError):
+            payload = None
+        configured = payload.get(section) if isinstance(payload, dict) else None
+        # A V1 job predates the explicit review sections.  Keep that read-only
+        # compatibility path for old operator fixtures, but every V2 snapshot
+        # must carry an explicit ``enabled`` flag and the waiting checkpoint.
+        # Config rows created before the V2 contract do not have a review
+        # section.  Keep their read-only review endpoints usable for migration
+        # tooling, while treating a V2 row with a missing section as disabled.
+        legacy = configured is None and int(job.get("config_version") or 1) < 2
+        enabled = legacy or (
+            isinstance(configured, dict) and configured.get("enabled") is True
+        )
+        if not enabled:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "review_disabled",
+                    "message": f"{section} review is disabled for this job",
+                    "fields": {"stage": section},
+                },
+            )
+
+        status = str(job["status"])
+        if not legacy and status != waiting_status:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "review_not_waiting",
+                    "message": f"{section} review can only be confirmed while the job is waiting",
+                    "fields": {"stage": section, "expected_status": waiting_status},
+                },
+            )
+        return not legacy
+
+    async def _requeue_after_review(
+        job_id: str,
+        background_tasks: BackgroundTasks,
+        *,
+        expected_status: str | None,
+    ) -> str:
+        """CAS a waiting review checkpoint back into the execution queue.
+
+        The caller has already validated the review rows.  Re-reading the job
+        and requiring the exact waiting status here closes the race where a
+        worker (or a second reviewer) changes the job between that validation
+        and the lifecycle transition.
+        """
+
+        from .lifecycle import LifecycleError
 
         lifecycle, job = _lifecycle(job_id)
         status = str(job["status"])
-        if status not in {"waiting_count_review", "waiting_token_review", "paused"}:
-            return status
-        from .lifecycle import LifecycleError
-
-        try:
-            queued = lifecycle.transition("queued")
-        except LifecycleError:
-            queued = lifecycle.transition("running")
+        if expected_status is not None and status != expected_status:
+            raise LifecycleError(
+                f"review checkpoint changed from {expected_status!r} to {status!r}"
+            )
+        # JobLifecycle.transition uses update_job_status(... expected_status=...)
+        # so this is a compare-and-set, not a read-then-write transition.
+        queued = lifecycle.transition("queued")
         background_tasks.add_task(_execute_job_async, job_id)
         return queued
     
@@ -961,6 +1022,37 @@ def create_workflow_router(
                     "message": "Dataset root is no longer registered",
                 },
             ) from exc
+
+        restore_started = False
+        restore_operation_key = f"restore:{job_id}:{backup_zip.name}"
+
+        def _mark_restore_failed() -> None:
+            """Leave a failed restore retryable without retaining its lock."""
+
+            try:
+                database.update_job_status(
+                    job_id,
+                    "rollback_required",
+                    error="restore_failed",
+                    expected_status="restoring",
+                )
+            except Exception:  # noqa: BLE001, S110
+                pass
+            try:
+                database.record_operation(
+                    job_id,
+                    "restore",
+                    idempotency_key=restore_operation_key,
+                    status="failed",
+                    payload={"code": "restore_failed"},
+                )
+                database.record_event(job_id, "restore_failed", payload={"code": "restore_failed"})
+            except Exception:  # noqa: BLE001, S110
+                pass
+            try:
+                database.release_dataset_locks(job_id)
+            except Exception:  # noqa: BLE001, S110
+                pass
         
         try:
             # Serialize Restore against new starts. The terminal job released
@@ -971,6 +1063,7 @@ def create_workflow_router(
                     status_code=409,
                     detail={"code": "restore_locked", "message": "dataset is busy"},
                 )
+            restore_started = True
             if not database.update_job_status(job_id, "restoring", expected_status="queued"):
                 database.release_dataset_locks(job_id)
                 raise HTTPException(
@@ -981,28 +1074,47 @@ def create_workflow_router(
             database.record_operation(
                 job_id,
                 "restore",
-                idempotency_key=f"restore:{job_id}:{backup_zip.stat().st_mtime_ns}",
+                idempotency_key=restore_operation_key,
                 payload={"restored_files": restored_count},
             )
             database.record_event(job_id, "restore_completed", payload={"restored_files": restored_count})
-            database.update_job_status(job_id, "completed", expected_status="restoring")
+            if not database.update_job_status(job_id, "completed", expected_status="restoring"):
+                raise CommitError("restore state changed before completion")
+            # ``completed`` normally releases these rows in the database CAS;
+            # keep this explicit so the contract survives older DB adapters.
+            database.release_dataset_locks(job_id)
             return {
                 "job_id": job_id,
                 "root_id": root_id,
                 "restored_files": restored_count,
             }
         except CommitError as exc:
-            database.update_job_status(job_id, "rollback_required", expected_status="restoring")
+            if restore_started:
+                _mark_restore_failed()
             raise HTTPException(
                 status_code=500,
                 detail={
                     "code": "restore_failed",
-                    "message": str(exc)
+                    "message": "restore failed; recovery is required",
                 }
             ) from exc
         except HTTPException:
-            database.release_dataset_locks(job_id)
+            # Only release a lock acquired by this request.  If start_job lost
+            # the CAS race, another restore/recovery may own the job's lock;
+            # releasing it here would silently un-serialize that operation.
+            if restore_started:
+                database.release_dataset_locks(job_id)
             raise
+        except Exception as exc:  # noqa: BLE001
+            if restore_started:
+                _mark_restore_failed()
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "code": "restore_failed",
+                    "message": "restore failed; recovery is required",
+                },
+            ) from exc
 
     @router.post("/jobs/{job_id}/discard")
     async def discard_job(job_id: str) -> dict[str, Any]:
@@ -1169,6 +1281,7 @@ def create_workflow_router(
     ) -> dict[str, Any]:
         """Gate export on an explicit confirmation with nothing left pending."""
         from .count_review import CountReviewError
+        from .lifecycle import LifecycleError
 
         if not request.confirmed:
             raise HTTPException(
@@ -1178,6 +1291,7 @@ def create_workflow_router(
                     "message": "explicit count review confirmation is required",
                 },
             )
+        strict_gate = _review_gate(job_id, "count_review", "waiting_count_review")
         store = _count_store(job_id)
         try:
             store.assert_ready_for_export()
@@ -1186,7 +1300,29 @@ def create_workflow_router(
                 status_code=409,
                 detail={"code": "count_review_incomplete", "message": str(exc)},
             ) from exc
-        status = await _requeue_after_review(job_id, background_tasks)
+        if not strict_gate:
+            # V1/operator fixtures may have review rows without a persisted
+            # review section.  They are read-only compatibility records; do
+            # not enqueue a pending job without the authoritative start lock.
+            current = database.get_job(job_id)
+            return {
+                "job_id": job_id,
+                "confirmed": True,
+                "pending": 0,
+                "status": str(current["status"]) if current else "pending",
+            }
+        try:
+            status = await _requeue_after_review(
+                job_id,
+                background_tasks,
+                expected_status="waiting_count_review",
+            )
+        except LifecycleError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "review_state_conflict", "message": str(exc)},
+            ) from exc
+        database.record_event(job_id, "count_review_confirmed", payload={"pending": 0})
         return {"job_id": job_id, "confirmed": True, "pending": 0, "status": status}
 
 
@@ -1262,6 +1398,7 @@ def create_workflow_router(
         background_tasks: BackgroundTasks,
     ) -> dict[str, Any]:
         """Gate export on every overflow having been applied."""
+        from .lifecycle import LifecycleError
         from .token_budget_review import TokenBudgetReviewError
 
         if not request.confirmed:
@@ -1272,6 +1409,7 @@ def create_workflow_router(
                     "message": "explicit token budget review confirmation is required",
                 },
             )
+        strict_gate = _review_gate(job_id, "token_budget", "waiting_token_review")
         store = _token_store(job_id)
         try:
             store.assert_ready_for_export()
@@ -1280,7 +1418,26 @@ def create_workflow_router(
                 status_code=409,
                 detail={"code": "token_review_incomplete", "message": str(exc)},
             ) from exc
-        status = await _requeue_after_review(job_id, background_tasks)
+        if not strict_gate:
+            current = database.get_job(job_id)
+            return {
+                "job_id": job_id,
+                "confirmed": True,
+                "unresolved": 0,
+                "status": str(current["status"]) if current else "pending",
+            }
+        try:
+            status = await _requeue_after_review(
+                job_id,
+                background_tasks,
+                expected_status="waiting_token_review",
+            )
+        except LifecycleError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "review_state_conflict", "message": str(exc)},
+            ) from exc
+        database.record_event(job_id, "token_review_confirmed", payload={"unresolved": 0})
         return {"job_id": job_id, "confirmed": True, "unresolved": 0, "status": status}
     @router.post("/jobs/preflight")
     async def preflight_job(config: dict[str, Any]) -> dict[str, Any]:

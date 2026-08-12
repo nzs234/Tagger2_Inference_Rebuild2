@@ -25,11 +25,16 @@ unimplemented.
 
 ## Verification
 
-- Backend: `402 passed, 2 skipped`.
+- Backend: `407 passed, 1 skipped`.
 - Frontend: `38 passed`; ESLint and TypeScript/Vite build pass.
 - Workflow mypy gate (the changed workflow modules): pass.
 - Explicit Ruff gate (`E4`, `E7`, `E9`, `F`): pass.
 - Source algorithm port guard: `17 passed`.
+- Updated real/API smoke: 20 randomly selected image+JSON pairs from the
+  user-provided training-set folder completed `pending -> queued -> completed`;
+  60 files were exported with zero failures/issues. Legacy `{tag,nl}` sidecars
+  were normalized to canonical `tags`; all 20 output JSON files had non-empty
+  tags. The source directory remained read-only.
 - Real-material smoke: 5 randomly sampled image+JSON pairs from
   `E:\琥珀训练集预备` exported 15 files with `failed=0` and no issues. The
   source directory was read-only; samples were copied to a temporary directory.
@@ -42,6 +47,8 @@ unimplemented.
   errors; this is not claimed as a release-gate pass.
 - Real e621 classification snapshot, replacement index, tokenizer and CPU OCR
   runtime are not bundled. Missing resources must report `blocked_resource`.
-- Stage-run persistence is currently aggregate pipeline-level; per-stage and
-  per-batch orchestrator records, long-lived SSE, 100k pressure/chaos tests,
-  and real OCR/GPU acceptance remain future work.
+- Stage-run persistence currently covers pipeline/import/export/review with
+  checkpoints; finer per-module/per-batch orchestration, long-lived SSE,
+  pressure/chaos tests, and real OCR/GPU acceptance remain future work.
+- Pressure/chaos testing was intentionally skipped for this delivery pass per
+  request; only the small real-material flow gate was required.

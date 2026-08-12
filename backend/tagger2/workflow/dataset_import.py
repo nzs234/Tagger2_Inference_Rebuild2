@@ -188,7 +188,26 @@ def classify_annotation(
                 raise ImportError_(f"annotation JSON is invalid: {exc}") from exc
             if not isinstance(document, dict):
                 raise ImportError_("annotation JSON root is not an object")
+            # Older Tagger exports use a singular comma-separated ``tag``
+            # field.  Normalize it at the import boundary so the rest of the
+            # pipeline only handles the public nine-field ``tags`` field.
+            # Keep an explicit ``tags`` value authoritative when both forms
+            # are present.
+            if isinstance(document.get("tags"), str):
+                document["tags"] = list(_parse_tag_txt(str(document["tags"])))
+            elif not document.get("tags") and "tag" in document:
+                legacy_tags = document.get("tag")
+                if isinstance(legacy_tags, str):
+                    document["tags"] = list(_parse_tag_txt(legacy_tags))
+                elif isinstance(legacy_tags, (list, tuple)):
+                    document["tags"] = [
+                        str(value).strip()
+                        for value in legacy_tags
+                        if str(value).strip()
+                    ]
             payload["document"] = document
+            payload["tags"] = document.get("tags", ())
+            payload["nl"] = str(document.get("nl", ""))
             return "standard_json", payload
 
     if txt_path.is_file():

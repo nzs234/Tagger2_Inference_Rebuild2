@@ -137,6 +137,25 @@ def test_import_nl_txt_mode_writes_nl_not_tags():
         assert sample.skip_caption is False
 
 
+def test_import_normalizes_legacy_tag_json():
+    """Legacy ``{tag, nl}`` sidecars feed the canonical nine-field adapter."""
+    from backend.tagger2.workflow.dataset_import import import_dataset
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+        _write_image(root / "legacy.png")
+        (root / "legacy.json").write_text(
+            json.dumps({"tag": "wolf, blue eyes, wolf", "nl": "A wolf."}),
+            encoding="utf-8",
+        )
+
+        result = import_dataset(root, recursive=False)
+        (sample,) = result.samples
+        assert sample.annotation_kind == "standard_json"
+        assert sample.tags == ("wolf", "blue eyes")
+        assert sample.nl == "A wolf."
+
+
 def test_import_rejects_corrupt_raw_e621_json_without_fallback():
     """A malformed raw e621 document blocks that sample instead of falling back."""
     from backend.tagger2.workflow.dataset_import import import_dataset
@@ -178,6 +197,31 @@ def test_import_rejects_multi_frame_and_unsupported_images():
         assert [sample.relative_image_path for sample in result.samples] == ["ok.png"]
         assert [issue.code for issue in result.issues] == ["image_invalid"]
         assert "notes.md" in result.skipped_files
+
+
+def test_pipeline_stage_tracker_closes_running_stage_on_exception():
+    """A failed pipeline cannot leave its durable stage row running."""
+    from backend.tagger2.workflow.pipeline import _StageRunTracker
+
+    class FakeDatabase:
+        def __init__(self):
+            self.calls = []
+
+        def record_stage_run(self, job_id, stage_id, **kwargs):
+            run_id = kwargs.get("run_id", f"{stage_id}-run")
+            self.calls.append((job_id, stage_id, run_id, kwargs["status"], kwargs.get("checkpoint")))
+            return run_id
+
+    database = FakeDatabase()
+    tracker = _StageRunTracker(database, "job-1")
+    tracker.begin("import", checkpoint={"checkpoint": "discovering"})
+    tracker.close_open()
+
+    assert [call[3] for call in database.calls] == ["running", "failed"]
+    assert database.calls[-1][4] == {
+        "checkpoint": "aborted",
+        "reason": "pipeline_exit",
+    }
 
 
 def test_offline_pipeline_full_copy_exports_json_and_flat_txt():

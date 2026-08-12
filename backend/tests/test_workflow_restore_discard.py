@@ -113,6 +113,32 @@ def test_restore_targets_source_root_for_in_place(env):
     assert (env["source"] / "a.json").read_bytes() == ORIGINAL
 
 
+def test_restore_failure_is_retryable_and_releases_dataset_lock(env, monkeypatch):
+    """A failed restore parks the job for recovery without retaining its lock."""
+
+    from tagger2.workflow.commit import CommitError
+
+    job_id, workspace = _job(env, work_mode="in_place")
+    _seed_backup(env["source"], workspace)
+    _finish(env["database"], job_id)
+
+    def fail_restore(*_args, **_kwargs):
+        raise CommitError("simulated restore failure")
+
+    monkeypatch.setattr("tagger2.workflow.commit.restore_annotation_backup", fail_restore)
+    response = env["client"].post(f"/api/v1/workflows/jobs/{job_id}/restore")
+
+    assert response.status_code == 500
+    assert response.json()["detail"]["code"] == "restore_failed"
+    assert env["database"].get_job(job_id)["status"] == "rollback_required"
+    with env["database"].connection() as conn:
+        lock = conn.execute(
+            "SELECT released_at FROM workflow_dataset_locks WHERE job_id = ?",
+            (job_id,),
+        ).fetchone()
+    assert lock is None or lock["released_at"] is not None
+
+
 def test_restore_without_backup_is_404(env):
     job_id, _workspace = _job(env)
     _finish(env["database"], job_id)

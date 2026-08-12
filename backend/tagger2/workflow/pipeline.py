@@ -134,6 +134,92 @@ class PipelineReport:
         }
 
 
+class _StageRunTracker:
+    """Keep durable stage-run rows out of the ``running`` state."""
+
+    _TERMINAL = {"completed", "failed", "skipped"}
+
+    def __init__(self, database: Any | None, job_id: str | None) -> None:
+        self.database = database
+        self.job_id = job_id
+        self._open: dict[str, str] = {}
+
+    @property
+    def enabled(self) -> bool:
+        return (
+            self.database is not None
+            and self.job_id is not None
+            and hasattr(self.database, "record_stage_run")
+        )
+
+    def begin(
+        self,
+        stage_id: str,
+        *,
+        total: int = 0,
+        checkpoint: dict[str, Any] | None = None,
+    ) -> str | None:
+        database = self.database
+        job_id = self.job_id
+        if database is None or job_id is None or not hasattr(database, "record_stage_run"):
+            return None
+        run_id = database.record_stage_run(
+            job_id,
+            stage_id,
+            status="running",
+            total=total,
+            checkpoint=checkpoint,
+        )
+        self._open[stage_id] = run_id
+        return run_id
+
+    def update(
+        self,
+        stage_id: str,
+        status: str,
+        *,
+        total: int = 0,
+        processed: int = 0,
+        issue_count: int = 0,
+        checkpoint: dict[str, Any] | None = None,
+    ) -> None:
+        database = self.database
+        job_id = self.job_id
+        if database is None or job_id is None or not hasattr(database, "record_stage_run"):
+            return
+        run_id = self._open.get(stage_id)
+        if run_id is None:
+            run_id = self.begin(stage_id, total=total, checkpoint=checkpoint)
+        if run_id is None:
+            return
+        database.record_stage_run(
+            job_id,
+            stage_id,
+            status=status,
+            run_id=run_id,
+            total=total,
+            processed=processed,
+            issue_count=issue_count,
+            checkpoint=checkpoint,
+        )
+        if status in self._TERMINAL:
+            self._open.pop(stage_id, None)
+
+    def close_open(self, *, status: str = "failed") -> None:
+        """Close rows left open by an exception or an early return."""
+
+        for stage_id in tuple(self._open):
+            try:
+                self.update(
+                    stage_id,
+                    status,
+                    checkpoint={"checkpoint": "aborted", "reason": "pipeline_exit"},
+                )
+            except Exception:  # noqa: BLE001
+                # Cleanup must never replace the original pipeline exception.
+                self._open.pop(stage_id, None)
+
+
 def _display_policy(config: WorkflowJobConfigV1) -> CaptionDisplayPolicy:
     caption = config.caption
     return CaptionDisplayPolicy(
@@ -199,7 +285,7 @@ def _parse_policy_config(config_arg: dict[str, Any] | PolicyConfig) -> PolicyCon
     )
 
 
-def run_offline_pipeline(
+def _run_offline_pipeline_impl(
     config: WorkflowJobConfigV1,
     *,
     source_root: Path,
@@ -219,6 +305,7 @@ def run_offline_pipeline(
     # are durable before a commit is attempted.
     database: Any | None = None,
     job_id: str | None = None,
+    stage_tracker: _StageRunTracker | None = None,
 ) -> PipelineReport:
     """Run the deterministic offline vertical and commit its results.
 
@@ -234,26 +321,14 @@ def run_offline_pipeline(
 
     report = PipelineReport(resource_fingerprints=dict(resource_fingerprints or {}))
     policy = _display_policy(config)
-    pipeline_stage_run: str | None = None
-    if database is not None and job_id is not None and hasattr(database, "record_stage_run"):
-        pipeline_stage_run = database.record_stage_run(
-            job_id,
-            "pipeline",
-            status="running",
-        )
+    stage_tracker = stage_tracker or _StageRunTracker(database, job_id)
+    pipeline_stage_run = stage_tracker.begin("pipeline")
 
     def finish_pipeline_stage(status: str, *, processed: int = 0, checkpoint: dict[str, Any] | None = None) -> None:
-        if (
-            database is not None
-            and job_id is not None
-            and pipeline_stage_run is not None
-            and hasattr(database, "record_stage_run")
-        ):
-            database.record_stage_run(
-                job_id,
+        if pipeline_stage_run is not None:
+            stage_tracker.update(
                 "pipeline",
-                status=status,
-                run_id=pipeline_stage_run,
+                status,
                 total=report.total_samples,
                 processed=processed,
                 issue_count=len(report.issues),
@@ -272,18 +347,29 @@ def run_offline_pipeline(
         confirmed_counts = CountReviewStore(database, job_id).confirmed_counts()
         applied_token_texts = TokenBudgetReviewStore(database, job_id).applied_texts()
 
+    import_stage_run = stage_tracker.begin(
+        "import",
+        checkpoint={"checkpoint": "discovering"},
+    )
     imported: ImportResult = import_dataset(
         source_root,
         recursive=config.recursive,
         input_txt_mode=str(config.caption.get("input_txt_mode", "tag")),
     )
     report.total_samples = len(imported.samples)
-    if pipeline_stage_run is not None and database is not None and job_id is not None:
-        database.record_stage_run(
-            job_id,
+    if import_stage_run is not None:
+        stage_tracker.update(
+            "import",
+            "completed",
+            total=report.total_samples,
+            processed=report.total_samples,
+            issue_count=len(imported.issues),
+            checkpoint={"checkpoint": "imported", "sample_count": report.total_samples},
+        )
+    if pipeline_stage_run is not None:
+        stage_tracker.update(
             "pipeline",
-            status="running",
-            run_id=pipeline_stage_run,
+            "running",
             total=report.total_samples,
             checkpoint={"checkpoint": "imported"},
         )
@@ -545,6 +631,10 @@ def run_offline_pipeline(
                 temp_projections[sample.relative_image_path] = {
                     field_name: document.get(field_name) for field_name in NINE_FIELDS
                 }
+                if not temp_projections[sample.relative_image_path]["tags"]:
+                    temp_projections[sample.relative_image_path]["tags"] = list(
+                        sample.tags
+                    )
             else:
                 projection = dict(build_projection(sample))
                 classified = classified_projections.get(sample.relative_image_path)
@@ -593,6 +683,11 @@ def run_offline_pipeline(
             'failed': nl_report.failed,
         }
 
+    export_stage_run = stage_tracker.begin(
+        "export",
+        total=report.total_samples,
+        checkpoint={"checkpoint": "staging"},
+    )
     for sample in imported.samples:
         if control_state() in {"pausing", "paused", "cancelling", "cancelled", "interrupted"}:
             break
@@ -606,6 +701,8 @@ def run_offline_pipeline(
                     key: ([] if value is None and key in {"quality", "appearance", "tags", "environment"} else value)
                     for key, value in projection.items()
                 }
+                if not projection["tags"]:
+                    projection["tags"] = list(sample.tags)
                 projection = {
                     key: ("" if value is None else value) for key, value in projection.items()
                 }
@@ -858,6 +955,27 @@ def run_offline_pipeline(
             )
             report.failed_samples += 1
 
+    if export_stage_run is not None:
+        export_control_state = control_state()
+        export_status = (
+            "skipped"
+            if export_control_state
+            in {"pausing", "paused", "cancelling", "cancelled", "interrupted"}
+            else "completed"
+        )
+        stage_tracker.update(
+            "export",
+            export_status,
+            total=report.total_samples,
+            processed=report.exported_samples,
+            issue_count=len(report.issues),
+            checkpoint={
+                "checkpoint": "staged",
+                "exported_samples": report.exported_samples,
+                "failed_samples": report.failed_samples,
+            },
+        )
+
     report.policy = dict(policy_counts)
     report.token_budget = dict(budget_counts)
     report.replacement = {
@@ -867,6 +985,11 @@ def run_offline_pipeline(
         "keep_rewritten": totals.keep_rewritten,
     }
 
+    review_stage_run = stage_tracker.begin(
+        "review",
+        total=report.total_samples,
+        checkpoint={"checkpoint": "overlay"},
+    )
     if database is not None and job_id is not None:
         # The control plane must reflect stage completion even when the final
         # dataset commit is deferred for review.  A sample marked completed
@@ -979,6 +1102,15 @@ def run_offline_pipeline(
                 message=report_issue.message,
                 sample_id=report_issue.sample_id,
             )
+    if review_stage_run is not None:
+        stage_tracker.update(
+            "review",
+            "completed",
+            total=report.total_samples,
+            processed=report.exported_samples,
+            issue_count=len(report.issues),
+            checkpoint={"checkpoint": "overlay_ready"},
+        )
 
     blocking = [issue for issue in report.issues if issue.blocking]
     if blocking:
@@ -1058,6 +1190,50 @@ def run_offline_pipeline(
     finish_pipeline_stage("completed", processed=report.exported_samples)
     _write_issue_log(workspace, report)
     return report
+
+
+def run_offline_pipeline(
+    config: WorkflowJobConfigV1,
+    *,
+    source_root: Path,
+    output_root: Path,
+    workspace: Path,
+    replacement_index_path: Path | None = None,
+    resource_fingerprints: dict[str, str] | None = None,
+    resource_manifests: Mapping[str, Mapping[str, Any]] | None = None,
+    tag_predictor: TagPredictor | None = None,
+    policy_config: Any | None = None,
+    token_counter: Any | None = None,
+    classification_rules: ClassificationRules | None = None,
+    ocr_engine: OCREngine | None = None,
+    nl_client: NlClient | None = None,
+    database: Any | None = None,
+    job_id: str | None = None,
+) -> PipelineReport:
+    """Run the pipeline and close durable stage rows on every exit path."""
+
+    tracker = _StageRunTracker(database, job_id)
+    try:
+        return _run_offline_pipeline_impl(
+            config,
+            source_root=source_root,
+            output_root=output_root,
+            workspace=workspace,
+            replacement_index_path=replacement_index_path,
+            resource_fingerprints=resource_fingerprints,
+            resource_manifests=resource_manifests,
+            tag_predictor=tag_predictor,
+            policy_config=policy_config,
+            token_counter=token_counter,
+            classification_rules=classification_rules,
+            ocr_engine=ocr_engine,
+            nl_client=nl_client,
+            database=database,
+            job_id=job_id,
+            stage_tracker=tracker,
+        )
+    finally:
+        tracker.close_open()
 
 
 def _write_issue_log(workspace: Path, report: PipelineReport) -> None:
