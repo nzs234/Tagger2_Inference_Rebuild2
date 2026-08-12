@@ -186,7 +186,8 @@ carries a warning that its resources are not bundled.
 
 ### Still not built
 
-- SSE event stream for workflow jobs (status is polled instead).
+- Long-lived SSE event streaming for workflow jobs (the UI currently uses the
+  replayable JSON event cursor, with reconnect and generation guards).
 - Automated download of the official snapshots. Import is a local, explicit
   step; nothing is fetched over the network on the project's behalf.
 - Danbooru-specific replacement and count resources. The profile is selectable
