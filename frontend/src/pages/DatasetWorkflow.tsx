@@ -136,6 +136,9 @@ export function DatasetWorkflow() {
         ? { enabled: true, min_confidence: draft.ocrMinConfidence }
         : { enabled: false },
       nl: { enabled: false },
+      // Production UI jobs always stop at the explicit Count Review gate.
+      // Legacy/API callers may opt out for deterministic compatibility tests.
+      count_review: { enabled: true },
       token_budget: { enabled: false },
       export: { format: draft.exportFormat },
     }
