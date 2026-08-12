@@ -31,7 +31,7 @@ def test_schema_v2_adds_lease_columns():
     """Lease bookkeeping exists so an interrupted sample is detectable."""
     from backend.tagger2.workflow.db_schema import SCHEMA_VERSION
 
-    assert SCHEMA_VERSION == 2
+    assert SCHEMA_VERSION == 3
 
     with tempfile.TemporaryDirectory() as tmpdir:
         database, job_id, _workspace, _lifecycle = _setup(tmpdir)

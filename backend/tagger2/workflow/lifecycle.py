@@ -1,4 +1,4 @@
-"""Job lifecycle: pause, resume, lease expiry and interrupted-run repair.
+﻿"""Job lifecycle: pause, resume, lease expiry and interrupted-run repair.
 
 A workflow job is resumable because three things are durable: the immutable input
 manifest, the per-sample status rows, and the commit journal. This module owns the
@@ -21,8 +21,10 @@ from .commit import CommitJournal
 # Terminal states cannot transition further; a paused job resumes to running.
 ALLOWED_JOB_TRANSITIONS: dict[str, frozenset[str]] = {
     "pending": frozenset({"running", "cancelled", "failed"}),
-    "running": frozenset({"paused", "completed", "failed", "cancelled"}),
+    "running": frozenset({"paused", "waiting_count_review", "waiting_token_review", "completed", "failed", "cancelled"}),
     "paused": frozenset({"running", "cancelled", "failed"}),
+    "waiting_count_review": frozenset({"running", "cancelled", "failed"}),
+    "waiting_token_review": frozenset({"running", "cancelled", "failed"}),
     "completed": frozenset(),
     "failed": frozenset({"running"}),
     "cancelled": frozenset(),
@@ -282,3 +284,4 @@ __all__ = [
     "LifecycleError",
     "RepairReport",
 ]
+

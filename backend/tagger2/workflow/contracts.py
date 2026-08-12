@@ -23,6 +23,137 @@ WorkMode = Literal["in_place", "full_copy"]
 OverwriteMode = Literal["incremental", "rebuild"]
 ModuleId = Literal["caption", "classify", "replace", "ocr", "nl", "count_review", "policy", "token_budget", "export"]
 
+# Per-section configuration schema.
+#
+# ``from_payload`` accepts partial sections and merges them onto the dataclass
+# defaults, so validation is declarative rather than a chain of hand-written
+# checks. Each entry is (type, constraint):
+#   bool                     -> must be a real bool, not a truthy string
+#   ("enum", allowed)        -> must be one of ``allowed``
+#   ("num", low, high)       -> int/float within the inclusive range
+#   ("int", low, high)       -> int within the inclusive range
+#   "str"                    -> any string
+#   "str?"                   -> string or None
+_UNIT = ("num", 0.0, 1.0)
+
+SECTION_SCHEMA: dict[str, dict[str, Any]] = {
+    "caption": {
+        "enabled": bool,
+        "resource_id": "str?",
+        "threshold_mode": ("enum", ("model_default", "manual")),
+        "threshold": ("num", 0.0, 1.0),
+        "overwrite_txt": bool,
+        "input_txt_mode": ("enum", ("tag", "nl")),
+    },
+    "classify": {
+        "enabled": bool,
+        "resource_id": "str?",
+        "overwrite_json": bool,
+        "overwrite_count": bool,
+    },
+    "replace": {
+        "enabled": bool,
+        "resource_id": "str?",
+    },
+    "ocr": {
+        "enabled": bool,
+        "resource_id": "str?",
+        "min_confidence": _UNIT,
+        "force_reprocess": bool,
+    },
+    "nl": {
+        "enabled": bool,
+        "reuse_original_nl": bool,
+        "api_enabled": bool,
+        "use_image": bool,
+        "use_full_json": bool,
+        "prompt_preset": "str",
+        "length": ("enum", ("short", "medium", "long")),
+    },
+    "count_review": {
+        "enabled": bool,
+    },
+    "policy": {
+        "enabled": bool,
+        "seed": "str",
+        "directory_to_artist": bool,
+        "artist_dropout": _UNIT,
+        "quality_dropout": _UNIT,
+        "appearance_nl_solo_drop_nl": _UNIT,
+        "appearance_nl_solo_drop_appearance": _UNIT,
+        "appearance_nl_non_solo_drop_nl": _UNIT,
+        "appearance_nl_non_solo_drop_appearance": _UNIT,
+    },
+    "token_budget": {
+        "enabled": bool,
+        "tokenizer_resource_id": "str?",
+        "max_tokens": ("int", 1, 32768),
+    },
+    "export": {
+        "format": ("enum", ("json", "flat_txt", "both")),
+    },
+}
+
+ENUM_FIELDS: dict[str, tuple[str, ...]] = {
+    "profile": ("e621", "danbooru"),
+    "work_mode": ("in_place", "full_copy"),
+    "overwrite_mode": ("incremental", "rebuild"),
+}
+
+
+def _validate_scalar(section: str, key: str, value: Any, rule: Any) -> None:
+    """Raise ValueError when ``value`` violates ``rule``."""
+
+    label = f"{section}.{key}" if section else key
+
+    if rule is bool:
+        # bool is a subclass of int, so an explicit type check is required to
+        # reject 1/0 and truthy strings that would silently enable a stage.
+        if not isinstance(value, bool):
+            raise ValueError(f"{label} must be true or false")
+        return
+
+    if rule == "str":
+        if not isinstance(value, str) or not value:
+            raise ValueError(f"{label} must be a non-empty string")
+        return
+
+    if rule == "str?":
+        if value is not None and not isinstance(value, str):
+            raise ValueError(f"{label} must be a string or null")
+        return
+
+    kind = rule[0]
+    if kind == "enum":
+        allowed = rule[1]
+        if value not in allowed:
+            raise ValueError(f"{label} must be one of: {', '.join(map(str, allowed))}")
+        return
+
+    low, high = rule[1], rule[2]
+    if kind == "int":
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(f"{label} must be an integer")
+    else:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"{label} must be a number")
+    if not low <= value <= high:
+        raise ValueError(f"{label} must be between {low} and {high}")
+
+
+def _validate_section(section: str, values: Mapping[str, Any]) -> None:
+    """Reject unknown keys and out-of-contract values inside one section."""
+
+    rules = SECTION_SCHEMA[section]
+    unknown = sorted(set(values) - set(rules))
+    if unknown:
+        raise ValueError(
+            f"unknown {section} fields: {', '.join(unknown)}"
+        )
+    for key, value in values.items():
+        _validate_scalar(section, key, value, rules[key])
+
+
 # Validation patterns
 RESOURCE_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{0,127}$")
 RESOURCE_FINGERPRINT_PATTERN = re.compile(r"^[0-9a-f]{64}$")
@@ -41,6 +172,46 @@ def canonical_json(value: Any) -> str:
 def sha256_json(value: Any) -> str:
     """Compute SHA-256 hash of canonical JSON."""
     return hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()
+
+
+# Nine-field standard annotation structure.
+#
+# This is the canonical output format for workflow jobs. All stages produce
+# projections that conform to this shape, and the export stage validates them
+# before writing JSON/TXT.
+#
+# Field semantics:
+#   quality: rating bucket (e.g., ["safe"], ["questionable"])
+#   count: character count bucket ("solo", "duo", "trio", "group", "")
+#   character: comma-separated character names
+#   series: comma-separated series/copyright names
+#   artist: comma-separated artist names
+#   appearance: appearance tags (e.g., ["blue_eyes", "long_hair"])
+#   tags: general tags (e.g., ["forest", "outdoors"])
+#   environment: environment/setting tags
+#   nl: natural language description
+
+try:
+    from typing import TypedDict
+except ImportError:
+    from typing_extensions import TypedDict  # type: ignore[assignment]
+
+
+class NineFieldAnnotation(TypedDict, total=False):
+    """Type-safe nine-field annotation payload.
+    
+    ``total=False`` allows partial payloads during construction; validation
+    happens at export time via ``normalize_json_bytes``.
+    """
+    quality: list[str]
+    count: str
+    character: str
+    series: str
+    artist: str
+    appearance: list[str]
+    tags: list[str]
+    environment: list[str]
+    nl: str
 
 
 @dataclass(frozen=True)
@@ -208,7 +379,7 @@ class WorkflowJobConfigV1:
     
     # Export configuration
     export: dict[str, Any] = field(default_factory=lambda: {
-        "format": "both",  # "json", "txt", "both"
+        "format": "both",  # "json", "flat_txt", "both"
     })
     
     compatibility_mode: bool = True
@@ -248,21 +419,38 @@ class WorkflowJobConfigV1:
             None if output_root is None else _path_ref(output_root, "output_root")
         )
 
-        for section in (
-            "caption",
-            "classify",
-            "replace",
-            "ocr",
-            "nl",
-            "count_review",
-            "policy",
-            "token_budget",
-            "export",
-        ):
-            if section in values and not isinstance(values[section], Mapping):
-                raise ValueError(f"{section} must be an object")
-            if section in values:
-                values[section] = dict(values[section])
+        for name, allowed in ENUM_FIELDS.items():
+            if name in values and values[name] not in allowed:
+                raise ValueError(
+                    f"{name} must be one of: {', '.join(allowed)}"
+                )
+
+        if "recursive" in values:
+            _validate_scalar("", "recursive", values["recursive"], bool)
+        if "compatibility_mode" in values:
+            _validate_scalar("", "compatibility_mode", values["compatibility_mode"], bool)
+
+        # A partial section is merged onto its defaults so a caller can override
+        # one key without restating the whole block, and the merged result is
+        # validated as a whole.
+        defaults = cls(
+            profile=values.get("profile", "e621"),
+            work_mode=values.get("work_mode", "in_place"),
+            overwrite_mode=values.get("overwrite_mode", "incremental"),
+            source_root=values["source_root"],
+        )
+        for section in SECTION_SCHEMA:
+            supplied = values.get(section)
+            if supplied is None:
+                continue
+            if not isinstance(supplied, Mapping):
+                # ValueError keeps one exception contract for all config problems;
+                # callers catch it alongside TypeError.
+                raise ValueError(f"{section} must be an object")  # noqa: TRY004
+            _validate_section(section, supplied)
+            merged = dict(getattr(defaults, section))
+            merged.update(supplied)
+            values[section] = merged
 
         return cls(**values)
 

@@ -8,6 +8,7 @@ import pytest
 
 def _service(tmp_path: Path):
     from tagger2.security import PathAllowlist
+    from tagger2.workflow.db import WorkflowDatabase
     from tagger2.workflow.preflight import WorkflowPreflightService
     from tagger2.workflow.resources import WorkflowResourceCatalog
 
@@ -21,7 +22,8 @@ def _service(tmp_path: Path):
     allowlist.register(output, kind="output", root_id="out", label="out", writable=True)
 
     catalog = WorkflowResourceCatalog(tmp_path / "resources")
-    return WorkflowPreflightService(allowlist, catalog), catalog
+    db = WorkflowDatabase(":memory:")
+    return WorkflowPreflightService(allowlist, catalog, db), catalog
 
 
 def _config(**overrides):
@@ -175,3 +177,13 @@ def test_unreadable_snapshot_is_blocking(tmp_path: Path):
         service.validate_config(config)
     errors = excinfo.value.details["errors"]
     assert any("cannot be read" in error for error in errors)
+
+
+
+
+
+
+
+
+
+

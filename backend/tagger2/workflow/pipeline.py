@@ -15,6 +15,7 @@ if TYPE_CHECKING:
     from .stages.policy import PolicyConfig
 from dataclasses import dataclass, field
 from pathlib import Path
+from collections.abc import Mapping
 from typing import Any
 
 from .caption_format import (
@@ -30,7 +31,7 @@ from .commit import (
     commit_staged_files,
     write_annotation_backup,
 )
-from .contracts import WorkflowJobConfigV1, canonical_json, utc_now
+from .contracts import NineFieldAnnotation, WorkflowJobConfigV1, canonical_json, utc_now
 from .dataset_import import ImportedSample, ImportResult, import_dataset
 from .replacement_index import load_replacement_rules
 from .ocr import OCREngine, run_ocr_stage
@@ -135,7 +136,7 @@ def _display_policy(config: WorkflowJobConfigV1) -> CaptionDisplayPolicy:
     )
 
 
-def build_projection(sample: ImportedSample) -> dict[str, Any]:
+def build_projection(sample: ImportedSample) -> NineFieldAnnotation:
     """Build the nine-field projection for one imported sample.
 
     A standard JSON annotation is reused as-is; a raw e621 document contributes
@@ -385,7 +386,7 @@ def run_offline_pipeline(
     policy_counts: dict[str, int] = {"artist_dropped": 0, "quality_dropped": 0}
     budget_counts: dict[str, int] = {}
     export_format = str(config.export.get("format", "both"))
-    if export_format not in {"json", "txt", "both"}:
+    if export_format not in {"json", "flat_txt", "both"}:
         raise PipelineError(f"unsupported export format: {export_format!r}")
 
 
@@ -649,7 +650,7 @@ def run_offline_pipeline(
                 staged.append(
                     staging.stage(sample.annotation_key + ".json", normalized.json_bytes)
                 )
-            if export_format in {"txt", "both"}:
+            if export_format in {"flat_txt", "both"}:
                 staged.append(
                     staging.stage(
                         sample.annotation_key + ".txt",
@@ -736,7 +737,7 @@ __all__ = [
 ]
 
 
-def _safe_flat_txt(annotation: dict[str, Any], policy: CaptionDisplayPolicy) -> str:
+def _safe_flat_txt(annotation: Mapping[str, object], policy: CaptionDisplayPolicy) -> str:
     """Flatten a caption for review, tolerating a payload that cannot serialize.
 
     An overflow row only needs readable text for the reviewer, so a payload that

@@ -24,22 +24,51 @@ class WorkflowDatabase:
 
     def __init__(self, db_path: Path | str):
         self.db_path = Path(db_path)
-        apply_migrations(self.db_path)
+        self._memory_conn: sqlite3.Connection | None = None
+        
+        # For :memory: databases, create and hold a persistent connection
+        if str(db_path) == ":memory:":
+            self._memory_conn = sqlite3.connect(":memory:", timeout=30.0, check_same_thread=False)
+            self._memory_conn.row_factory = sqlite3.Row
+            self._memory_conn.execute("PRAGMA foreign_keys=ON")
+            # Apply migrations directly to this connection
+            from .db_schema import SCHEMA_SQL, SCHEMA_VERSION
+            import hashlib
+            checksum = hashlib.sha256(SCHEMA_SQL.encode("utf-8")).hexdigest()
+            self._memory_conn.executescript(SCHEMA_SQL)
+            self._memory_conn.execute(
+                "INSERT INTO schema_migrations (version, checksum, applied_at)"
+                " VALUES (?, ?, datetime('now'))",
+                (SCHEMA_VERSION, checksum),
+            )
+            self._memory_conn.commit()
+        else:
+            apply_migrations(self.db_path)
 
     @contextlib.contextmanager
     def connection(self) -> Iterator[sqlite3.Connection]:
         """Context manager for database connection."""
-        conn = sqlite3.connect(self.db_path, timeout=30.0)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA foreign_keys=ON")
-        try:
-            yield conn
-            conn.commit()
-        except Exception:
-            conn.rollback()
-            raise
-        finally:
-            conn.close()
+        if self._memory_conn is not None:
+            # For :memory:, yield the persistent connection without closing
+            try:
+                yield self._memory_conn
+                self._memory_conn.commit()
+            except Exception:
+                self._memory_conn.rollback()
+                raise
+        else:
+            # For file-based databases, create a new connection each time
+            conn = sqlite3.connect(self.db_path, timeout=30.0)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA foreign_keys=ON")
+            try:
+                yield conn
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
 
     def create_job(
         self,
@@ -241,6 +270,24 @@ class WorkflowDatabase:
                     """,
                     (job_id,)
                 )
+            return [dict(row) for row in cursor.fetchall()]
+
+    def get_active_jobs_for_path(self, source_root_id: str) -> list[dict[str, Any]]:
+        """Get active jobs using the given source root.
+        
+        Active jobs are those in running, pending, or paused states.
+        Used for dataset lock checking during preflight.
+        """
+        with self.connection() as conn:
+            cursor = conn.execute(
+                """
+                SELECT * FROM workflow_jobs
+                WHERE source_root_id = ? 
+                  AND status IN ('running', 'pending', 'paused', 'waiting_count_review', 'waiting_token_review')
+                ORDER BY created_at DESC
+                """,
+                (source_root_id,)
+            )
             return [dict(row) for row in cursor.fetchall()]
 
 

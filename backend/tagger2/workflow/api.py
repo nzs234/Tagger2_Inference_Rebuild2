@@ -1,4 +1,4 @@
-"""Workflow API routes."""
+﻿"""Workflow API routes."""
 
 from fastapi import APIRouter, HTTPException, BackgroundTasks
 from typing import Any, Callable, Literal, Sequence
@@ -273,7 +273,7 @@ def create_workflow_router(
     if database is None:
         database = WorkflowDatabase(default_workflow_database_path())
 
-    preflight_service = WorkflowPreflightService(allowlist, resource_catalog)
+    preflight_service = WorkflowPreflightService(allowlist, resource_catalog, database)
 
     def _record_job_failure(job_id: str, exc: BaseException, trace: str) -> None:
         """Fail a job without leaking internals to the client.
@@ -511,15 +511,31 @@ def create_workflow_router(
                 token_store = TokenBudgetReviewStore(database, job_id)
                 token_store.initialize(report.token_overflows)
     
-            # Mark completed or failed based on blocking issues
+            # Check if human review is needed before marking as completed
+            count_store = CountReviewStore(database, job_id)
+            token_store_check = TokenBudgetReviewStore(database, job_id)
+            
+            pending_count = count_store.pending_count()
+            pending_token = token_store_check.unresolved_count()
+            
             has_blocking = any(
                 issue.blocking for issue in report.issues
             )
-            final_status = "failed" if has_blocking else "completed"
+            
+            # Determine final status based on blocking issues and pending reviews
+            if has_blocking:
+                final_status = "failed"
+            elif pending_count > 0:
+                final_status = "waiting_count_review"
+            elif pending_token > 0:
+                final_status = "waiting_token_review"
+            else:
+                final_status = "completed"
+            
             lifecycle.transition(final_status)
     
             # Issues are already persisted in the issues table via report
-    
+
         except Exception as exc:
             # The traceback is operator data, not client data: write it to the
             # job workspace and store only a stable code on the job row.
@@ -671,6 +687,17 @@ def create_workflow_router(
                 detail={"code": "invalid_transition", "message": str(exc)},
             ) from exc
 
+    
+    @router.post("/jobs/{job_id}/cancel")
+    async def cancel_job(job_id: str) -> dict[str, Any]:
+        """Cancel a job permanently. Cannot be resumed once cancelled."""
+        from .lifecycle import LifecycleError
+
+        lifecycle, _job = _lifecycle(job_id)
+        try:
+            return {"job_id": job_id, "status": lifecycle.transition("cancelled")}
+        except LifecycleError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
     @router.post("/jobs/{job_id}/repair")
     async def repair_job(job_id: str) -> dict[str, Any]:
         """Repair an interrupted run and report what recovery found."""
@@ -682,6 +709,138 @@ def create_workflow_router(
             "resumable_samples": len(lifecycle.resumable_samples()),
         }
 
+
+    @router.post("/jobs/{job_id}/restore")
+    async def restore_job(job_id: str) -> dict[str, Any]:
+        """Restore original annotations from backup archive.
+        
+        This operation restores the dataset to its pre-workflow state using
+        the backup created during job initialization. The job must be in a
+        terminal state (completed or failed) or explicitly cancelled.
+        """
+        from .commit import restore_annotation_backup, CommitError
+        
+        lifecycle, job = _lifecycle(job_id)
+        status = str(job["status"])
+        
+        # Only allow restore from terminal or cancelled states
+        if status not in ("completed", "failed", "cancelled"):
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "code": "invalid_state_for_restore",
+                    "message": f"Cannot restore from state: {status}"
+                }
+            )
+        
+        workspace = Path(str(job["workspace_path"]))
+        backup_zip = workspace / "backup.zip"
+        
+        if not backup_zip.exists():
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    "code": "backup_not_found",
+                    "message": "Backup archive not found for this job"
+                }
+            )
+        
+        # The dataset that was written is the output root for full_copy and the
+        # source root for in_place, so restore has to target the same one.
+        work_mode = str(job["work_mode"])
+        root_id = str(job["output_root_id"] or "") if work_mode == "full_copy" else str(job["source_root_id"])
+        if not root_id:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "code": "missing_dataset_root",
+                    "message": "Job has no dataset root to restore into",
+                },
+            )
+
+        try:
+            dataset_root = allowlist.get(root_id).path
+        except PathNotAllowedError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "code": "invalid_dataset_root",
+                    "message": "Dataset root is no longer registered",
+                },
+            ) from exc
+        
+        try:
+            restored_count = restore_annotation_backup(backup_zip, dataset_root)
+            return {
+                "job_id": job_id,
+                "root_id": root_id,
+                "restored_files": restored_count,
+            }
+        except CommitError as exc:
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "code": "restore_failed",
+                    "message": str(exc)
+                }
+            ) from exc
+
+    @router.post("/jobs/{job_id}/discard")
+    async def discard_job(job_id: str) -> dict[str, Any]:
+        """Discard a job's workspace and intermediate files.
+        
+        This permanently removes the job's workspace directory including all
+        intermediate files, staged outputs, and backups. The job record remains
+        in the database for audit purposes but cannot be restored or resumed.
+        
+        The job must be in a terminal state (completed, failed, cancelled).
+        """
+        import shutil
+        
+        lifecycle, job = _lifecycle(job_id)
+        status = str(job["status"])
+        
+        # Only allow discard from terminal states
+        if status not in ("completed", "failed", "cancelled"):
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "code": "invalid_state_for_discard",
+                    "message": f"Cannot discard job in state: {status}"
+                }
+            )
+        
+        workspace = Path(str(job["workspace_path"]))
+        
+        if not workspace.exists():
+            # Already discarded or never created
+            return {
+                "job_id": job_id,
+                "discarded": False,
+                "message": "Workspace already removed"
+            }
+        
+        try:
+            # Remove the entire workspace directory
+            shutil.rmtree(workspace)
+            
+            # Update job record to mark as discarded
+            # Note: This is a simple implementation. Full version would update
+            # a 'discarded_at' timestamp in the database
+            
+            return {
+                "job_id": job_id,
+                "discarded": True,
+                "removed_path": str(workspace.name),  # Only return relative name
+            }
+        except Exception as exc:
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "code": "discard_failed",
+                    "message": f"Failed to remove workspace: {exc}"
+                }
+            ) from exc
     def _count_store(job_id: str):
         from .count_review import CountReviewStore
 
@@ -1035,4 +1194,5 @@ def create_workflow_router(
 
 
 __all__ = ["create_workflow_router"]
+
 

@@ -1,4 +1,4 @@
-"""Test workflow foundation: contracts, database, resources, preflight, API."""
+﻿"""Test workflow foundation: contracts, database, resources, preflight, API."""
 
 import json
 import tempfile
@@ -234,6 +234,7 @@ def test_workflow_preflight():
     """Test workflow preflight validation."""
     from backend.tagger2.security import PathAllowlist, PathRoot
     from backend.tagger2.workflow.contracts import WorkflowJobConfigV1, WorkflowPathRef
+    from backend.tagger2.workflow.db import WorkflowDatabase
     from backend.tagger2.workflow.preflight import WorkflowPreflightError, WorkflowPreflightService
     from backend.tagger2.workflow.resources import WorkflowResourceCatalog
     
@@ -269,7 +270,8 @@ def test_workflow_preflight():
         catalog = WorkflowResourceCatalog(resource_dir)
         
         # Create preflight service
-        service = WorkflowPreflightService(allowlist, catalog)
+        db = WorkflowDatabase(":memory:")
+        service = WorkflowPreflightService(allowlist, catalog, db)
         
         # Test valid configuration
         valid_config = WorkflowJobConfigV1(
@@ -314,3 +316,7 @@ def test_workflow_preflight():
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+
+

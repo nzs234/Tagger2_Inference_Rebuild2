@@ -1,4 +1,4 @@
-"""Workflow database schema and migrations."""
+﻿"""Workflow database schema and migrations."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import hashlib
 import sqlite3
 from pathlib import Path
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -26,7 +26,11 @@ CREATE TABLE IF NOT EXISTS workflow_jobs (
     source_root_id TEXT NOT NULL,
     output_root_id TEXT,
     workspace_path TEXT NOT NULL,
-    status TEXT NOT NULL CHECK(status IN ('pending', 'running', 'paused', 'completed', 'failed', 'cancelled')),
+    status TEXT NOT NULL CHECK(status IN (
+        'pending', 'running', 'paused', 
+        'waiting_count_review', 'waiting_token_review',
+        'completed', 'failed', 'cancelled'
+    )),
     current_module_id TEXT,
     total_samples INTEGER NOT NULL DEFAULT 0,
     processed_samples INTEGER NOT NULL DEFAULT 0,
@@ -132,7 +136,9 @@ CREATE INDEX IF NOT EXISTS idx_workflow_token_review_status ON workflow_token_bu
 
 def apply_migrations(db_path: Path) -> None:
     """Apply schema migrations to workflows database."""
-    db_path.parent.mkdir(parents=True, exist_ok=True)
+    # Skip directory creation for in-memory databases
+    if str(db_path) != ":memory:":
+        db_path.parent.mkdir(parents=True, exist_ok=True)
     
     checksum = hashlib.sha256(SCHEMA_SQL.encode("utf-8")).hexdigest()
     conn = sqlite3.connect(db_path, timeout=30.0)
@@ -190,6 +196,63 @@ def apply_migrations(db_path: Path) -> None:
                 (2, checksum),
             )
 
+        if applied < 3:
+            # v2 -> v3: The CHECK constraint on workflow_jobs.status cannot be
+            # altered in place on SQLite, so we rebuild the table to include
+            # waiting_count_review and waiting_token_review states.
+            # Preserve all existing data during the rebuild.
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                # Create new table with updated CHECK constraint
+                conn.execute("""
+                    CREATE TABLE workflow_jobs_v3 (
+                        job_id TEXT PRIMARY KEY,
+                        config_version INTEGER NOT NULL CHECK(config_version = 1),
+                        config_json TEXT NOT NULL,
+                        config_hash TEXT NOT NULL,
+                        profile TEXT NOT NULL CHECK(profile IN ('e621', 'danbooru')),
+                        work_mode TEXT NOT NULL CHECK(work_mode IN ('in_place', 'full_copy')),
+                        overwrite_mode TEXT NOT NULL CHECK(overwrite_mode IN ('incremental', 'rebuild')),
+                        source_root_id TEXT NOT NULL,
+                        output_root_id TEXT,
+                        workspace_path TEXT NOT NULL,
+                        status TEXT NOT NULL CHECK(status IN (
+                            'pending', 'running', 'paused', 
+                            'waiting_count_review', 'waiting_token_review',
+                            'completed', 'failed', 'cancelled'
+                        )),
+                        current_module_id TEXT,
+                        total_samples INTEGER NOT NULL DEFAULT 0,
+                        processed_samples INTEGER NOT NULL DEFAULT 0,
+                        succeeded_samples INTEGER NOT NULL DEFAULT 0,
+                        failed_samples INTEGER NOT NULL DEFAULT 0,
+                        skipped_samples INTEGER NOT NULL DEFAULT 0,
+                        created_at TEXT NOT NULL,
+                        started_at TEXT,
+                        finished_at TEXT,
+                        error TEXT
+                    )
+                """)
+                
+                # Copy all existing data
+                conn.execute("""
+                    INSERT INTO workflow_jobs_v3 SELECT * FROM workflow_jobs
+                """)
+                
+                # Drop old table and rename new one
+                conn.execute("DROP TABLE workflow_jobs")
+                conn.execute("ALTER TABLE workflow_jobs_v3 RENAME TO workflow_jobs")
+                
+                conn.execute(
+                    "INSERT INTO schema_migrations (version, checksum, applied_at)"
+                    " VALUES (?, ?, datetime('now'))",
+                    (3, checksum),
+                )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+
         # Keep the remaining DDL idempotent so a partially created database heals.
         conn.executescript(SCHEMA_SQL)
         conn.commit()
@@ -200,3 +263,4 @@ def apply_migrations(db_path: Path) -> None:
 
 
 __all__ = ["SCHEMA_VERSION", "SCHEMA_SQL", "apply_migrations"]
+

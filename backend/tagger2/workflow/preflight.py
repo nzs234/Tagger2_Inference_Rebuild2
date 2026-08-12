@@ -1,4 +1,4 @@
-"""Workflow preflight validation."""
+﻿"""Workflow preflight validation."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ from typing import Any
 from ..security import PathAllowlist, PathNotAllowedError
 from .contracts import WorkflowJobConfigV1
 from .resources import WorkflowResourceCatalog
+from .db import WorkflowDatabase
 
 
 class WorkflowPreflightError(Exception):
@@ -25,9 +26,11 @@ class WorkflowPreflightService:
         self,
         allowlist: PathAllowlist,
         resource_catalog: WorkflowResourceCatalog,
+        database: WorkflowDatabase,
     ):
         self.allowlist = allowlist
         self.resource_catalog = resource_catalog
+        self.database = database
 
     def _snapshot_profile(self, resource_id: str) -> str | None:
         """Return the profile a registered classification snapshot was built for.
@@ -79,6 +82,16 @@ class WorkflowPreflightService:
                 errors.append(f"Source path is not a directory: {config.source_root.relative_path}")
         except PathNotAllowedError as e:
             errors.append(f"Source path not allowed: {e}")
+
+        # Dataset lock: an in-flight job already owns this source root, so a
+        # second job would race it on the same files.
+        active_jobs = self.database.get_active_jobs_for_path(config.source_root.root_id)
+        if active_jobs:
+            job_ids = [str(job["job_id"])[:8] for job in active_jobs]
+            errors.append(
+                f"Dataset is locked by active job(s): {', '.join(job_ids)}. "
+                "Wait for them to finish or cancel them before creating a new job."
+            )
 
         # Validate output root if full_copy mode
         if config.work_mode == "full_copy":
@@ -213,3 +226,5 @@ class WorkflowPreflightService:
 
 
 __all__ = ["WorkflowPreflightError", "WorkflowPreflightService"]
+
+
