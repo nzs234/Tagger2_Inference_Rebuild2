@@ -2,6 +2,7 @@ param(
   [string]$OutputDir = "dist",
   [string]$Version = "",
   [switch]$SkipRuntime,
+  [switch]$BaseRuntimeOnly,
   [switch]$SkipSmokeTest
 )
 
@@ -21,6 +22,10 @@ $name = if ($safeVersion) {
 $stage = Join-Path $root (".release_$stamp")
 $out = Join-Path $root $OutputDir
 $smoke = Join-Path $root (".release_smoke_$stamp")
+
+if ($SkipRuntime -and $BaseRuntimeOnly) {
+  throw "SkipRuntime and BaseRuntimeOnly cannot be used together"
+}
 
 function Copy-ReleaseItem([string]$RelativePath) {
   $source = Join-Path $root $RelativePath
@@ -87,7 +92,21 @@ try {
   )) {
     Copy-ReleaseItem $item
   }
-  if ((-not $SkipRuntime) -and (Test-Path -LiteralPath (Join-Path $root "runtime/python.exe"))) {
+  if ($BaseRuntimeOnly) {
+    $sourceRuntime = Join-Path $root "runtime"
+    if (-not (Test-Path -LiteralPath (Join-Path $sourceRuntime "python.exe"))) {
+      throw "Base runtime requested but runtime/python.exe is missing"
+    }
+    $destinationRuntime = Join-Path $stage "runtime"
+    New-Item -ItemType Directory -Force -Path $destinationRuntime | Out-Null
+    Copy-Item -Path (Join-Path $sourceRuntime "*") -Destination $destinationRuntime -Recurse -Force
+    foreach ($largeDirectory in @("Lib\site-packages", "Scripts")) {
+      $removePath = Join-Path $destinationRuntime $largeDirectory
+      if (Test-Path -LiteralPath $removePath) {
+        Remove-Item -LiteralPath $removePath -Recurse -Force
+      }
+    }
+  } elseif ((-not $SkipRuntime) -and (Test-Path -LiteralPath (Join-Path $root "runtime/python.exe"))) {
     Copy-ReleaseItem "runtime"
   }
   foreach ($directory in @("models", "data_cache", "data")) {
