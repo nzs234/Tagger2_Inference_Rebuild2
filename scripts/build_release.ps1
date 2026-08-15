@@ -1,6 +1,7 @@
 param(
   [string]$OutputDir = "dist",
   [string]$Version = "",
+  [switch]$SkipRuntime,
   [switch]$SkipSmokeTest
 )
 
@@ -86,7 +87,7 @@ try {
   )) {
     Copy-ReleaseItem $item
   }
-  if (Test-Path -LiteralPath (Join-Path $root "runtime/python.exe")) {
+  if ((-not $SkipRuntime) -and (Test-Path -LiteralPath (Join-Path $root "runtime/python.exe"))) {
     Copy-ReleaseItem "runtime"
   }
   foreach ($directory in @("models", "data_cache", "data")) {
