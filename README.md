@@ -1,5 +1,31 @@
 # Tagger2 Inference Rebuild
 
+**V1.01 · Windows 本地优先的图像打标与数据集工作流工作台**
+
+Tagger2 Inference Rebuild 将本地 Caption 模型推理、单图/批量任务、e621 标签整理、确定性标签替换、可选 OCR、数量复核、Token 检查和 JSON/TXT 导出统一到一个可复现的 FastAPI + React 应用中。原项目仓库保持不变，本仓库是独立重建版本。
+
+## 核心能力
+
+- 使用本地 Caption 模型进行单图和批量图片打标。
+- 通过 e621 分类快照整理标签，并使用不可变替换索引。
+- 支持生成新数据集或更新原数据集；原地更新会先创建备份。
+- 在导出前执行数量复核和 Token 长度检查，复核未确认时不会提交目标数据集。
+- 支持暂停、恢复、取消、恢复任务、事件查看和失败回滚。
+- 所有工作流资源通过 manifest、大小和 SHA-256 指纹冻结。
+
+## 三分钟了解工作流
+
+1. 启动服务并打开 `http://127.0.0.1:20000`。
+2. 在“本地模型”页面确认 Caption 模型已经加载。
+3. 在“数据集工作流”中手动填写源数据集和输出目录。
+4. 选择 e621 分类、替换、OCR 和 Token 处理步骤。
+5. 点击“检查设置”，预检通过后创建任务。
+6. 创建后再显式点击“开始处理”，完成复核后导出结果。
+
+默认推荐的 e621 替换索引为 `replace-e621-pass-drop-v2`，其中原索引的 `pass` 已全部转换为 `drop`（keep 47,095、replace 3,171、drop 105,440、pass 0）。
+
+模型权重、用户图片、数据库和 OCR 模型缓存不会提交到 Git 仓库或发布包；模型和机器相关运行时需要在本机单独准备。详细安装、资源导入和发布说明见下文及 [`docs/release_package_contents.md`](docs/release_package_contents.md)。
+
 This is the independent local/online image-tagging workspace. The original
 project is left untouched. The server targets Windows 10/11, Python 3.12 and
 CUDA with a CPU fallback. Node is only needed when rebuilding the frontend;
