@@ -72,6 +72,12 @@ metadata. Omitting the flag keeps the importer strict and fails closed. The
 designated replacement index is imported with
 `scripts/import_designated_replacement_index.py`.
 
+For the e621 production default, the immutable local resource
+`replace-e621-pass-drop-v2` is used. It changes only `action=pass` rows to
+`action=drop` and clears their `replacement_tags` (47,095 keep / 3,171
+replace / 105,440 drop / 0 pass). The original V1 resources remain available
+for old jobs and reproducibility.
+
 Runtime lock files pin every direct and transitive dependency with SHA-256
 hashes. The `.txt` files are source manifests, not deployment inputs. Update
 all locks on Python 3.12 with:

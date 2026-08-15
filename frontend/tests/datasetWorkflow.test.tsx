@@ -24,7 +24,7 @@ describe('workflow copy', () => {
   it('never leaves a blank string in either language', () => {
     for (const language of ['zh', 'en'] as const) {
       for (const [key, value] of Object.entries(copyFor(language))) {
-        expect(value.trim().length, `${language}.${key}`).toBeGreaterThan(0)
+        if (typeof value === 'string') expect(value.trim().length, `${language}.${key}`).toBeGreaterThan(0)
       }
     }
   })
@@ -57,6 +57,16 @@ describe('DatasetWorkflow page', () => {
             category: 'replacement_index',
             fingerprint: 'a'.repeat(64),
             created_at: '2026-08-11T00:00:00Z',
+          },
+          {
+            resource_id: 'classify-e621-20260812-v1',
+            category: 'classify',
+            fingerprint: 'b'.repeat(64),
+          },
+          {
+            resource_id: 'tokenizer-qwen3-0-6b-tokenizer-v1',
+            category: 'tokenizer',
+            fingerprint: 'c'.repeat(64),
           },
         ])
       }
@@ -101,10 +111,79 @@ describe('DatasetWorkflow page', () => {
     expect(screen.getByText(/不会静默回退/)).toBeInTheDocument()
   })
 
+  it('disables preflight when capability discovery fails', async () => {
+    const fetchMock = vi.mocked(globalThis.fetch)
+    const fallback = fetchMock.getMockImplementation()!
+    fetchMock.mockImplementation(async (input, init) => {
+      if (String(input).includes('/workflows/capabilities')) {
+        return new Response(JSON.stringify({ code: 'capabilities_unavailable' }), {
+          status: 503,
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      return fallback(input, init)
+    })
+
+    renderPage()
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('任务预检已停用')
+    expect(screen.getByRole('button', { name: copyFor('zh').preflight })).toBeDisabled()
+    expect(screen.getByLabelText(copyFor('zh').profile)).toBeDisabled()
+    expect(screen.getByLabelText(copyFor('zh').workMode)).toBeDisabled()
+  })
+
   it('keeps the create button disabled until preflight passes', async () => {
     renderPage()
     const create = screen.getByRole('button', { name: '创建任务' })
     expect(create).toBeDisabled()
+  })
+
+  it('exposes registered classification and tokenizer resources in the job config', async () => {
+    renderPage()
+    const zh = copyFor('zh')
+    await waitFor(() => {
+      expect(screen.getByLabelText(zh.enableClassify)).toBeInTheDocument()
+      expect(screen.getByLabelText(zh.enableTokenBudget)).toBeInTheDocument()
+    })
+    fireEvent.change(screen.getByLabelText(zh.enableClassify), { target: { value: 'yes' } })
+    fireEvent.change(screen.getByLabelText(zh.enableTokenBudget), { target: { value: 'yes' } })
+    await waitFor(() => {
+      expect(screen.getByRole('option', { name: 'classify-e621-20260812-v1' })).toBeInTheDocument()
+      expect(screen.getByRole('option', { name: 'tokenizer-qwen3-0-6b-tokenizer-v1' })).toBeInTheDocument()
+    })
+    expect((screen.getByLabelText(zh.classifyResource) as HTMLSelectElement).value).toBe(
+      'classify-e621-20260812-v1',
+    )
+    expect((screen.getByLabelText(zh.tokenizerResource) as HTMLSelectElement).value).toBe(
+      'tokenizer-qwen3-0-6b-tokenizer-v1',
+    )
+  })
+
+  it('opens one structured help popover and closes it with Escape', async () => {
+    renderPage()
+    const helpButtons = await screen.findAllByRole('button', { name: copyFor('zh').helpLabels.button })
+    expect(helpButtons.length).toBeGreaterThan(3)
+    fireEvent.click(helpButtons[0]!)
+    expect(screen.getByRole('dialog')).toBeInTheDocument()
+    expect(screen.getByText(copyFor('zh').helpLabels.purpose)).toBeInTheDocument()
+    fireEvent.click(helpButtons[1]!)
+    expect(screen.getAllByRole('dialog')).toHaveLength(1)
+    fireEvent.keyDown(document, { key: 'Escape' })
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+  })
+
+  it('uses the e621 defaults and accepts complete manual dataset paths', async () => {
+    renderPage()
+    const zh = copyFor('zh')
+    expect((screen.getByLabelText(zh.enableClassify) as HTMLSelectElement).value).toBe('yes')
+    expect((screen.getByLabelText(zh.enableReplace) as HTMLSelectElement).value).toBe('yes')
+    const source = screen.getByLabelText(zh.sourcePath) as HTMLInputElement
+    const output = screen.getByLabelText(zh.outputPath) as HTMLInputElement
+    fireEvent.change(source, { target: { value: 'E:\\datasets\\train' } })
+    fireEvent.change(output, { target: { value: 'E:\\datasets\\train_processed' } })
+    expect(source.value).toBe('E:\\datasets\\train')
+    expect(output.value).toBe('E:\\datasets\\train_processed')
+    expect(screen.queryByRole('combobox', { name: zh.sourcePath })).not.toBeInTheDocument()
   })
 })
 
@@ -132,10 +211,12 @@ describe('DatasetWorkflow count review and job controls', () => {
 
   let posts: { url: string; body: unknown }[] = []
   let pending = 1
+  let countItems = [decision]
 
   beforeEach(() => {
     posts = []
     pending = 1
+    countItems = [decision]
     usePreferences.setState({ workflowLanguage: 'zh' })
     vi.spyOn(globalThis, 'fetch').mockImplementation(
       async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -147,6 +228,24 @@ describe('DatasetWorkflow count review and job controls', () => {
           })
         if (init?.method === 'POST') {
           posts.push({ url, body: init.body ? JSON.parse(String(init.body)) : null })
+          if (url.includes('/path-bindings/preview')) {
+            return json({
+              status: 'ready',
+              source_bound: true,
+              output_bound: true,
+              output_create_required: false,
+              warnings: [],
+              errors: [],
+            })
+          }
+          if (url.includes('/path-bindings')) {
+            return json({
+              status: 'ready',
+              source: { root_id: 'in', relative_path: '' },
+              output: { root_id: 'out', relative_path: '' },
+              output_created: false,
+            })
+          }
           if (url.includes('/count-review/resolve')) {
             pending = 0
             return json({ sample_id: 7, count_value: 'duo', version: 4 })
@@ -185,7 +284,16 @@ describe('DatasetWorkflow count review and job controls', () => {
           })
         }
         if (url.includes('/count-review')) {
-          return json({ items: [{ ...decision, status: pending ? 'pending' : 'confirmed' }], pending })
+          const parsed = new URL(url, 'http://localhost')
+          const offset = Number(parsed.searchParams.get('offset') ?? 0)
+          const limit = Number(parsed.searchParams.get('limit') ?? 50)
+          return json({
+            items: countItems.slice(offset, offset + limit).map((item) => ({
+              ...item,
+              status: pending ? item.status : 'confirmed',
+            })),
+            pending,
+          })
         }
         if (url.includes('/token-review')) return json({ items: [], unresolved: 0 })
         if (url.includes('/issues')) return json([])
@@ -233,6 +341,17 @@ describe('DatasetWorkflow count review and job controls', () => {
               total_samples: 3,
               current_module_id: null,
               created_at: '2026-08-11T03:00:00Z',
+            },
+            {
+              job_id: 'job-5',
+              status: 'completed',
+              profile: 'e621',
+              work_mode: 'full_copy',
+              pinned: false,
+              processed_samples: 2,
+              total_samples: 2,
+              current_module_id: null,
+              created_at: '2026-08-11T04:00:00Z',
             },
           ])
         }
@@ -300,6 +419,27 @@ describe('DatasetWorkflow count review and job controls', () => {
     expect(screen.queryByRole('button', { name: /采用 zero/ })).not.toBeInTheDocument()
   })
 
+  it('paginates beyond the first 50 count-review rows', async () => {
+    countItems = Array.from({ length: 51 }, (_, index) => ({
+      ...decision,
+      sample_id: index + 1,
+      relative_image_path: `set-a/img-${String(index + 1).padStart(4, '0')}.png`,
+    }))
+    pending = 51
+
+    await selectJob()
+    expect(await screen.findByText('set-a/img-0001.png')).toBeInTheDocument()
+    const next = await screen.findByRole('button', { name: '下一页' })
+    expect(next).toBeEnabled()
+    fireEvent.click(next)
+
+    expect(await screen.findByText('set-a/img-0051.png')).toBeInTheDocument()
+    expect(screen.getByText('第 2 页')).toBeInTheDocument()
+    expect(
+      vi.mocked(globalThis.fetch).mock.calls.some(([input]) => String(input).includes('offset=50')),
+    ).toBe(true)
+  })
+
   it('pauses a running job and reports repair results', async () => {
     await selectJob()
     fireEvent.click(await screen.findByRole('button', { name: /暂停/ }))
@@ -341,8 +481,8 @@ describe('DatasetWorkflow count review and job controls', () => {
     renderPage()
     fireEvent.click(await screen.findByText(/job-3/))
 
-    expect(await screen.findByRole('button', { name: /开始任务/ })).toBeInTheDocument()
-    fireEvent.click(screen.getByRole('button', { name: /开始任务/ }))
+    expect(await screen.findByRole('button', { name: copyFor('zh').startJob })).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: copyFor('zh').startJob }))
 
     await waitFor(() => {
       expect(posts.some((post) => post.url.endsWith('/start'))).toBe(true)
@@ -363,6 +503,27 @@ describe('DatasetWorkflow count review and job controls', () => {
     const discard = await screen.findByRole('button', { name: /丢弃工作区/ })
     expect(discard).toBeDisabled()
     expect(screen.getByText(/取消固定后才能丢弃工作区/)).toBeInTheDocument()
+  })
+
+  it('does not poll durable events for a terminal job', async () => {
+    renderPage()
+    fireEvent.click(await screen.findByText(/job-5/))
+    await screen.findByRole('button', { name: /丢弃工作区/ })
+
+    expect(
+      vi.mocked(globalThis.fetch).mock.calls.some(([input]) => String(input).includes('/job-5/events')),
+    ).toBe(false)
+  })
+
+  it('clears the selected job after discarding its workspace', async () => {
+    renderPage()
+    fireEvent.click(await screen.findByText(/job-5/))
+    fireEvent.click(await screen.findByRole('button', { name: /丢弃工作区/ }))
+
+    await waitFor(() => {
+      expect(posts.some((post) => post.url.endsWith('/job-5/discard'))).toBe(true)
+      expect(screen.queryByRole('button', { name: /丢弃工作区/ })).not.toBeInTheDocument()
+    })
   })
 })
 
@@ -510,16 +671,43 @@ describe('DatasetWorkflow OCR', () => {
           })
         if (init?.method === 'POST') {
           posted = init.body ? JSON.parse(String(init.body)) : null
+          if (url.includes('/path-bindings/preview')) {
+            return json({
+              status: 'ready',
+              source_bound: true,
+              output_bound: false,
+              output_create_required: false,
+              warnings: [],
+              errors: [],
+            })
+          }
+          if (url.includes('/path-bindings')) {
+            return json({
+              status: 'ready',
+              source: { root_id: 'in', relative_path: '' },
+              output: null,
+              output_created: false,
+            })
+          }
           return json({ valid: true, errors: [], warnings: [] })
         }
         if (url.includes('/report')) return json(reportBody)
+        if (url.endsWith('/models')) {
+          return json({ items: [{ id: 'local-caption-v1', name: 'Local Caption', backend: 'onnx', loaded: true }] })
+        }
         if (url.includes('/token-review')) return json({ items: [], unresolved: 0 })
         if (url.includes('/count-review')) return json({ items: [], pending: 0 })
         if (url.includes('/issues')) return json([])
         if (url.includes('/workflows/capabilities')) {
           return json({ profiles: ['e621'], work_modes: ['in_place', 'full_copy'], resources: [] })
         }
-        if (url.includes('/workflows/resources')) return json([])
+        if (url.includes('/workflows/resources')) {
+          return json([
+            { resource_id: 'classify-e621-20260812-v1', category: 'classify', fingerprint: 'a'.repeat(64) },
+            { resource_id: 'replace-e621-pass-drop-v2', category: 'replace', fingerprint: 'b'.repeat(64) },
+            { resource_id: 'ocr-paddleocr-2-9-1-cpu-v1', category: 'ocr', fingerprint: 'c'.repeat(64) },
+          ])
+        }
         if (url.includes('/workflows/jobs')) {
           return json([
             {
@@ -558,15 +746,13 @@ describe('DatasetWorkflow OCR', () => {
     renderPage()
 
     const zh = copyFor('zh')
-    fireEvent.change(screen.getByLabelText(zh.workMode), { target: { value: 'in_place' } })
+    const workMode = screen.getByLabelText(zh.workMode)
+    await waitFor(() => expect(workMode).toBeEnabled())
+    fireEvent.change(workMode, { target: { value: 'in_place' } })
 
-    // The root list arrives asynchronously; selecting before it lands is a no-op.
-    const sourceRoot = screen.getByLabelText(zh.sourceRoot) as HTMLSelectElement
-    await waitFor(() => {
-      expect(sourceRoot.options.length).toBeGreaterThan(1)
-    })
-    fireEvent.change(sourceRoot, { target: { value: 'in' } })
-    expect(sourceRoot.value).toBe('in')
+    const sourcePath = screen.getByLabelText(zh.sourcePath) as HTMLInputElement
+    fireEvent.change(sourcePath, { target: { value: 'C:\\datasets\\sample' } })
+    expect(sourcePath.value).toBe('C:\\datasets\\sample')
 
     fireEvent.change(screen.getByLabelText(zh.enableOcr), {
       target: { value: 'yes' },
@@ -576,12 +762,15 @@ describe('DatasetWorkflow OCR', () => {
     expect(confidence).toBeInTheDocument()
     fireEvent.change(confidence, { target: { value: '0.8' } })
 
-    fireEvent.click(screen.getByRole('button', { name: copyFor('zh').preflight }))
+    const preflight = screen.getByRole('button', { name: copyFor('zh').preflight })
+    await waitFor(() => expect(preflight).toBeEnabled())
+    fireEvent.click(preflight)
 
     await waitFor(() => {
       expect((posted as { ocr?: unknown })?.ocr).toEqual({
         enabled: true,
         min_confidence: 0.8,
+        resource_id: 'ocr-paddleocr-2-9-1-cpu-v1',
       })
     })
   })

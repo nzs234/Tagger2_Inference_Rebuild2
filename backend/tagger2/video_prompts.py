@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Any, Literal, Mapping, TypeAlias
+from typing import Any, Literal, Mapping, TypeAlias, cast
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -330,7 +330,7 @@ def normalize_video_prompt_mode(value: str | None = None) -> VideoPromptMode:
 def normalize_fl2va_single_image_role(value: str | None = None) -> Fl2vaSingleImageRole:
     role = (value or "first").strip().lower()
     if role in {"first", "last"}:
-        return role
+        return cast(Fl2vaSingleImageRole, role)
     raise ValueError("single-image role must be first or last")
 
 

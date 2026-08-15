@@ -25,6 +25,8 @@
   WorkflowRepairReport,
   WorkflowResource,
   WorkflowJobStatus,
+  WorkflowPathBinding,
+  WorkflowPathBindingPreview,
   WorkflowTokenReviewAction,
   WorkflowTokenReviewItem,
   WorkflowTokenReviewPage,
@@ -209,6 +211,25 @@ export const api = {
       '/workflows/resources/import/apply',
       { method: 'POST', body: JSON.stringify(body) },
     ),
+  workflowPreviewPathBinding: (body: {
+    source_path: string
+    output_path?: string
+    work_mode: 'full_copy' | 'in_place'
+  }) =>
+    request<WorkflowPathBindingPreview>('/workflows/path-bindings/preview', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+  workflowBindPaths: (body: {
+    source_path: string
+    output_path?: string
+    work_mode: 'full_copy' | 'in_place'
+    create_output?: boolean
+  }) =>
+    request<WorkflowPathBinding>('/workflows/path-bindings', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
   workflowPreflight: (config: Record<string, unknown>) =>
     request<WorkflowPreflightReport>('/workflows/jobs/preflight', {
       method: 'POST',

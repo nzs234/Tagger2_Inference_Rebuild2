@@ -339,7 +339,10 @@ class WorkflowJobConfigV1:
     # Caption configuration
     caption: dict[str, Any] = field(default_factory=lambda: {
         "enabled": True,
-        "model_id": "caption-e621-eva02-large-full-v1",
+        # The host Runtime binds this to the canonical id of an already
+        # loaded local model.  Keep the workflow contract free of a second,
+        # fabricated model namespace.
+        "model_id": None,
         "threshold_mode": "model_default",
         "overwrite_txt": False,
         "input_txt_mode": "tag",  # "tag" or "nl"
@@ -359,7 +362,7 @@ class WorkflowJobConfigV1:
         # Keep the historical ``replace-`` prefix for V1 clients while the
         # catalog stores the immutable e621 replacement digest under this
         # compatibility ID as well as its canonical ID.
-        "resource_id": "replace-e621-index-v1",
+        "resource_id": "replace-e621-pass-drop-v2",
     })
     
     # OCR configuration

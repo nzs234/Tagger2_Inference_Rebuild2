@@ -31,14 +31,20 @@ export function useWorkflowEvents(
   const [error, setError] = useState<string | null>(null)
   const onEventRef = useRef(options.onEvent)
   const generationRef = useRef(0)
+  const cursorRef = useRef(0)
+  const lastJobIdRef = useRef<string | undefined>(undefined)
   onEventRef.current = options.onEvent
 
   useEffect(() => {
     const generation = generationRef.current + 1
     generationRef.current = generation
-    setEvents([])
-    setCursor(0)
-    setError(null)
+    if (lastJobIdRef.current !== jobId) {
+      lastJobIdRef.current = jobId
+      setEvents([])
+      setCursor(0)
+      cursorRef.current = 0
+      setError(null)
+    }
 
     if (!jobId || options.enabled === false) {
       setState('idle')
@@ -47,7 +53,7 @@ export function useWorkflowEvents(
 
     const controller = new AbortController()
     let timer: number | undefined
-    let currentCursor = 0
+    let currentCursor = cursorRef.current
     const interval = Math.max(1000, options.pollIntervalMs ?? 3000)
 
     const schedule = () => {
@@ -82,6 +88,7 @@ export function useWorkflowEvents(
           hasMore = page.has_more === true
         }
         if (generationRef.current !== generation || controller.signal.aborted) return
+        cursorRef.current = currentCursor
         if (received.length > 0) {
           setEvents((previous) => [...previous, ...received].slice(-MAX_EVENTS))
           setCursor(currentCursor)

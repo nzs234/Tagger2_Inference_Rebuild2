@@ -2006,12 +2006,13 @@ def create_app(settings: AppConfig | None = None) -> FastAPI:
         )
         provider = runtime.provider(selected_provider)
         def validator(value: str) -> dict[str, Any]:
-            return parse_video_prompt_response(
+            package = parse_video_prompt_response(
                 value,
                 selected_mode,
                 base_mode,
                 reference_image_count=reference_image_count,
             )
+            return package.model_dump(mode="json")
         response = await provider.generate(
             image_data,
             prompt,
@@ -2686,6 +2687,7 @@ def create_app(settings: AppConfig | None = None) -> FastAPI:
             model_registry=runtime.registry,
             inference_engine=runtime.engine,
             storage=runtime.storage,
+            root_registrar=runtime.register_persistent_root,
         ),
         dependencies=[Depends(authorize)],
     )

@@ -30,7 +30,8 @@ def _response_models():
     for name in dir(workflow_api):
         value = getattr(workflow_api, name)
         if (
-            isinstance(value, type)
+            not name.endswith("Request")
+            and isinstance(value, type)
             and issubclass(value, BaseModel)
             and value is not BaseModel
         ):

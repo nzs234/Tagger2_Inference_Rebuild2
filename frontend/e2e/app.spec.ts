@@ -1,7 +1,7 @@
 import { expect, test, type Page } from '@playwright/test'
 import path from 'node:path'
 
-const pages = ['工作台', '视频提示词', '批量任务', '在线模型', '本地模型', '设置'] as const
+const pages = ['工作台', '视频提示词', '批量任务', '数据集工作流', '在线模型', '本地模型', '设置'] as const
 
 test.beforeEach(async ({ page }) => {
   await mockApi(page)
@@ -19,6 +19,39 @@ test('all routes fit the viewport and produce review screenshots', async ({ page
       fullPage: true,
     })
   }
+})
+
+test('dark theme keeps every route readable and within the viewport', async ({ page }, testInfo) => {
+  await page.goto('/')
+  await page.getByRole('button', { name: '浅色主题' }).click()
+  await expect(page.locator('html')).toHaveAttribute('data-theme', 'dark')
+  for (const name of pages) {
+    await navigate(page, name)
+    await expect(page.getByRole('heading', { name, level: 1 })).toBeVisible()
+    await expectNoHorizontalOverflow(page)
+    await page.screenshot({
+      path: path.join('test-results', 'screenshots', `${testInfo.project.name}-dark-${routeSlug(name)}.png`),
+      fullPage: true,
+    })
+  }
+})
+
+test('mobile navigation traps focus and restores the trigger on close', async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== 'mobile', 'mobile navigation behavior')
+  await page.goto('/')
+  const open = page.getByRole('button', { name: '打开导航' })
+  await open.click()
+
+  const close = page.getByRole('button', { name: '关闭导航' })
+  await expect(close).toBeFocused()
+  await expect(page.locator('.main-area')).toHaveAttribute('inert', '')
+  await page.keyboard.press('Shift+Tab')
+  await expect(page.locator('.sidebar .nav-item').last()).toBeFocused()
+
+  await page.keyboard.press('Escape')
+  await expect(open).toBeFocused()
+  await expect(open).toHaveAttribute('aria-expanded', 'false')
+  await expect(page.locator('.main-area')).not.toHaveAttribute('inert')
 })
 
 test('video prompt desk generates, restores, and clears in-memory revisions', async ({ page }) => {
@@ -65,7 +98,7 @@ test('video prompt desk generates, restores, and clears in-memory revisions', as
   page.once('dialog', (dialog) => dialog.accept())
   await page.getByRole('button', { name: '清空任务' }).click()
   await expect(page.getByText('上传 1 到 9 张参考图片')).toBeVisible()
-  await page.getByRole('tab', { name: 'FL2VA', exact: true }).click()
+  await page.getByRole('group', { name: '视频提示词模型' }).getByRole('button', { name: 'FL2VA', exact: true }).click()
   await expect(page.getByText('H3 T2VA PROMPT DESK', { exact: true })).toBeVisible()
   await page.locator('input[type="file"]').setInputFiles([
     {
@@ -121,7 +154,7 @@ test('classifier and adapter controls are visible and keyboard focusable', async
   await batchUnderscores.focus()
   await page.keyboard.press('Space')
   await expect(batchUnderscores).toBeChecked()
-  await page.getByRole('tab', { name: '本地模型' }).click()
+  await page.getByRole('group', { name: '推理模式' }).getByRole('button', { name: '本地模型' }).click()
   await expect(page.getByRole('checkbox', { name: '输出 Rating 标签', exact: true })).not.toBeChecked()
   await expect(page.getByRole('checkbox', { name: '括号转义', exact: true })).toBeChecked()
   await expect(page.getByRole('checkbox', { name: '启用美学评分' })).toBeVisible()
@@ -146,14 +179,18 @@ test('classifier and adapter controls are visible and keyboard focusable', async
 
 test('batch hybrid mode submits one local job with the required combined outputs', async ({ page }, testInfo) => {
   const bodies: Array<Record<string, unknown>> = []
-  await page.route('**/api/v1/scans', (route) => route.fulfill({
-    status: 200,
-    contentType: 'application/json',
-    body: JSON.stringify({
-      items: [{ id: 'image-1', relative_path: 'sample.png', file_name: 'sample.png', size: 128 }],
-      total: 1,
-    }),
-  }))
+  const scanBodies: Array<Record<string, unknown>> = []
+  await page.route('**/api/v1/scans', (route) => {
+    scanBodies.push(route.request().postDataJSON() as Record<string, unknown>)
+    return route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        items: [{ id: 'image-1', relative_path: 'sample.png', file_name: 'sample.png', size: 128 }],
+        total: 1,
+      }),
+    })
+  })
   await page.route('**/api/v1/jobs', async (route) => {
     if (route.request().method() !== 'POST') return route.fallback()
     bodies.push(route.request().postDataJSON() as Record<string, unknown>)
@@ -169,7 +206,9 @@ test('batch hybrid mode submits one local job with the required combined outputs
   await page.getByRole('textbox', { name: '输入文件夹路径' }).fill('E:\\6_santabear1')
   await page.getByRole('button', { name: '扫描目录' }).click()
   await expect(page.getByText('扫描完成：找到 1 张')).toBeVisible()
-  await page.getByRole('tab', { name: '本地 + 在线' }).click()
+  expect(scanBodies).toHaveLength(1)
+  expect(scanBodies[0]).toMatchObject({ page_size: 250 })
+  await page.getByRole('group', { name: '推理模式' }).getByRole('button', { name: '本地 + 在线' }).click()
   await expect(page.getByText('WD EVA02 Large Tagger', { exact: true })).toBeVisible()
   await expect(page.getByText('ConvNeXt V2 Tagger', { exact: true })).toHaveCount(0)
   await page.getByRole('button', { name: '调节 WD EVA02 Large Tagger 阈值' }).click()
@@ -705,6 +744,145 @@ test('workbench retry reconnects the stream and replaces failed results', async 
   await expectNoHorizontalOverflow(page)
 })
 
+test('workbench keeps same-basename uploads and results distinct by image identity', async ({ page }) => {
+  await page.route('**/api/v1/uploads', (route) => route.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify({
+      upload_id: 'same-name-upload',
+      files: [
+        { id: 'image-first', name: 'duplicate.png', size: 68 },
+        { id: 'image-second', name: 'duplicate.png', size: 96 },
+      ],
+    }),
+  }))
+  await page.route('**/api/v1/jobs', async (route) => {
+    if (route.request().method() !== 'POST') return route.fallback()
+    return route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({ ...jobSummary('running'), id: 'same-name-e2e', mode: 'local', total: 2 }),
+    })
+  })
+  await page.route('**/api/v1/jobs/same-name-e2e/events', (route) => {
+    const event = {
+      seq: 1, job_id: 'same-name-e2e', state: 'succeeded', phase: 'completed',
+      processed: 2, total: 2, succeeded: 2, skipped: 0, failed: 0,
+    }
+    return route.fulfill({
+      status: 200,
+      contentType: 'text/event-stream',
+      body: `id: 1\nevent: job\ndata: ${JSON.stringify(event)}\n\n`,
+    })
+  })
+  await page.route('**/api/v1/jobs/same-name-e2e/results', (route) => route.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify({
+      items: [
+        {
+          image_id: 'image-first', file_name: 'duplicate.png', status: 'succeeded',
+          tags: [{ text: 'first_identity', category: 'general', score: 0.91, source: 'local', model_id: 'model_demo_01' }],
+          model_results: [{ model_id: 'model_demo_01', model_name: 'WD EVA02 Large Tagger', tags: [{ text: 'first_identity', category: 'general', score: 0.91, source: 'local', model_id: 'model_demo_01' }] }],
+          artifacts: [], warnings: [], timing: {},
+        },
+        {
+          image_id: 'image-second', file_name: 'duplicate.png', status: 'succeeded',
+          tags: [{ text: 'second_identity', category: 'general', score: 0.88, source: 'local', model_id: 'model_demo_01' }],
+          model_results: [{ model_id: 'model_demo_01', model_name: 'WD EVA02 Large Tagger', tags: [{ text: 'second_identity', category: 'general', score: 0.88, source: 'local', model_id: 'model_demo_01' }] }],
+          artifacts: [], warnings: [], timing: {},
+        },
+      ],
+      total: 2,
+    }),
+  }))
+
+  await page.goto('/')
+  await page.locator('input[type="file"]').setInputFiles([
+    {
+      name: 'duplicate.png', mimeType: 'image/png',
+      buffer: Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=', 'base64'),
+    },
+    {
+      name: 'duplicate.png', mimeType: 'image/png',
+      buffer: Buffer.from('second-image-with-a-different-size'),
+    },
+  ])
+  await expect(page.getByText('2 张图片')).toBeVisible()
+  await page.getByRole('button', { name: '开始打标' }).click()
+
+  const resultPanel = page.locator('.result-panel')
+  await expect(resultPanel.locator('.tag-pill').filter({ hasText: 'first_identity' })).toBeVisible()
+  const queueRows = page.locator('.queue-row-select')
+  await expect(queueRows).toHaveCount(2)
+  await queueRows.nth(1).focus()
+  await page.keyboard.press('Enter')
+  await expect(resultPanel.locator('.tag-pill').filter({ hasText: 'second_identity' })).toBeVisible()
+  await expect(resultPanel.locator('.tag-pill').filter({ hasText: 'first_identity' })).toHaveCount(0)
+})
+
+test('workbench can reread results after the initial result requests fail', async ({ page }) => {
+  let resultRequests = 0
+  await page.route('**/api/v1/jobs', async (route) => {
+    if (route.request().method() !== 'POST') return route.fallback()
+    return route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({ ...jobSummary('running'), id: 'result-read-e2e', mode: 'local' }),
+    })
+  })
+  await page.route('**/api/v1/jobs/result-read-e2e/events', (route) => {
+    const event = {
+      seq: 1, job_id: 'result-read-e2e', state: 'succeeded', phase: 'completed',
+      processed: 1, total: 1, succeeded: 1, skipped: 0, failed: 0,
+    }
+    return route.fulfill({
+      status: 200,
+      contentType: 'text/event-stream',
+      body: `id: 1\nevent: job\ndata: ${JSON.stringify(event)}\n\n`,
+    })
+  })
+  await page.route('**/api/v1/jobs/result-read-e2e/results', (route) => {
+    resultRequests += 1
+    if (resultRequests <= 3) {
+      return route.fulfill({
+        status: 503,
+        contentType: 'application/json',
+        body: JSON.stringify({ code: 'results_unavailable', message: 'Results are still unavailable' }),
+      })
+    }
+    return route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        items: [{
+          image_id: 'image-e2e', file_name: 'task.png', status: 'succeeded',
+          tags: [{ text: 'reread_recovered', category: 'general', score: 0.9, source: 'local', model_id: 'model_demo_01' }],
+          model_results: [{ model_id: 'model_demo_01', model_name: 'WD EVA02 Large Tagger', tags: [{ text: 'reread_recovered', category: 'general', score: 0.9, source: 'local', model_id: 'model_demo_01' }] }],
+          artifacts: [], warnings: [], timing: {},
+        }],
+        total: 1,
+      }),
+    })
+  })
+
+  await page.goto('/')
+  await page.locator('input[type="file"]').setInputFiles({
+    name: 'task.png', mimeType: 'image/png',
+    buffer: Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=', 'base64'),
+  })
+  await page.getByRole('button', { name: '开始打标' }).click()
+
+  const reread = page.getByRole('button', { name: '重新读取结果' })
+  await expect(reread).toBeVisible({ timeout: 8_000 })
+  expect(resultRequests).toBe(3)
+  await reread.click()
+
+  await expect(page.locator('.result-panel').locator('.tag-pill').filter({ hasText: 'reread_recovered' })).toBeVisible()
+  await expect(reread).toHaveCount(0)
+  expect(resultRequests).toBe(4)
+})
+
 test('job stream reconnects with Last-Event-ID and supports cancel and retry', async ({ page }) => {
   await page.goto('/')
   await page.locator('input[type="file"]').setInputFiles({
@@ -809,6 +987,9 @@ async function mockApi(page: Page) {
       { id: 'model_demo_01', name: 'WD EVA02 Large Tagger', backend: 'onnx', architecture: 'eva02_large_patch14', input_size: [448, 448], loaded: true, device: 'cuda', memory_mb: 1940, threshold: 0.35, thresholds: { default: 0.35, general: 0.35, character: 0.85, rating: 0.5 }, preset_thresholds: { default: 0.35, general: 0.35, character: 0.85, rating: 0.5 }, threshold_source: 'model', trusted_pickle: false, adapters: [{ id: 'lora', name: 'LoRA', type: 'lora', enabled: false, weight: 1 }], classifiers: ['aesthetic'] },
       { id: 'model_demo_02', name: 'ConvNeXt V2 Tagger', backend: 'safetensors', architecture: 'convnextv2_huge', input_size: [384, 384], loaded: false, threshold: 0.4, thresholds: { default: 0.4, general: 0.4, character: 0.72 }, preset_thresholds: { default: 0.4, general: 0.4, character: 0.72 }, threshold_source: 'model', trusted_pickle: false, adapters: [], classifiers: ['aesthetic'] },
     ] })
+    if (pathname.endsWith('/workflows/capabilities')) return json({ profiles: ['e621', 'danbooru'], work_modes: ['full_copy', 'in_place'], resources: [] })
+    if (pathname.endsWith('/workflows/resources')) return json([])
+    if (pathname.endsWith('/workflows/jobs') && route.request().method() === 'GET') return json([])
     if (pathname.endsWith('/classifiers')) return json({ items: [
       { id: 'aesthetic', enabled: true, loaded: true, error: null },
     ] })
@@ -862,7 +1043,7 @@ function jobSummary(state: string) {
 }
 
 function routeSlug(name: typeof pages[number]) {
-  return ({ 工作台: 'workbench', 视频提示词: 'video-prompts', 批量任务: 'batch', 在线模型: 'providers', 本地模型: 'models', 设置: 'settings' })[name]
+  return ({ 工作台: 'workbench', 视频提示词: 'video-prompts', 批量任务: 'batch', 数据集工作流: 'dataset-workflow', 在线模型: 'providers', 本地模型: 'models', 设置: 'settings' })[name]
 }
 
 function fl2vaPromptPackage() {

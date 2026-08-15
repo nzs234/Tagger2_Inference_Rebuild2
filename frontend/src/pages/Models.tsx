@@ -1,7 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { AlertTriangle, Box, CheckCircle2, Cpu, Database, Download, Gauge, GitBranch, HardDrive, Layers3, Link, LoaderCircle, MemoryStick, Power, RefreshCw, RotateCcw, Search, Settings2, ShieldAlert, Sparkles, Unplug, X } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
-import { Button, EmptyState, Field, IconButton, Notice, Panel, StatusBadge } from '../components/ui'
+import { Button, DialogLayer, EmptyState, Field, IconButton, Notice, Panel, StatusBadge } from '../components/ui'
 import { api, ApiError } from '../lib/api'
 import type { ClassifierProfile, ModelDownload, ModelProfile } from '../types'
 
@@ -146,7 +146,7 @@ export function Models() {
       </div>}
     </Panel>
 
-    {downloadOpen && <div className="drawer-backdrop" role="presentation" onMouseDown={(event) => { if (event.currentTarget === event.target) setDownloadOpen(false) }}><aside className="drawer model-download-drawer" role="dialog" aria-modal="true" aria-labelledby="model-download-title">
+    {downloadOpen && <DialogLayer onClose={() => setDownloadOpen(false)}><aside className="drawer model-download-drawer" role="dialog" aria-modal="true" aria-labelledby="model-download-title">
       <header className="drawer-header"><div><p className="eyebrow">HUGGING FACE</p><h2 id="model-download-title">下载模型</h2></div><IconButton label="关闭" onClick={() => setDownloadOpen(false)}><X size={18} /></IconButton></header>
       <form className="drawer-body model-download-form" onSubmit={(event) => { event.preventDefault(); downloadMutation.mutate() }}>
         <Field label="Hugging Face 仓库地址"><div className="input-with-icon"><Link size={15} /><input aria-label="Hugging Face 仓库地址" type="url" required value={downloadUrl} onChange={(event) => setDownloadUrl(event.target.value)} placeholder="https://huggingface.co/owner/model" spellCheck={false} /></div></Field>
@@ -157,9 +157,9 @@ export function Models() {
         </div>}
         <div className="drawer-actions"><Button type="button" variant="secondary" onClick={() => setDownloadOpen(false)}>关闭</Button><Button type="submit" icon={downloadMutation.isPending || downloadRecord?.status === 'running' || downloadRecord?.status === 'queued' ? <LoaderCircle className="spin" size={15} /> : <Download size={15} />} disabled={!downloadUrl.trim() || downloadMutation.isPending || downloadRecord?.status === 'running' || downloadRecord?.status === 'queued'}>{downloadRecord?.status === 'failed' ? '重新下载' : '开始下载'}</Button></div>
       </form>
-    </aside></div>}
+    </aside></DialogLayer>}
 
-    {selected && <div className="drawer-backdrop" role="presentation" onMouseDown={(event) => { if (event.currentTarget === event.target) setSelected(undefined) }}><aside className="drawer model-drawer" role="dialog" aria-modal="true" aria-labelledby="model-settings-title">
+    {selected && <DialogLayer onClose={() => setSelected(undefined)}><aside className="drawer model-drawer" role="dialog" aria-modal="true" aria-labelledby="model-settings-title">
       <header className="drawer-header"><div><p className="eyebrow">MODEL PROFILE</p><h2 id="model-settings-title">{selected.name}</h2></div><IconButton label="关闭" onClick={() => setSelected(undefined)}><X size={18} /></IconButton></header>
       <div className="drawer-body">
         <div className="model-summary"><span className={`model-logo backend-${selected.backend}`}><ModelIcon backend={selected.backend} /></span><div><strong>{selected.architecture ?? '未标注架构'}</strong><span>{selected.backend.toUpperCase()} · {formatInput(selected.input_size)}</span></div><StatusBadge state={selected.loaded ? 'succeeded' : 'interrupted'} /></div>
@@ -177,7 +177,7 @@ export function Models() {
         </div>
         <div className="drawer-actions"><Button variant="secondary" onClick={() => setSelected(undefined)}>取消</Button><Button variant="secondary" icon={applyLoadMutation.isPending ? <LoaderCircle size={15} className="spin" /> : <Power size={15} />} disabled={applyLoadMutation.isPending || saveMutation.isPending} onClick={() => applyLoadMutation.mutate()}>{selected.loaded ? '重新加载' : '按配置加载'}</Button><Button icon={saveMutation.isPending ? <LoaderCircle size={15} className="spin" /> : <CheckCircle2 size={15} />} disabled={saveMutation.isPending || applyLoadMutation.isPending} onClick={() => saveMutation.mutate()}>保存 Profile</Button></div>
       </div>
-    </aside></div>}
+    </aside></DialogLayer>}
   </div>
 }
 

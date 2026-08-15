@@ -1,4 +1,5 @@
 export type AppPage = 'workbench' | 'video-prompts' | 'batch' | 'dataset-workflow' | 'providers' | 'models' | 'settings'
+export type ThemeMode = 'light' | 'dark' | 'system'
 export type JobMode = 'local' | 'online'
 export type JobState =
   | 'queued'
@@ -360,6 +361,24 @@ export type WorkflowJobStatus =
 export interface WorkflowPathRef {
   root_id: string
   relative_path: string
+}
+
+export type WorkflowPathBindingPreviewStatus = 'ready' | 'create_required' | 'not_applicable'
+
+export interface WorkflowPathBindingPreview {
+  status: WorkflowPathBindingPreviewStatus
+  source_bound: boolean
+  output_bound: boolean
+  output_create_required: boolean
+  warnings: string[]
+  errors: string[]
+}
+
+export interface WorkflowPathBinding {
+  status: 'ready' | 'not_applicable'
+  source: WorkflowPathRef
+  output?: WorkflowPathRef | null
+  output_created: boolean
 }
 
 export interface WorkflowResource {

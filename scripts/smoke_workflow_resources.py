@@ -74,7 +74,7 @@ def main() -> int:
     catalog = WorkflowResourceCatalog(project_root / "data" / "workflows" / "resources")
     resource_ids = {
         "classify": "classify-e621-20260812-v1",
-        "replace": "replace-e621-index-v1",
+        "replace": "replace-e621-pass-drop-v2",
         "tokenizer": "tokenizer-qwen3-0-6b-tokenizer-v1",
         "ocr": "ocr-paddleocr-2-9-1-cpu-v1",
     }
@@ -97,7 +97,7 @@ def main() -> int:
             "recursive": False,
             "caption": {"enabled": False},
             "classify": {"enabled": True, "resource_id": resource_ids["classify"]},
-            "replace": {"enabled": True, "resource_id": resource_ids["replace"]},
+        "replace": {"enabled": True, "resource_id": resource_ids["replace"]},
             "ocr": {"enabled": True, "resource_id": resource_ids["ocr"]},
             "nl": {"enabled": False},
             "count_review": {"enabled": False},

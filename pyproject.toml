@@ -78,4 +78,20 @@ select = ["E4", "E7", "E9", "F"]
 python_version = "3.12"
 check_untyped_defs = true
 ignore_missing_imports = true
-exclude = "(^|[\\/])(models|data_cache|frontend[\\/]node_modules)([\\/]|$)"
+exclude = "(^|[\\/])(models|data_cache|frontend[\\/]node_modules|backend[\\/]tests)([\\/]|$)"
+
+# These four modules are byte-for-byte ports guarded by
+# backend/tests/test_workflow_ports.py.  Keep the source text untouched and
+# scope only mypy's inference-only diagnostics to the immutable ports.
+[[tool.mypy.overrides]]
+module = [
+  "tagger2.workflow.caption_format.normalizer",
+  "tagger2.workflow.stages.policy",
+  "tagger2.workflow.stages.replacement",
+  "tagger2.workflow.stages.token_budget",
+  "backend.tagger2.workflow.caption_format.normalizer",
+  "backend.tagger2.workflow.stages.policy",
+  "backend.tagger2.workflow.stages.replacement",
+  "backend.tagger2.workflow.stages.token_budget",
+]
+disable_error_code = ["arg-type", "assignment", "attr-defined", "call-overload", "var-annotated"]

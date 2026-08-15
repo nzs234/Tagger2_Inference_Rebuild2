@@ -1,6 +1,7 @@
 ﻿"""Workflow API routes."""
 
 import json
+import stat
 from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any, Literal
@@ -40,6 +41,16 @@ def _build_public_error_codes() -> dict[type, str]:
 
 _PUBLIC_ERROR_CODES: dict[type, str] | None = None
 
+# This was the old workflow-only placeholder.  It is not a model registry ID
+# and must never be passed to LocalInferenceEngine.  Existing V1 snapshots may
+# still contain it, so the API treats it as an instruction to use the host
+# application's currently loaded local model.
+_AUTO_CAPTION_MODEL_IDS = frozenset(
+    {
+        "caption-e621-eva02-large-full-v1",
+    }
+)
+
 
 def _public_error_code(exc: BaseException) -> str:
     """Map an exception onto a stable public code via its MRO.
@@ -62,6 +73,43 @@ def _public_error_code(exc: BaseException) -> str:
 class WorkflowJobCreateRequest(BaseModel):
     """Request to create a workflow job."""
     config: dict[str, Any]
+
+
+class WorkflowPathBindingPreviewRequest(BaseModel):
+    """Absolute paths entered by the local UI before root binding."""
+
+    source_path: str
+    output_path: str | None = None
+    work_mode: Literal["full_copy", "in_place"] = "full_copy"
+
+
+class WorkflowPathBindingRequest(WorkflowPathBindingPreviewRequest):
+    """Resolve manual paths and optionally create the output directory."""
+
+    create_output: bool = False
+
+
+class WorkflowPathRefResponse(BaseModel):
+    """Internal path reference; never contains an absolute filesystem path."""
+
+    root_id: str
+    relative_path: str
+
+
+class WorkflowPathBindingPreviewResponse(BaseModel):
+    status: Literal["ready", "create_required", "not_applicable"]
+    source_bound: bool
+    output_bound: bool
+    output_create_required: bool
+    warnings: list[str] = []
+    errors: list[str] = []
+
+
+class WorkflowPathBindingResponse(BaseModel):
+    status: Literal["ready", "not_applicable"]
+    source: WorkflowPathRefResponse
+    output: WorkflowPathRefResponse | None = None
+    output_created: bool = False
 
 
 class WorkflowJobCreateResponse(BaseModel):
@@ -267,6 +315,7 @@ def create_workflow_router(
     model_registry: Any | None = None,
     inference_engine: Any | None = None,
     storage: Any | None = None,
+    root_registrar: Callable[..., Any] | None = None,
 ) -> APIRouter:
     """Create workflow API router.
 
@@ -286,7 +335,336 @@ def create_workflow_router(
     # instead of observing jobs stuck forever in ``running``.
     database.mark_interrupted_jobs()
 
-    preflight_service = WorkflowPreflightService(allowlist, resource_catalog, database)
+    preflight_service = WorkflowPreflightService(
+        allowlist,
+        resource_catalog,
+        database,
+        model_registry=model_registry,
+        inference_engine=inference_engine,
+    )
+
+    def _manual_path(raw: str, field: str) -> Path:
+        """Validate a user-entered absolute directory without exposing it."""
+
+        text = str(raw or "").strip()
+        if not text:
+            raise ValueError(f"{field} is required")
+        if "\x00" in text:
+            raise ValueError(f"{field} contains NUL")
+        if text.startswith(("\\\\?\\", "\\\\.\\")):
+            raise ValueError(f"{field} uses an unsupported device path")
+        candidate = Path(text).expanduser()
+        if not candidate.is_absolute():
+            raise ValueError(f"{field} must be an absolute path")
+        current = candidate
+        while current != current.parent:
+            try:
+                attributes = getattr(current.stat(follow_symlinks=False), "st_file_attributes", 0)
+                if current.is_symlink() or attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0):
+                    raise ValueError(f"{field} contains an unsupported reparse point")
+            except FileNotFoundError:
+                pass
+            current = current.parent
+        resolved = candidate.resolve(strict=False)
+        if resolved.parent == resolved:
+            raise ValueError(f"{field} cannot be a filesystem root")
+        return resolved
+
+    def _path_overlap(first: Path, second: Path) -> bool:
+        try:
+            first.relative_to(second)
+            return True
+        except ValueError:
+            try:
+                second.relative_to(first)
+                return True
+            except ValueError:
+                return False
+
+    def _register_manual_root(path: Path, *, kind: Literal["input", "output"]) -> Any:
+        registrar = root_registrar
+        if registrar is not None:
+            return registrar(path, name="手动输入目录" if kind == "input" else "手动输出目录", kind=kind)
+        return allowlist.register(
+            path,
+            kind=kind,
+            label="手动输入目录" if kind == "input" else "手动输出目录",
+            writable=kind == "output",
+        )
+
+    def _bind_manual_path(
+        path: Path,
+        *,
+        kind: Literal["input", "output"],
+        allow_register: bool,
+    ) -> tuple[Any | None, str]:
+        match = allowlist.find_root_for_path(
+            path,
+            kind=kind,
+            writable=True if kind == "output" else None,
+        )
+        if match is not None:
+            return match
+        if not allow_register:
+            return None, ""
+        root = _register_manual_root(path, kind=kind)
+        return root, ""
+
+    def _preview_manual_paths(request: WorkflowPathBindingPreviewRequest) -> tuple[
+        Path, Path | None, Any | None, Any | None, bool, list[str]
+    ]:
+        source = _manual_path(request.source_path, "source_path")
+        if not source.is_dir():
+            raise ValueError("source_path does not exist")
+        source_binding, _source_relative = _bind_manual_path(
+            source, kind="input", allow_register=False
+        )
+        output: Path | None = None
+        output_binding: Any | None = None
+        output_create_required = False
+        errors: list[str] = []
+        if request.work_mode == "full_copy":
+            if not request.output_path:
+                errors.append("output_path_required")
+            else:
+                output = _manual_path(request.output_path, "output_path")
+                if _path_overlap(source, output):
+                    errors.append("source_output_overlap")
+                if output.exists() and not output.is_dir():
+                    errors.append("output_path_not_directory")
+                if output.exists():
+                    output_binding, _output_relative = _bind_manual_path(
+                        output, kind="output", allow_register=False
+                    )
+                    if output_binding is not None and not output_binding.writable:
+                        errors.append("output_path_not_writable")
+                else:
+                    output_create_required = True
+                    parent = output.parent
+                    if not parent.is_dir():
+                        errors.append("output_parent_not_found")
+        return source, output, source_binding, output_binding, output_create_required, errors
+
+    @router.post("/path-bindings/preview", response_model=WorkflowPathBindingPreviewResponse)
+    async def preview_path_binding(
+        request: WorkflowPathBindingPreviewRequest,
+    ) -> WorkflowPathBindingPreviewResponse:
+        """Validate manually entered paths without registering or creating them."""
+
+        try:
+            _source, _output, source_binding, output_binding, create_required, errors = (
+                _preview_manual_paths(request)
+            )
+        except (TypeError, ValueError, OSError, PathNotAllowedError) as exc:
+            message = str(exc)
+            if isinstance(exc, (OSError, PathNotAllowedError)):
+                message = "path_binding_io_error" if isinstance(exc, OSError) else "path_not_allowed"
+            return WorkflowPathBindingPreviewResponse(
+                status="not_applicable",
+                source_bound=False,
+                output_bound=False,
+                output_create_required=False,
+                errors=[message],
+            )
+        if errors:
+            return WorkflowPathBindingPreviewResponse(
+                status="not_applicable",
+                source_bound=source_binding is not None,
+                output_bound=output_binding is not None,
+                output_create_required=create_required,
+                errors=errors,
+            )
+        return WorkflowPathBindingPreviewResponse(
+            status="create_required" if create_required else "ready",
+            source_bound=source_binding is not None,
+            output_bound=output_binding is not None,
+            output_create_required=create_required,
+        )
+
+    @router.post("/path-bindings", response_model=WorkflowPathBindingResponse)
+    async def bind_manual_paths(
+        request: WorkflowPathBindingRequest,
+    ) -> WorkflowPathBindingResponse:
+        """Bind complete paths to the existing workflow path-reference contract."""
+
+        try:
+            source, output, _source_binding, _output_binding, create_required, errors = (
+                _preview_manual_paths(request)
+            )
+            if errors:
+                raise ValueError("; ".join(errors))
+            if create_required and not request.create_output:
+                raise ValueError("output_creation_confirmation_required")
+            created_output_path: Path | None = None
+            try:
+                if output is not None and create_required:
+                    output.mkdir(parents=True, exist_ok=False)
+                    created_output_path = output
+                source_root, source_relative = _bind_manual_path(
+                    source, kind="input", allow_register=True
+                )
+                if source_root is None:
+                    raise ValueError("source_path_binding_failed")
+                output_ref: WorkflowPathRefResponse | None = None
+                output_created = False
+                if output is not None:
+                    output_root, output_relative = _bind_manual_path(
+                        output, kind="output", allow_register=True
+                    )
+                    if output_root is None:
+                        raise ValueError("output_path_binding_failed")
+                    output_ref = WorkflowPathRefResponse(
+                        root_id=str(output_root.root_id), relative_path=output_relative
+                    )
+                    output_created = create_required
+                return WorkflowPathBindingResponse(
+                    status="ready" if request.work_mode == "full_copy" else "not_applicable",
+                    source=WorkflowPathRefResponse(
+                        root_id=str(source_root.root_id), relative_path=source_relative
+                    ),
+                    output=output_ref,
+                    output_created=output_created,
+                )
+            except Exception:
+                # Never remove a pre-existing directory.  If a later
+                # registration/persistence step fails, clean up only the
+                # empty directory this request created.
+                if created_output_path is not None:
+                    try:
+                        if not any(created_output_path.iterdir()):
+                            created_output_path.rmdir()
+                    except OSError:
+                        pass
+                raise
+        except (TypeError, ValueError, OSError, PathNotAllowedError) as exc:
+            message = str(exc)
+            if isinstance(exc, (OSError, PathNotAllowedError)):
+                message = "path_binding_io_error" if isinstance(exc, OSError) else "path_not_allowed"
+            raise HTTPException(
+                status_code=400,
+                detail={"code": "path_binding_failed", "message": message},
+            ) from exc
+
+    def _registered_model(model_id: str) -> Any | None:
+        """Resolve a model through the host registry without leaking paths."""
+
+        if model_registry is None:
+            return None
+        try:
+            record = model_registry.get_model(model_id)
+        except (AttributeError, KeyError, LookupError, ValueError, RuntimeError):
+            record = None
+        if record is not None:
+            return record
+
+        # Workbench/Batch accept the model display name and directory name as
+        # selectors in addition to the opaque registry id.  Preserve that
+        # compatibility for workflow callers, but persist the canonical id.
+        try:
+            records = list(model_registry.list())
+        except (AttributeError, TypeError):
+            return None
+        folded = model_id.casefold()
+        matches = [
+            item
+            for item in records
+            if folded
+            in {
+                str(getattr(item, "model_id", "")).casefold(),
+                str(getattr(item, "name", "")).casefold(),
+                getattr(getattr(item, "path", None), "name", "").casefold(),
+            }
+        ]
+        return matches[0] if len(matches) == 1 else None
+
+    def _resolve_caption_model(
+        config: WorkflowJobConfigV2,
+        *,
+        require_loaded: bool = True,
+    ) -> WorkflowJobConfigV2:
+        """Bind Caption to the existing local inference model configuration.
+
+        The single-image and batch surfaces already establish the source of
+        truth for local model loading, thresholds, preprocessing and adapters:
+        ``ModelRegistry`` plus ``LocalInferenceEngine``.  Dataset Workflow
+        must not invent a second model id or silently use a different default.
+        A legacy placeholder (or omitted model id, which is normalized to that
+        placeholder by the V1 reader) selects the first model currently loaded
+        by the host runtime.  The canonical opaque id is persisted in the job
+        snapshot, so a resumed job is deterministic.
+        """
+
+        if not bool(config.caption.get("enabled")):
+            return config
+        if model_registry is None or inference_engine is None:
+            raise ValueError(
+                "caption stage requires the host local model runtime; "
+                "load a local model from the Models page first"
+            )
+
+        requested = str(config.caption.get("model_id") or "").strip()
+        record: Any | None = None
+        if requested and requested not in _AUTO_CAPTION_MODEL_IDS:
+            record = _registered_model(requested)
+            if record is None:
+                raise ValueError(f"caption local model is not registered: {requested}")
+            loaded_id_set = {
+                str(value)
+                for value in getattr(inference_engine, "loaded_model_ids", ())
+                if str(value)
+            }
+            if require_loaded and not bool(getattr(record, "loaded", False)) and str(
+                getattr(record, "model_id", "")
+            ) not in loaded_id_set:
+                raise ValueError(
+                    "caption local model is not loaded; "
+                    "load it from the Models page before creating the job"
+                )
+        else:
+            loaded_ids: list[str]
+            try:
+                loaded_ids = [
+                    str(value)
+                    for value in getattr(inference_engine, "loaded_model_ids", ())
+                    if str(value)
+                ]
+            except (TypeError, AttributeError):
+                loaded_ids = []
+            for model_id in loaded_ids:
+                if (candidate := _registered_model(model_id)) is not None:
+                    record = candidate
+                    break
+
+            # Some test/runtime adapters expose only ModelRecord.loaded.  It
+            # is still the same host registry state, so accept that form too.
+            if record is None:
+                try:
+                    records = list(model_registry.list())
+                except (AttributeError, TypeError):
+                    records = []
+                record = next(
+                    (
+                        item
+                        for item in records
+                        if bool(getattr(item, "loaded", False))
+                        and str(getattr(item, "model_id", ""))
+                    ),
+                    None,
+                )
+            if record is None:
+                raise ValueError(
+                    "caption stage requires a loaded local model; "
+                    "load one from the Models page before creating the job"
+                )
+
+        canonical_id = str(getattr(record, "model_id", "")).strip()
+        if not canonical_id:
+            raise ValueError("caption local model has no canonical registry id")
+        values = config.to_dict()
+        caption = dict(config.caption)
+        caption["model_id"] = canonical_id
+        values["caption"] = caption
+        return WorkflowJobConfigV2.from_payload(values)
 
     def _token_counter_for_config(config: WorkflowJobConfigV2):
         """Resolve the immutable tokenizer resource for one job.
@@ -400,6 +778,10 @@ def create_workflow_router(
                     raise
     
             config = WorkflowJobConfigV2.from_payload(json.loads(job["config_json"]))
+            # Older rows can still contain the workflow placeholder model id.
+            # Rebind them at the execution boundary so recovery uses the same
+            # local model selection as a newly-created job.
+            config = _resolve_caption_model(config, require_loaded=False)
             workspace = Path(job["workspace_path"])
     
             # Resolve physical paths from root references
@@ -436,6 +818,39 @@ def create_workflow_router(
                 resource_fingerprints[resource_id] = manifest.resource_fingerprint
                 frozen_manifests[resource_id] = dict(manifest.__dict__)
 
+            def verify_frozen_resources() -> None:
+                for resource_id, fingerprint in resource_fingerprints.items():
+                    if resource_id.startswith("model:") or resource_id.startswith("provider:"):
+                        continue
+                    current = resource_catalog.get_manifest(resource_id)
+                    path = resource_catalog.get_resource_path(resource_id)
+                    if (
+                        current is None
+                        or path is None
+                        or current.resource_fingerprint != fingerprint
+                    ):
+                        raise ValueError(f"resource hash drift detected: {resource_id}")
+
+            def verify_host_model() -> None:
+                model_id = str(config.caption.get("model_id") or "")
+                if not config.caption.get("enabled") or not model_id:
+                    return
+                record = _registered_model(model_id)
+                weight_path = (
+                    Path(str(getattr(record, "weight_path", "")))
+                    if record is not None
+                    else None
+                )
+                expected = resource_fingerprints.get(f"model:{model_id}")
+                if expected and (weight_path is None or not weight_path.is_file()):
+                    raise ValueError(f"caption model weight is unavailable: {model_id}")
+                if expected and weight_path is not None and resource_catalog.fingerprint_file(weight_path) != expected:
+                    raise ValueError(f"caption model hash drift detected: {model_id}")
+
+            def verify_all_frozen_resources() -> None:
+                verify_frozen_resources()
+                verify_host_model()
+
             for section_name, resource_key in (
                 ("classify", "resource_id"),
                 ("replace", "resource_id"),
@@ -447,6 +862,37 @@ def create_workflow_router(
                     resource_id = str(section.get(resource_key, ""))
                     if resource_id:
                         freeze_resource(resource_id)
+
+            # Caption and NL are backed by host registries rather than the
+            # workflow catalog.  Freeze their stable identities alongside the
+            # content-addressed resources so a recovery report explains which
+            # local model/provider was used.  Host model files remain outside
+            # the workflow catalog and are never copied into a job workspace.
+            caption_model_id = str(config.caption.get("model_id") or "")
+            if config.caption.get("enabled") and caption_model_id:
+                model_record = _registered_model(caption_model_id)
+                if model_record is not None:
+                    weight_path = Path(str(getattr(model_record, "weight_path", "")))
+                    if weight_path.is_file():
+                        model_digest = resource_catalog.fingerprint_file(weight_path)
+                        resource_fingerprints[f"model:{caption_model_id}"] = (
+                            model_digest
+                        )
+                        frozen_manifests[f"model:{caption_model_id}"] = {
+                            "model_id": caption_model_id,
+                            "name": str(getattr(model_record, "name", "")),
+                            "backend": str(getattr(getattr(model_record, "backend", None), "value", "")),
+                            "weight_name": weight_path.name,
+                            "size_bytes": weight_path.stat().st_size,
+                            "weight_digest": model_digest,
+                        }
+
+            provider_id = str(config.nl.get("provider_id") or "")
+            if config.nl.get("enabled") and provider_id:
+                frozen_manifests[f"provider:{provider_id}"] = {
+                    "provider_id": provider_id,
+                    "model": config.nl.get("model"),
+                }
 
             # Wire up resources from catalog
             replacement_index_path = None
@@ -606,6 +1052,7 @@ def create_workflow_router(
                 nl_client=nl_client,
                 database=database,
                 job_id=job_id,
+                resource_verifier=verify_all_frozen_resources,
             )
     
             # Persist the stage report so the UI can read per-stage counters
@@ -1488,6 +1935,7 @@ def create_workflow_router(
         """Validate job configuration before creation."""
         try:
             job_config = WorkflowJobConfigV2.from_payload(config)
+            job_config = _resolve_caption_model(job_config)
             report = preflight_service.validate_config(job_config)
             return report
         except WorkflowPreflightError as exc:
@@ -1503,6 +1951,7 @@ def create_workflow_router(
         """Create a draft workflow job; execution requires an explicit start."""
         try:
             job_config = WorkflowJobConfigV2.from_payload(request.config)
+            job_config = _resolve_caption_model(job_config)
             
             # Run preflight validation
             preflight_service.validate_config(job_config)

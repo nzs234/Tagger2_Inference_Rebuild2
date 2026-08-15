@@ -41,7 +41,7 @@ export function VideoPrompts() {
   const controllerRef = useRef<AbortController | undefined>(undefined)
 
   const providers = useQuery({ queryKey: ['providers'], queryFn: api.providers, staleTime: 60_000 })
-  const providerItems = providers.data?.items ?? []
+  const providerItems = useMemo(() => providers.data?.items ?? [], [providers.data?.items])
   const currentRevision = useMemo(
     () => revisions.find((revision) => revision.id === currentRevisionId),
     [currentRevisionId, revisions],
@@ -175,11 +175,11 @@ export function VideoPrompts() {
         <FileDropzone onFiles={selectImages} disabled={isGenerating || availableImageSlots === 0} multiple={availableImageSlots > 1} maxFiles={availableImageSlots} label="添加参考图片" detail={`还可添加 ${availableImageSlots} 张图片`} />
         <div className="video-preset-control">
           <div className="video-preset-heading"><span>提示词预设</span><small>{promptMode === 'fl2va' ? `${baseMode.toUpperCase()} · H3 Base` : 'Ref2VA · 可复用视觉引用'}</small></div>
-          <div className="mode-switch video-preset-switch" role="tablist" aria-label="视频提示词模型">
-            <button type="button" role="tab" aria-selected={promptMode === 'ref2va'} className={promptMode === 'ref2va' ? 'mode-active' : ''} onClick={() => changePromptMode('ref2va')} disabled={isGenerating}>Ref2VA</button>
-            <button type="button" role="tab" aria-selected={promptMode === 'fl2va'} className={promptMode === 'fl2va' ? 'mode-active' : ''} onClick={() => changePromptMode('fl2va')} disabled={isGenerating}>FL2VA</button>
+          <div className="mode-switch video-preset-switch" role="group" aria-label="视频提示词模型">
+            <button type="button" aria-pressed={promptMode === 'ref2va'} className={promptMode === 'ref2va' ? 'mode-active' : ''} onClick={() => changePromptMode('ref2va')} disabled={isGenerating}>Ref2VA</button>
+            <button type="button" aria-pressed={promptMode === 'fl2va'} className={promptMode === 'fl2va' ? 'mode-active' : ''} onClick={() => changePromptMode('fl2va')} disabled={isGenerating}>FL2VA</button>
           </div>
-          {promptMode === 'fl2va' && images.length === 1 && <div className="video-single-role"><span>单图角色</span><div className="mode-switch video-preset-switch" role="tablist" aria-label="单图关键帧角色"><button type="button" role="tab" aria-selected={fl2vaSingleImageRole === 'first'} className={fl2vaSingleImageRole === 'first' ? 'mode-active' : ''} onClick={() => changeSingleImageRole('first')} disabled={isGenerating}>首帧 I2VA</button><button type="button" role="tab" aria-selected={fl2vaSingleImageRole === 'last'} className={fl2vaSingleImageRole === 'last' ? 'mode-active' : ''} onClick={() => changeSingleImageRole('last')} disabled={isGenerating}>末帧 L2VA</button></div></div>}
+          {promptMode === 'fl2va' && images.length === 1 && <div className="video-single-role"><span>单图角色</span><div className="mode-switch video-preset-switch" role="group" aria-label="单图关键帧角色"><button type="button" aria-pressed={fl2vaSingleImageRole === 'first'} className={fl2vaSingleImageRole === 'first' ? 'mode-active' : ''} onClick={() => changeSingleImageRole('first')} disabled={isGenerating}>首帧 I2VA</button><button type="button" aria-pressed={fl2vaSingleImageRole === 'last'} className={fl2vaSingleImageRole === 'last' ? 'mode-active' : ''} onClick={() => changeSingleImageRole('last')} disabled={isGenerating}>末帧 L2VA</button></div></div>}
         </div>
         <div className="video-provider-fields">
           <Field label="Provider"><select aria-label="Provider" value={providerId} disabled={isGenerating} onChange={(event) => {
@@ -209,7 +209,7 @@ export function VideoPrompts() {
         </form>
       </Panel>
 
-      <Panel title={promptMode === 'fl2va' ? `H3 ${baseMode.toUpperCase()} 套件` : 'H3 Ref2VA 套件'} eyebrow="03 / OUTPUT" className="video-output-panel" actions={viewedRevision ? <div className="video-language-switch" role="tablist" aria-label="输出语言">{([['both', '中英'], ['zh', '中文'], ['en', 'EN']] as const).map(([value, label]) => <button key={value} type="button" role="tab" aria-selected={displayLanguage === value} className={displayLanguage === value ? 'video-language-active' : ''} onClick={() => setDisplayLanguage(value)}>{label}</button>)}</div> : undefined}>
+      <Panel title={promptMode === 'fl2va' ? `H3 ${baseMode.toUpperCase()} 套件` : 'H3 Ref2VA 套件'} eyebrow="03 / OUTPUT" className="video-output-panel" actions={viewedRevision ? <div className="video-language-switch" role="group" aria-label="输出语言">{([['both', '中英'], ['zh', '中文'], ['en', 'EN']] as const).map(([value, label]) => <button key={value} type="button" aria-pressed={displayLanguage === value} className={displayLanguage === value ? 'video-language-active' : ''} onClick={() => setDisplayLanguage(value)}>{label}</button>)}</div> : undefined}>
         {viewedRevision ? <PromptPackageView
           revision={viewedRevision}
           current={viewedRevision.id === currentRevisionId}

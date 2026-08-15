@@ -1,13 +1,13 @@
 import { ArrowRight, Clipboard, Cpu, FileJson, Gauge, Image as ImageIcon, LoaderCircle, Play, RefreshCw, RotateCcw, Send, Tags, Trash2, UploadCloud, X } from 'lucide-react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { ClassifierSelector } from '../components/ClassifierSelector'
 import { FileDropzone } from '../components/FileDropzone'
 import { JobControls } from '../components/JobControls'
 import { JsonTree } from '../components/JsonTree'
 import { PromptEditors } from '../components/PromptEditors'
 import { TagCloud } from '../components/TagCloud'
-import { Button, EmptyState, Field, IconButton, Notice, Panel, ProgressBar, StatusBadge, VirtualList } from '../components/ui'
+import { Button, DialogLayer, EmptyState, Field, IconButton, Notice, Panel, ProgressBar, StatusBadge, VirtualList } from '../components/ui'
 import { useJobEvents, type StreamState } from '../hooks/useJobEvents'
 import { useOnlinePrompts } from '../hooks/useOnlinePrompts'
 import { api, ApiError } from '../lib/api'
@@ -22,7 +22,7 @@ const terminalStates = new Set<JobState>(['succeeded', 'failed', 'cancelled', 'i
 export function Workbench() {
   const queryClient = useQueryClient()
   const setPage = usePreferences((state) => state.setPage)
-  const { items, selectedId, addFiles, remove, clear, select, update, updateByName, setAllState } = useQueueStore()
+  const { items, selectedId, addFiles, remove, clear, select, update, setAllState } = useQueueStore()
   const [localEnabled, setLocalEnabled] = useState(true)
   const [onlineEnabled, setOnlineEnabled] = useState(false)
   const [providerId, setProviderId] = useState('')
@@ -38,17 +38,20 @@ export function Workbench() {
   const [streamRestarts, setStreamRestarts] = useState<Partial<Record<JobMode, number>>>({})
   const [channelResults, setChannelResults] = useState<ChannelResults>({})
   const [completedModes, setCompletedModes] = useState<JobMode[]>([])
+  const [resultLoadErrors, setResultLoadErrors] = useState<JobMode[]>([])
   const [startupErrors, setStartupErrors] = useState<string[]>([])
   const [message, setMessage] = useState<{ tone: 'info' | 'warning' | 'danger' | 'success'; text: string } | null>(null)
   const [isStarting, setIsStarting] = useState(false)
   const loadedJobs = useRef(new Set<string>())
+  const loadingJobs = useRef(new Set<string>())
+  const imageQueueIds = useRef(new Map<string, string>())
   const completionHandled = useRef(false)
 
   const providers = useQuery({ queryKey: ['providers'], queryFn: api.providers, staleTime: 60_000 })
   const onlinePrompts = useOnlinePrompts()
   const models = useQuery({ queryKey: ['models'], queryFn: api.models, staleTime: 10_000, refetchInterval: 15_000 })
   const classifiers = useQuery({ queryKey: ['classifiers'], queryFn: api.classifiers, staleTime: 30_000, retry: false })
-  const providerItems = providers.data?.items ?? []
+  const providerItems = useMemo(() => providers.data?.items ?? [], [providers.data?.items])
   const modelItems = models.data?.items ?? []
   const loadedModels = modelItems.filter((model) => model.loaded)
   const localModelIds = loadedModels.map((model) => model.id)
@@ -58,7 +61,7 @@ export function Workbench() {
     return result
   }, {})
   const selected = items.find((item) => item.id === selectedId)
-  const selectedResults = selected ? channelResults[selected.file.name] : undefined
+  const selectedResults = selected ? channelResults[selected.id] : undefined
   const localResult = selectedResults?.local
   const onlineResult = selectedResults?.online
   const hasResult = Boolean(localResult || onlineResult)
@@ -75,38 +78,51 @@ export function Workbench() {
   }, [providerId, providerItems])
 
   const handleEvent = useCallback((next: JobEvent) => {
-    const total = Math.max(next.total, 1)
-    if (next.current_item && !terminalStates.has(next.state)) {
-      updateByName(next.current_item, 'processing')
-    }
-    if (next.total) {
-      const percent = Math.round((next.processed / total) * 100)
-      items.filter((item) => item.state === 'processing').forEach((item) => {
-        update(item.id, { progress: Math.max(item.progress, percent) })
-      })
-    }
-  }, [items, update, updateByName])
+    if (!next.current_item || terminalStates.has(next.state)) return
+    const queueItemId = imageQueueIds.current.get(next.current_item)
+    if (queueItemId) update(queueItemId, { state: 'processing' })
+  }, [update])
   const onLocalEvent = useCallback((event: JobEvent) => handleEvent(event), [handleEvent])
   const onOnlineEvent = useCallback((event: JobEvent) => handleEvent(event), [handleEvent])
   const localStream = useJobEvents(activeJobs.local, { onEvent: onLocalEvent, restartKey: streamRestarts.local })
   const onlineStream = useJobEvents(activeJobs.online, { onEvent: onOnlineEvent, restartKey: streamRestarts.online })
 
   const loadResults = useCallback(async (mode: JobMode, jobId: string) => {
-    if (loadedJobs.current.has(jobId)) return
-    loadedJobs.current.add(jobId)
+    if (loadedJobs.current.has(jobId) || loadingJobs.current.has(jobId)) return
+    loadingJobs.current.add(jobId)
     try {
-      const payload = await api.results(jobId)
+      let payload: Awaited<ReturnType<typeof api.results>> | undefined
+      let lastError: unknown
+      for (let attempt = 0; attempt < 3 && !payload; attempt += 1) {
+        try {
+          payload = await api.results(jobId)
+        } catch (error) {
+          lastError = error
+          if (attempt < 2) await new Promise((resolve) => window.setTimeout(resolve, 500 * 2 ** attempt))
+        }
+      }
+      if (!payload) throw lastError
+
+      const resolved = payload.items.map((item) => {
+        const queueItemId = imageQueueIds.current.get(item.image_id)
+        if (!queueItemId) throw new Error(`结果 ${item.image_id} 无法关联到上传队列`)
+        return [queueItemId, item] as const
+      })
       setChannelResults((current) => {
         const next = { ...current }
-        for (const item of payload.items) {
-          next[item.file_name] = { ...next[item.file_name], [mode]: item }
+        for (const [queueItemId, item] of resolved) {
+          next[queueItemId] = { ...next[queueItemId], [mode]: item }
         }
         return next
       })
-    } catch (error) {
-      setMessage({ tone: 'danger', text: error instanceof ApiError ? error.message : `${mode === 'local' ? '本地' : '在线'}结果读取失败` })
-    } finally {
+      loadedJobs.current.add(jobId)
+      setResultLoadErrors((current) => current.filter((item) => item !== mode))
       setCompletedModes((current) => current.includes(mode) ? current : [...current, mode])
+    } catch (error) {
+      setResultLoadErrors((current) => current.includes(mode) ? current : [...current, mode])
+      setMessage({ tone: 'danger', text: error instanceof ApiError ? error.message : error instanceof Error ? error.message : `${mode === 'local' ? '本地' : '在线'}结果读取失败` })
+    } finally {
+      loadingJobs.current.delete(jobId)
       void queryClient.invalidateQueries({ queryKey: ['jobs'] })
     }
   }, [queryClient])
@@ -139,7 +155,7 @@ export function Workbench() {
     completionHandled.current = true
     let failed = 0
     for (const item of items) {
-      const results = channelResults[item.file.name]
+      const results = channelResults[item.id]
       const itemFailed = startupErrors.length > 0 || modes.some((mode) => !results?.[mode] || results[mode]?.status === 'failed')
       if (itemFailed) failed += 1
       update(item.id, {
@@ -162,12 +178,17 @@ export function Workbench() {
     setStreamRestarts({})
     setChannelResults({})
     setCompletedModes([])
+    setResultLoadErrors([])
     setStartupErrors([])
     loadedJobs.current.clear()
+    loadingJobs.current.clear()
+    imageQueueIds.current.clear()
     completionHandled.current = false
     setAllState('uploading')
     try {
       const upload = await api.upload(items.map((item) => item.file))
+      if (upload.files.length !== items.length) throw new Error('上传响应与队列数量不一致')
+      imageQueueIds.current = new Map(upload.files.map((file, index) => [file.id, items[index]!.id]))
       setAllState('queued')
       const output = {
         json: false,
@@ -274,7 +295,11 @@ export function Workbench() {
     setStreamRestarts({})
     setChannelResults({})
     setCompletedModes([])
+    setResultLoadErrors([])
     setStartupErrors([])
+    loadedJobs.current.clear()
+    loadingJobs.current.clear()
+    imageQueueIds.current.clear()
   }
   const activeStates = (['local', 'online'] as const)
     .filter((mode) => activeJobs[mode])
@@ -313,12 +338,20 @@ export function Workbench() {
         </div>
       </div>
     </div>
-    {message && <Notice tone={message.tone}>{message.text}<IconButton label="关闭提示" onClick={() => setMessage(null)}><X size={15} /></IconButton></Notice>}
+    {message && <Notice tone={message.tone}>{message.text}{resultLoadErrors.length > 0 && <Button type="button" size="sm" variant="secondary" icon={<RefreshCw size={14} />} onClick={() => {
+      resultLoadErrors.forEach((mode) => {
+        const jobId = activeJobs[mode]
+        if (jobId) void loadResults(mode, jobId)
+      })
+    }}>重新读取结果</Button>}<IconButton label="关闭提示" onClick={() => setMessage(null)}><X size={15} /></IconButton></Notice>}
     <div className="workbench-grid">
       <Panel title="输入队列" eyebrow="01 / QUEUE" className="queue-panel">
         <FileDropzone onFiles={addFiles} disabled={isStarting} />
         <div className="queue-toolbar"><span>{items.length ? `${items.length} 张图片` : '队列为空'}</span>{items.length > 0 && <Button variant="quiet" size="sm" icon={<Trash2 size={14} />} onClick={resetWorkbench}>清空</Button>}</div>
-        <VirtualList items={items} height={Math.min(430, Math.max(112, items.length * 72))} rowHeight={72} getKey={(item) => item.id} empty={<EmptyState icon={<UploadCloud size={22} />} title="还没有图片" detail="拖入、选择或粘贴图片后开始" />} renderRow={(item) => <div className={`queue-row ${selectedId === item.id ? 'queue-row-selected' : ''}`} role="button" tabIndex={0} onClick={() => select(item.id)} onKeyDown={(event) => { if (event.key === 'Enter' || event.key === ' ') select(item.id) }}><img src={item.previewUrl} alt="" className="queue-thumb" /><span className="queue-row-main"><strong title={item.file.name}>{item.file.name}</strong><small>{formatBytes(item.file.size)}</small><ProgressBar value={item.progress} /></span><span className="queue-row-state"><StatusBadge state={item.state} /><IconButton label={`移除 ${item.file.name}`} onClick={(event) => { event.stopPropagation(); remove(item.id) }}><X size={14} /></IconButton></span></div>} />
+        <VirtualList items={items} height={Math.min(430, Math.max(112, items.length * 72))} rowHeight={72} getKey={(item) => item.id} empty={<EmptyState icon={<UploadCloud size={22} />} title="还没有图片" detail="拖入、选择或粘贴图片后开始" />} renderRow={(item) => <div className={`queue-row ${selectedId === item.id ? 'queue-row-selected' : ''}`}>
+          <button type="button" className="queue-row-select" aria-pressed={selectedId === item.id} onClick={() => select(item.id)}><img src={item.previewUrl} alt="" className="queue-thumb" /><span className="queue-row-main"><strong title={item.file.name}>{item.file.name}</strong><small>{formatBytes(item.file.size)}</small><ProgressBar value={item.progress} label={`${item.file.name} 进度`} /></span></button>
+          <span className="queue-row-state"><StatusBadge state={item.state} /><IconButton label={`移除 ${item.file.name}`} disabled={isStarting} onClick={() => remove(item.id)}><X size={14} /></IconButton></span>
+        </div>} />
       </Panel>
 
       <Panel title="预览" eyebrow="02 / PREVIEW" className="preview-panel">
@@ -353,11 +386,11 @@ export function Workbench() {
         <fieldset className="field toggle-field"><legend className="field-label">结果格式</legend><div className="toggle-row"><label className="toggle"><input aria-label="下划线替空格" type="checkbox" checked={replaceUnderscores} onChange={(event) => setReplaceUnderscores(event.target.checked)} /><span />下划线替空格</label><label className="toggle"><input aria-label="输出 Rating 标签" type="checkbox" checked={includeRating} onChange={(event) => setIncludeRating(event.target.checked)} /><span />输出 Rating</label><label className="toggle"><input aria-label="括号转义" type="checkbox" checked={escapeParentheses} onChange={(event) => setEscapeParentheses(event.target.checked)} /><span />括号转义</label></div></fieldset>
       </footer>
     </Panel>
-    {thresholdEditor && <div className="drawer-backdrop" role="presentation" onMouseDown={(event) => { if (event.currentTarget === event.target) setThresholdEditor(undefined) }}><div className="secret-dialog quick-threshold-dialog" role="dialog" aria-modal="true" aria-labelledby="quick-threshold-title">
+    {thresholdEditor && <DialogLayer onClose={() => setThresholdEditor(undefined)}><div className="secret-dialog quick-threshold-dialog" role="dialog" aria-modal="true" aria-labelledby="quick-threshold-title">
       <header><span className="dialog-icon"><Gauge size={20} /></span><div><p className="eyebrow">TASK THRESHOLD</p><h2 id="quick-threshold-title">{thresholdEditor.name}</h2></div><IconButton label="关闭" onClick={() => setThresholdEditor(undefined)}><X size={17} /></IconButton></header>
       <div className="dialog-body"><Notice tone="info">这里只调整当前工作台任务，不会修改模型文件或本地模型页面的默认配置。</Notice><div className="threshold-list">{thresholdKeys(thresholdDraft).map((key) => { const value = thresholdDraft[key] ?? 0; return <Field key={key} label={`${thresholdName(key)} ${value.toFixed(2)}`}><input aria-label={`${thresholdName(key)}阈值`} type="range" min="0" max="1" step="0.01" value={value} onChange={(event) => setThresholdDraft((current) => ({ ...current, [key]: Number(event.target.value) }))} /></Field> })}</div></div>
       <footer><Button type="button" variant="quiet" icon={<RotateCcw size={14} />} onClick={() => setThresholdDraft(effectiveThresholds(thresholdEditor))}>恢复模型当前值</Button><span className="drawer-actions-spacer" /><Button type="button" variant="secondary" onClick={() => setThresholdEditor(undefined)}>取消</Button><Button type="button" icon={<Gauge size={15} />} onClick={applyThresholdDraft}>应用到本次任务</Button></footer>
-    </div></div>}
+    </div></DialogLayer>}
   </div>
 }
 

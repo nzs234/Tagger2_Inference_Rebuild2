@@ -26,7 +26,7 @@ export default tseslint.config(
       'react-hooks/refs': 'off',
       'react-hooks/incompatible-library': 'off',
       'react-hooks/preserve-manual-memoization': 'off',
-      'react-hooks/exhaustive-deps': 'off',
+      'react-hooks/exhaustive-deps': 'error',
     },
   },
 )

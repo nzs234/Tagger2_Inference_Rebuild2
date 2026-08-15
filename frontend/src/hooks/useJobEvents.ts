@@ -14,11 +14,21 @@ const TERMINAL = new Set(['cancelled', 'succeeded', 'failed', 'interrupted'])
 
 function delay(ms: number, signal: AbortSignal): Promise<void> {
   return new Promise((resolve, reject) => {
-    const timer = window.setTimeout(resolve, ms)
-    signal.addEventListener('abort', () => {
-      window.clearTimeout(timer)
+    if (signal.aborted) {
       reject(signal.reason)
-    }, { once: true })
+      return
+    }
+    const cleanup = () => signal.removeEventListener('abort', onAbort)
+    const timer = window.setTimeout(() => {
+      cleanup()
+      resolve()
+    }, ms)
+    const onAbort = () => {
+      window.clearTimeout(timer)
+      cleanup()
+      reject(signal.reason)
+    }
+    signal.addEventListener('abort', onAbort, { once: true })
   })
 }
 
@@ -39,29 +49,38 @@ export function useJobEvents(jobId: string | undefined, options: UseJobEventsOpt
     const decoder = new TextDecoder()
     let buffer = ''
 
-    while (!signal.aborted) {
-      const { done, value } = await reader.read()
-      if (done) break
-      buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, '\n')
-      let boundary = buffer.indexOf('\n\n')
-      while (boundary >= 0) {
-        const block = buffer.slice(0, boundary)
-        buffer = buffer.slice(boundary + 2)
-        const lines = block.split('\n')
-        const data = lines.filter((line) => line.startsWith('data:')).map((line) => line.slice(5).trim()).join('\n')
-        const id = lines.find((line) => line.startsWith('id:'))?.slice(3).trim()
-        if (id && Number.isFinite(Number(id))) lastSeq.current = Number(id)
-        if (data) {
-          const parsed = JSON.parse(data) as JobEvent
-          lastSeq.current = parsed.seq ?? lastSeq.current
-          setEvent(parsed)
-          onEventRef.current?.(parsed)
-          if (TERMINAL.has(parsed.state)) return true
+    try {
+      while (!signal.aborted) {
+        const { done, value } = await reader.read()
+        if (done) break
+        buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, '\n')
+        let boundary = buffer.indexOf('\n\n')
+        while (boundary >= 0) {
+          const block = buffer.slice(0, boundary)
+          buffer = buffer.slice(boundary + 2)
+          const lines = block.split('\n')
+          const data = lines.filter((line) => line.startsWith('data:')).map((line) => line.slice(5).trim()).join('\n')
+          const id = lines.find((line) => line.startsWith('id:'))?.slice(3).trim()
+          if (id && Number.isFinite(Number(id))) lastSeq.current = Number(id)
+          if (data) {
+            const parsed = JSON.parse(data) as JobEvent
+            lastSeq.current = parsed.seq ?? lastSeq.current
+            setEvent(parsed)
+            onEventRef.current?.(parsed)
+            if (TERMINAL.has(parsed.state)) return true
+          }
+          boundary = buffer.indexOf('\n\n')
         }
-        boundary = buffer.indexOf('\n\n')
       }
+      return false
+    } finally {
+      try {
+        await reader.cancel()
+      } catch {
+        // The stream may already be closed or aborted.
+      }
+      reader.releaseLock()
     }
-    return false
   }, [])
 
   useEffect(() => {

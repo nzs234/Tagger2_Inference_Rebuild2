@@ -15,18 +15,22 @@ This file records the remaining production-scale work after the workflow control
 
 ## Remaining release work
 
-1. Extend the current pipeline/import/export/review stage runs into Caption/Classify/Replace/OCR/NL and 500-sample durable leases.
-2. Run a real e621 profile with explicitly imported classification snapshot, replacement index, tokenizer and CPU OCR runtime. Missing resources must be reported as `blocked_resource`, never replaced with mocks.
+1. Add 500-sample durable leases and batching. Caption, Classify, Replace, OCR, NL, Policy and Token Budget now emit durable stage rows in addition to pipeline/import/export/review.
+2. Keep the real e621 profile resources explicitly provisioned and re-verify
+   their digests when the catalog is refreshed. Missing resources must be
+   reported as `blocked_resource`, never replaced with mocks.
 3. Add 100k control-plane pressure, restart, disk-full, DB-lock, worker-hang, SSRF, hash-drift, path-traversal and commit/restore power-loss tests.
-4. Add baseline-drift checks and durable per-file undo/artifact records to the commit/Restore transaction boundary; stream large files instead of loading them as one `bytes` object.
+4. Add durable per-file undo/artifact records to the commit/Restore transaction boundary. Baseline-drift checks and streaming large-file copy/restore are now implemented; power-loss recovery coverage remains follow-up work.
 5. Upgrade the Dataset Workflow event-cursor polling adapter to long-lived SSE where deployment authentication/proxy constraints permit it.
-6. Re-run full repository mypy after legacy non-workflow errors are addressed; changed workflow modules already pass mypy and Ruff.
+6. Keep the full repository mypy/Ruff gates in the release checklist. The
+   current runtime reports both clean; immutable source ports use only scoped
+   mypy diagnostic overrides to preserve byte-level parity.
 
 ## Verification snapshot
 
-- Backend: `407 passed, 1 skipped`.
-- Frontend: `38 passed`; ESLint and TypeScript/Vite build pass.
-- Workflow mypy/Ruff: pass in the runtime tool environment.
+- Backend: `420 passed, 1 skipped`.
+- Frontend: `39 passed`; ESLint and TypeScript/Vite build pass.
+- Full repository mypy/Ruff: pass in the runtime tool environment.
 - Port guard: `17 passed`.
 - Real/API smoke: 20 randomly selected image+JSON pairs from the user-provided training-set folder completed `pending -> queued -> completed`; 60 files were exported with zero failures/issues, and legacy `{tag,nl}` sidecars produced non-empty canonical `tags`.
 - Pressure/chaos testing was intentionally skipped for this delivery pass.

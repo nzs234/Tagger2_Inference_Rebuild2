@@ -5,7 +5,7 @@ import { useState } from 'react'
 import { useForm } from 'react-hook-form'
 import { z } from 'zod'
 import { PromptEditors } from '../components/PromptEditors'
-import { Button, EmptyState, Field, IconButton, Notice, Panel, StatusBadge } from '../components/ui'
+import { Button, DialogLayer, EmptyState, Field, IconButton, Notice, Panel, StatusBadge } from '../components/ui'
 import { useOnlinePrompts } from '../hooks/useOnlinePrompts'
 import { api, ApiError } from '../lib/api'
 import type { ProviderKind, ProviderProfile, ProviderProtocol } from '../types'
@@ -74,11 +74,15 @@ export function Providers() {
         return { profile, secretError: error, secretUpdated: false }
       }
     },
-    onSuccess: ({ secretError, secretUpdated }) => {
+    onSuccess: ({ profile, secretError, secretUpdated }) => {
       const action = editingId ? 'Provider 已更新' : 'Provider 已创建'
-      setNotice(secretError
-        ? { tone: 'danger', text: `${action}，但 API Key 保存失败：${secretError instanceof ApiError ? secretError.message : '凭据存储不可用'}` }
-        : { tone: 'success', text: secretUpdated ? `${action}，API Key 已安全保存` : action })
+      if (secretError) {
+        setNotice({ tone: 'danger', text: `${action}，但 API Key 保存失败：${secretError instanceof ApiError ? secretError.message : '凭据存储不可用'}。配置编辑器已保留，可直接重试密钥保存。` })
+        setEditingId(profile.id)
+        void queryClient.invalidateQueries({ queryKey: ['providers'] })
+        return
+      }
+      setNotice({ tone: 'success', text: secretUpdated ? `${action}，API Key 已安全保存` : action })
       setShowForm(false); setEditingId(undefined); form.reset(defaults)
       void queryClient.invalidateQueries({ queryKey: ['providers'] })
     },
@@ -220,7 +224,7 @@ export function Providers() {
       <PromptEditors prompts={onlinePrompts} onChange={onlinePrompts.setPrompts} onReset={onlinePrompts.reset} />
     </Panel>
 
-    {showForm && <div className="drawer-backdrop" role="presentation" onMouseDown={(event) => { if (event.currentTarget === event.target) setShowForm(false) }}><aside className="drawer" role="dialog" aria-modal="true" aria-labelledby="provider-form-title">
+    {showForm && <DialogLayer onClose={() => setShowForm(false)}><aside className="drawer" role="dialog" aria-modal="true" aria-labelledby="provider-form-title">
       <header className="drawer-header"><div><p className="eyebrow">PROVIDER PROFILE</p><h2 id="provider-form-title">{editingId ? '编辑 Provider' : '添加 Provider'}</h2></div><IconButton label="关闭" onClick={() => setShowForm(false)}><X size={18} /></IconButton></header>
       <form className="drawer-body" onSubmit={form.handleSubmit((values) => saveMutation.mutate(values))}>
         <div className="provider-preset-grid">{(['custom', 'openai', 'gemini', 'claude'] as ConfigurableProviderKind[]).map((kind) => <button type="button" key={kind} className={selectedKind === kind ? 'preset-active' : ''} onClick={() => applyPreset(kind)}><ProviderIcon kind={kind} /><span>{providerKindName(kind)}</span></button>)}</div>
@@ -248,13 +252,13 @@ export function Providers() {
         </div>
         <div className="drawer-actions">{editingId && <Button type="button" variant="danger" icon={<Trash2 size={15} />} disabled={deleteMutation.isPending} onClick={() => { const provider = providerQuery.data?.items.find((item) => item.id === editingId); if (provider) requestDelete(provider) }}>删除</Button>}<span className="drawer-actions-spacer" /><Button type="button" variant="secondary" onClick={() => setShowForm(false)}>取消</Button><Button type="submit" icon={saveMutation.isPending ? <LoaderCircle size={15} className="spin" /> : <Save size={15} />} disabled={saveMutation.isPending}>{editingId ? '保存修改' : '创建 Provider'}</Button></div>
       </form>
-    </aside></div>}
+    </aside></DialogLayer>}
 
-    {secretProvider && <div className="drawer-backdrop" role="presentation" onMouseDown={(event) => { if (event.currentTarget === event.target) setSecretProvider(undefined) }}><div className="secret-dialog" role="dialog" aria-modal="true" aria-labelledby="secret-title">
+    {secretProvider && <DialogLayer onClose={() => setSecretProvider(undefined)}><div className="secret-dialog" role="dialog" aria-modal="true" aria-labelledby="secret-title">
       <header><span className="dialog-icon"><KeyRound size={20} /></span><div><p className="eyebrow">CREDENTIAL VAULT</p><h2 id="secret-title">{secretProvider.name} 密钥池</h2></div><IconButton label="关闭" onClick={() => setSecretProvider(undefined)}><X size={17} /></IconButton></header>
       <div className="dialog-body"><Notice tone="info">密钥提交后不会再次显示。每行填写一个密钥。</Notice><Field label="API Keys"><textarea value={keys} onChange={(event) => setKeys(event.target.value)} rows={6} spellCheck={false} autoComplete="off" placeholder="••••••••••••••••" /></Field></div>
       <footer><Button variant="secondary" onClick={() => setSecretProvider(undefined)}>取消</Button><Button icon={secretMutation.isPending ? <LoaderCircle size={15} className="spin" /> : <KeyRound size={15} />} disabled={!keys.trim() || secretMutation.isPending} onClick={() => secretMutation.mutate()}>保存密钥</Button></footer>
-    </div></div>}
+    </div></DialogLayer>}
   </div>
 }
 

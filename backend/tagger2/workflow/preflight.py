@@ -27,10 +27,15 @@ class WorkflowPreflightService:
         allowlist: PathAllowlist,
         resource_catalog: WorkflowResourceCatalog,
         database: WorkflowDatabase,
+        *,
+        model_registry: Any | None = None,
+        inference_engine: Any | None = None,
     ):
         self.allowlist = allowlist
         self.resource_catalog = resource_catalog
         self.database = database
+        self.model_registry = model_registry
+        self.inference_engine = inference_engine
 
     def _snapshot_profile(self, resource_id: str) -> str | None:
         """Return the profile a registered classification snapshot was built for.
@@ -138,6 +143,27 @@ class WorkflowPreflightService:
             model_id = config.caption.get("model_id") or config.caption.get("resource_id")
             if not model_id:
                 missing_resources.append("Caption is enabled but no model_id is selected")
+            elif self.model_registry is not None:
+                try:
+                    record = self.model_registry.get_model(str(model_id))
+                except (AttributeError, KeyError, LookupError, ValueError, RuntimeError):
+                    record = None
+                if record is None:
+                    missing_resources.append(
+                        f"Caption local model is not registered: {model_id}"
+                    )
+                else:
+                    loaded_ids = {
+                        str(value)
+                        for value in getattr(self.inference_engine, "loaded_model_ids", ())
+                        if str(value)
+                    }
+                    if not bool(getattr(record, "loaded", False)) and str(
+                        getattr(record, "model_id", "")
+                    ) not in loaded_ids:
+                        missing_resources.append(
+                            f"Caption local model is not loaded: {model_id}"
+                        )
 
         if config.classify.get("enabled"):
             resource_id = config.classify.get("resource_id")

@@ -3,7 +3,6 @@ import { persist } from 'zustand/middleware'
 import type {
   AppPage,
   WorkflowLanguage,
-  ImageResult,
   QueueItem,
   QueueState,
   Fl2vaSingleImageRole,
@@ -11,6 +10,7 @@ import type {
   VideoPromptMode,
   VideoPromptPackage,
   VideoPromptRevision,
+  ThemeMode,
 } from '../types'
 
 interface PreferencesState {
@@ -19,10 +19,12 @@ interface PreferencesState {
   sidebarOpen: boolean
   // Only the Dataset Workflow module is bilingual; the rest of the UI is Chinese.
   workflowLanguage: WorkflowLanguage
+  themeMode: ThemeMode
   setPage: (page: AppPage) => void
   setCompact: (compact: boolean) => void
   setSidebarOpen: (open: boolean) => void
   setWorkflowLanguage: (language: WorkflowLanguage) => void
+  setThemeMode: (mode: ThemeMode) => void
 }
 
 export const usePreferences = create<PreferencesState>()(
@@ -32,10 +34,12 @@ export const usePreferences = create<PreferencesState>()(
       compact: false,
       sidebarOpen: false,
       workflowLanguage: 'zh',
+      themeMode: 'light',
       setPage: (page) => set({ page, sidebarOpen: false }),
       setCompact: (compact) => set({ compact }),
       setSidebarOpen: (sidebarOpen) => set({ sidebarOpen }),
       setWorkflowLanguage: (workflowLanguage) => set({ workflowLanguage }),
+      setThemeMode: (themeMode) => set({ themeMode }),
     }),
     {
       name: 'tagger2-ui',
@@ -43,6 +47,7 @@ export const usePreferences = create<PreferencesState>()(
         page: state.page,
         compact: state.compact,
         workflowLanguage: state.workflowLanguage,
+        themeMode: state.themeMode,
       }),
     },
   ),
@@ -58,7 +63,6 @@ interface QueueStateStore {
   select: (id: string) => void
   setActiveJob: (jobId?: string) => void
   update: (id: string, patch: Partial<Pick<QueueItem, 'state' | 'progress' | 'error' | 'result'>>) => void
-  updateByName: (name: string, state: QueueState, result?: ImageResult, error?: string) => void
   setAllState: (state: QueueState) => void
 }
 
@@ -102,11 +106,6 @@ export const useQueueStore = create<QueueStateStore>((set, get) => ({
   setActiveJob: (activeJobId) => set({ activeJobId }),
   update: (id, patch) => set((state) => ({
     items: state.items.map((item) => (item.id === id ? { ...item, ...patch } : item)),
-  })),
-  updateByName: (name, queueState, result, error) => set((state) => ({
-    items: state.items.map((item) => item.file.name === name
-      ? { ...item, state: queueState, progress: queueState === 'done' ? 100 : item.progress, result, error }
-      : item),
   })),
   setAllState: (queueState) => set((state) => ({
     items: state.items.map((item) => ({ ...item, state: queueState, progress: queueState === 'ready' ? 0 : item.progress })),

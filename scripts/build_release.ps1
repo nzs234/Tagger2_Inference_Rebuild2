@@ -1,12 +1,22 @@
 param(
   [string]$OutputDir = "dist",
+  [string]$Version = "",
   [switch]$SkipSmokeTest
 )
 
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
 $stamp = Get-Date -Format "yyyyMMdd_HHmmss"
-$name = "Tagger2_Inference_Rebuild_$stamp"
+$safeVersion = if ([string]::IsNullOrWhiteSpace($Version)) {
+  ""
+} else {
+  ($Version.Trim() -replace "[^A-Za-z0-9._-]", "-")
+}
+$name = if ($safeVersion) {
+  "Tagger2_Inference_Rebuild_${safeVersion}_$stamp"
+} else {
+  "Tagger2_Inference_Rebuild_$stamp"
+}
 $stage = Join-Path $root (".release_$stamp")
 $out = Join-Path $root $OutputDir
 $smoke = Join-Path $root (".release_smoke_$stamp")
@@ -28,6 +38,13 @@ function Copy-ReleaseItem([string]$RelativePath) {
 
 try {
   New-Item -ItemType Directory -Force -Path $stage, $out | Out-Null
+  $versionFile = Join-Path $stage "VERSION.txt"
+  $releaseVersion = if ($safeVersion) { $safeVersion } else { "development" }
+  @(
+    "Tagger2 Inference",
+    "Version: $releaseVersion",
+    "Build timestamp: $stamp"
+  ) | Set-Content -LiteralPath $versionFile -Encoding utf8
 
   # Models and caches are provisioned separately because they are large.  The
   # placeholders keep the expected directory layout without copying secrets.
@@ -62,7 +79,10 @@ try {
     "start.bat",
     "setup.bat",
     "USER_GUIDE_zh-CN.txt",
-    "README.md"
+    "README.md",
+    "docs/release_package_contents.md",
+    "docs/workflow_manual_paths.md",
+    "docs/workflow_compatibility_report.md"
   )) {
     Copy-ReleaseItem $item
   }
@@ -73,6 +93,27 @@ try {
     $placeholder = Join-Path $stage "$directory/.gitkeep"
     New-Item -ItemType Directory -Force -Path (Split-Path -Parent $placeholder) | Out-Null
     New-Item -ItemType File -Force -Path $placeholder | Out-Null
+  }
+
+  # Ship the immutable, non-model workflow resources that make the default
+  # e621 profile usable out of the box.  Models and the OCR runtime/model
+  # cache stay external: the latter contains machine-specific absolute paths
+  # and is intentionally provisioned separately.
+  $resourceRoot = Join-Path $root "data\workflows\resources"
+  $resourceCategories = @("classify", "replacement_index", "tokenizer")
+  foreach ($category in $resourceCategories) {
+    $sourceCategory = Join-Path $resourceRoot $category
+    if (-not (Test-Path -LiteralPath $sourceCategory -PathType Container)) {
+      throw "Required release resource category is missing: data/workflows/resources/$category"
+    }
+    $resourceFiles = Get-ChildItem -LiteralPath $sourceCategory -File |
+      Where-Object { $_.Extension -ne ".csv" }
+    if (-not $resourceFiles) {
+      throw "Required release resource category is empty: data/workflows/resources/$category"
+    }
+    $destinationCategory = Join-Path $stage "data\workflows\resources\$category"
+    New-Item -ItemType Directory -Force -Path $destinationCategory | Out-Null
+    $resourceFiles | Copy-Item -Destination $destinationCategory -Force
   }
 
   # Keep the embedded interpreter portable. The startup script will later

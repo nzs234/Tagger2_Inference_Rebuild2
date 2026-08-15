@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from .stages.policy import PolicyConfig
 from collections.abc import Mapping
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -306,6 +307,7 @@ def _run_offline_pipeline_impl(
     database: Any | None = None,
     job_id: str | None = None,
     stage_tracker: _StageRunTracker | None = None,
+    resource_verifier: Callable[[], None] | None = None,
 ) -> PipelineReport:
     """Run the deterministic offline vertical and commit its results.
 
@@ -464,6 +466,15 @@ def _run_offline_pipeline_impl(
                 )
 
     caption_tags: dict[str, tuple[str, ...]] = {}
+    caption_stage_run = (
+        stage_tracker.begin(
+            "caption",
+            total=report.total_samples,
+            checkpoint={"checkpoint": "starting"},
+        )
+        if config.caption.get("enabled")
+        else None
+    )
     if config.caption.get("enabled"):
         if tag_predictor is None:
             raise PipelineError("caption stage is enabled but no tag predictor was provided")
@@ -495,12 +506,35 @@ def _run_offline_pipeline_impl(
                 caption_tags[result.relative_image_path] = tuple(
                     tag.raw_tag for tag in result.tags
                 )
+        if caption_stage_run is not None:
+            stage_tracker.update(
+                "caption",
+                "completed",
+                total=report.total_samples,
+                processed=caption_report.captioned + caption_report.skipped,
+                issue_count=caption_report.failed,
+                checkpoint={
+                    "checkpoint": "captioned",
+                    "captioned": caption_report.captioned,
+                    "skipped": caption_report.skipped,
+                    "failed": caption_report.failed,
+                },
+            )
 
 
     # OCR stage: text recognition into per-sample sidecars. It never changes
     # the nine-field payload and never blocks the run, so a missing runtime or a
     # failed image is a warning and the pipeline continues.
     ocr_results: dict[str, Any] = {}
+    ocr_stage_run = (
+        stage_tracker.begin(
+            "ocr",
+            total=report.total_samples,
+            checkpoint={"checkpoint": "starting"},
+        )
+        if config.ocr.get("enabled")
+        else None
+    )
     if config.ocr.get("enabled"):
         ocr_results, ocr_issues = run_ocr_stage(
             workspace,
@@ -530,9 +564,32 @@ def _run_offline_pipeline_impl(
                     blocking=False,
                 )
             )
+        if ocr_stage_run is not None:
+            stage_tracker.update(
+                "ocr",
+                "completed",
+                total=report.total_samples,
+                processed=len(ocr_results),
+                issue_count=len(ocr_issues),
+                checkpoint={
+                    "checkpoint": "sidecars",
+                    "processed": report.ocr.get("processed", 0),
+                    "failed": report.ocr.get("failed", 0),
+                    "regions": report.ocr.get("regions", 0),
+                },
+            )
 
     # Classify stage: map caption tags to nine-field structure
     classified_projections: dict[str, dict[str, list[str]]] = {}
+    classify_stage_run = (
+        stage_tracker.begin(
+            "classify",
+            total=report.total_samples,
+            checkpoint={"checkpoint": "starting"},
+        )
+        if config.classify.get("enabled")
+        else None
+    )
     if classification_rules is not None:
         # Build a combined tags source: prefer caption_tags, fallback to imported tags
         tags_to_classify: dict[str, tuple[str, ...]] = {}
@@ -561,12 +618,32 @@ def _run_offline_pipeline_impl(
                     )
                 )
                 report.failed_samples += 1
+        if classify_stage_run is not None:
+            stage_tracker.update(
+                "classify",
+                "completed",
+                total=report.total_samples,
+                processed=len(classified_projections),
+                issue_count=sum(
+                    1 for issue in report.issues if issue.module_id == "classify"
+                ),
+                checkpoint={
+                    "checkpoint": "classified",
+                    "sample_count": len(classified_projections),
+                },
+            )
 
     rules = {}
+    replace_stage_run = None
     if config.replace.get("enabled"):
         if replacement_index_path is None:
             raise PipelineError("replace stage is enabled but no replacement index was provided")
         rules = load_replacement_rules(Path(replacement_index_path))
+        replace_stage_run = stage_tracker.begin(
+            "replace",
+            total=report.total_samples,
+            checkpoint={"checkpoint": "rules_loaded", "rule_count": len(rules)},
+        )
 
     dataset_root = source_root if config.work_mode == "in_place" else output_root
 
@@ -601,6 +678,24 @@ def _run_offline_pipeline_impl(
     totals = ReplacementSummary(0, 0, 0, 0)
     policy_counts: dict[str, int] = {"artist_dropped": 0, "quality_dropped": 0}
     budget_counts: dict[str, int] = {}
+    policy_stage_run = (
+        stage_tracker.begin(
+            "policy",
+            total=report.total_samples,
+            checkpoint={"checkpoint": "starting"},
+        )
+        if policy_config is not None
+        else None
+    )
+    token_stage_run = (
+        stage_tracker.begin(
+            "token_budget",
+            total=report.total_samples,
+            checkpoint={"checkpoint": "starting"},
+        )
+        if config.token_budget.get("enabled") and token_counter is not None
+        else None
+    )
     # Public API keeps the stable ``txt`` spelling; the normalizer uses the
     # internal ``flat_txt`` representation only at the serialization boundary.
     export_format = str(config.export.get("format", "both"))
@@ -620,6 +715,17 @@ def _run_offline_pipeline_impl(
 
     # NL stage: generate natural language captions
     nl_projections: dict[str, Any] = {}
+    nl_stage_run = (
+        stage_tracker.begin(
+            "nl",
+            total=report.total_samples,
+            checkpoint={"checkpoint": "starting"},
+        )
+        if config.nl.get("enabled")
+        and config.nl.get("api_enabled")
+        and nl_client is not None
+        else None
+    )
     if config.nl.get('enabled') and config.nl.get('api_enabled') and nl_client is not None:
         # Build projections dict for NL stage (needs full nine-field structure)
         temp_projections: dict[str, dict[str, Any]] = {}
@@ -682,6 +788,20 @@ def _run_offline_pipeline_impl(
             'reused': nl_report.reused,
             'failed': nl_report.failed,
         }
+        if nl_stage_run is not None:
+            stage_tracker.update(
+                "nl",
+                "completed",
+                total=report.total_samples,
+                processed=nl_report.generated + nl_report.reused,
+                issue_count=nl_report.failed,
+                checkpoint={
+                    "checkpoint": "generated",
+                    "generated": nl_report.generated,
+                    "reused": nl_report.reused,
+                    "failed": nl_report.failed,
+                },
+            )
 
     export_stage_run = stage_tracker.begin(
         "export",
@@ -934,11 +1054,7 @@ def _run_offline_pipeline_impl(
             if config.work_mode == "full_copy":
                 source_image = source_root / sample.relative_image_path
                 if source_image.is_file():
-                    staged.append(
-                        staging.stage(
-                            sample.relative_image_path, source_image.read_bytes()
-                        )
-                    )
+                    staged.append(staging.stage_file(sample.relative_image_path, source_image))
 
             report.exported_samples += 1
             exported_sample_ids.add(sample.sample_id)
@@ -974,6 +1090,41 @@ def _run_offline_pipeline_impl(
                 "exported_samples": report.exported_samples,
                 "failed_samples": report.failed_samples,
             },
+        )
+
+    if replace_stage_run is not None:
+        stage_tracker.update(
+            "replace",
+            "completed",
+            total=report.total_samples,
+            processed=report.exported_samples,
+            issue_count=sum(1 for issue in report.issues if issue.module_id == "replace"),
+            checkpoint={
+                "checkpoint": "applied",
+                "replaced": totals.replaced,
+                "dropped": totals.dropped,
+                "passthrough": totals.passthrough,
+            },
+        )
+    if policy_stage_run is not None:
+        stage_tracker.update(
+            "policy",
+            "completed",
+            total=report.total_samples,
+            processed=report.exported_samples,
+            issue_count=sum(1 for issue in report.issues if issue.module_id == "policy"),
+            checkpoint={"checkpoint": "applied", **policy_counts},
+        )
+    if token_stage_run is not None:
+        stage_tracker.update(
+            "token_budget",
+            "completed",
+            total=report.total_samples,
+            processed=report.exported_samples,
+            issue_count=sum(
+                1 for issue in report.issues if issue.module_id == "token_budget"
+            ),
+            checkpoint={"checkpoint": "applied", **budget_counts},
         )
 
     report.policy = dict(policy_counts)
@@ -1173,6 +1324,37 @@ def _run_offline_pipeline_impl(
         _write_issue_log(workspace, report)
         return report
 
+    if resource_verifier is not None:
+        try:
+            resource_verifier()
+        except Exception as exc:  # noqa: BLE001 - fail closed before commit
+            resource_issue = StageIssue(
+                sample_id=None,
+                relative_image_path=None,
+                module_id="resource",
+                code="resource_hash_drift",
+                message=f"a frozen workflow resource changed before commit: {exc}",
+                blocking=True,
+            )
+            report.issues.append(resource_issue)
+            journal.append({"event": "commit_skipped", "reason": "resource_hash_drift"})
+            if database is not None and job_id is not None:
+                database.create_issue(
+                    job_id,
+                    module_id=resource_issue.module_id,
+                    code=resource_issue.code,
+                    severity=resource_issue.severity,
+                    blocking=True,
+                    message=resource_issue.message,
+                )
+            finish_pipeline_stage(
+                "failed",
+                processed=report.exported_samples,
+                checkpoint={"reason": "resource_hash_drift"},
+            )
+            _write_issue_log(workspace, report)
+            return report
+
     if database is not None and job_id is not None and current_state in {"running", "queued"}:
         database.update_job_status(job_id, "committing", expected_status=current_state)
 
@@ -1209,6 +1391,7 @@ def run_offline_pipeline(
     nl_client: NlClient | None = None,
     database: Any | None = None,
     job_id: str | None = None,
+    resource_verifier: Callable[[], None] | None = None,
 ) -> PipelineReport:
     """Run the pipeline and close durable stage rows on every exit path."""
 
@@ -1231,6 +1414,7 @@ def run_offline_pipeline(
             database=database,
             job_id=job_id,
             stage_tracker=tracker,
+            resource_verifier=resource_verifier,
         )
     finally:
         tracker.close_open()

@@ -4,7 +4,9 @@ This report records exactly what the merged Dataset Workflow module reproduces
 from the source project (`e621-standard-capotion-workflow`), what is not yet
 implemented, and where output must differ because a source resource is not
 obtainable. It is deliberately blunt: anything not verified is listed as not
-verified.
+verified. Local resources listed below are provisioned outside Git under
+`data/workflows/resources`; a fresh checkout must import them before enabling
+the corresponding stage.
 
 ## 1. Summary
 
@@ -20,8 +22,8 @@ verified.
 | API under `/api/v1/workflows` | Implemented, contract-tested |
 | Bilingual Dataset Workflow page | Implemented, tested |
 | Caption (adapter onto the host inference engine) | Implemented, tested |
-| Classify (official snapshot -> nine fields) | Implemented, tested |
-| OCR (isolated PaddleOCR runtime, sidecar output) | Implemented, tested with an engine double |
+| Classify (official snapshot -> nine fields) | Implemented, tested, e621 snapshot provisioned |
+| OCR (isolated PaddleOCR runtime, sidecar output) | Implemented, CPU runtime provisioned and probed |
 | NL / Count Review / Policy / Token Budget | Implemented, tested |
 | Pause / resume / repair / lease recovery | Implemented, tested |
 | Bilingual page incl. OCR controls and per-stage report | Implemented, tested |
@@ -141,7 +143,9 @@ flattened with cycle detection, and validation runs the real rule builder so a
 cycle cannot pass a row-level check.
 
 Import with `scripts/import_classification_snapshot.py` (use `--dry-run` to
-validate without registering). The snapshots themselves are not bundled.
+validate without registering). The snapshot itself is not bundled in Git, but
+the current local e621 resource is `classify-e621-20260812-v1` with fingerprint
+`eccfdfacf3bcf1611a9ee3561f54bb81e946122f582f1f421c5e90689f2db49f`.
 
 Field mapping is deterministic, never a guess: `character` and `artist` come
 from those categories (an artist tag is merged into the `artist` field, not
@@ -184,7 +188,10 @@ Preflight refuses, as blocking errors rather than warnings:
   index is not accepted as a substitute.
 
 Selecting the Danbooru profile with the dependent stages off is allowed and
-carries a warning that its resources are not bundled.
+carries a warning that its resources are not bundled. The e621 profile has a
+local replacement index (`replace-e621-pass-drop-v2`), Qwen tokenizer
+(`tokenizer-qwen3-0-6b-tokenizer-v1`) and PaddleOCR CPU descriptor
+(`ocr-paddleocr-2-9-1-cpu-v1`).
 
 ### Still not built
 
@@ -199,9 +206,12 @@ carries a warning that its resources are not bundled.
 
 | Resource | Source scale | Status here |
 | --- | --- | --- |
-| e621 classification dictionary | 120,978 audited entries | Not obtainable. Classify stays unavailable; no substitute dictionary is invented. |
+| e621 classification dictionary | Official 2026-08-12 export; 1,596,997 executable tags, 69,819 aliases, 58,603 implications | Provisioned locally as `classify-e621-20260812-v1`; 118 malformed official rows are quarantined and recorded in the anomaly report. |
 | e621 wiki count data | Private snapshot | Not obtainable. |
-| Source replacement index | 86,923 rules | Different artifact. The designated index supplied here has 155,706 rows / 50,910 executable rules and its own resource id and fingerprint. |
+| Source replacement index | 86,923 rules | Designated local artifact has 155,706 rows / 50,910 executable rules and fingerprint `4834c1cda2cd560641a7cd67d7cef8d99d381a89f7beab4a86e2ef4f90643ded`. |
+| e621 pass cleanup index | 155,706 executable rules | Provisioned as `replace-e621-pass-drop-v2`: 47,095 keep, 3,171 replace, 105,440 drop, 0 pass; fingerprint `2e3c4af6cc93b7f2cc8e55e2eda024ee69942f08a3618b6c2f0dfe6d45991972`. |
+| Tokenizer | Formal tokenizer resource required by the token gate | Qwen3-0.6B tokenizer JSON is provisioned as `tokenizer-qwen3-0-6b-tokenizer-v1`, fingerprint `aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4`. |
+| CPU OCR runtime | Isolated Paddle/PaddleOCR interpreter and model cache | Provisioned locally as `ocr-paddleocr-2-9-1-cpu-v1`; runtime and model-cache drift are checked before execution. |
 | `lse14-scorer-5k-v1` | 5k quality scorer | Not obtainable. The existing LSE14 1k asset may be used only when explicitly labelled; it is never presented as the 5k model. |
 | Danbooru formal resources | Private | Not obtainable. The profile is selectable but preflight warns, and the stage must fail closed rather than fall back to e621. |
 
@@ -223,8 +233,13 @@ npm run lint
 npm run build
 ```
 
-Current results: backend 282 passed / 1 skipped; frontend 35 passed;
-frontend lint clean (`--max-warnings 0`); `tsc -b` clean.
+Current results (2026-08-14): backend 416 passed / 1 skipped; frontend 41
+passed; changed workflow modules pass targeted mypy and Ruff checks. The
+20-image real-resource smoke completed with 20/20 samples and no issues.
+Ruff clean; frontend lint and `tsc -b` clean. The real local-model/resource
+smoke completed a one-image Caption + Classify + Replace + OCR + Tokenizer run
+and a separate 20-image offline/API run without blocking issues. Stress and
+GPU-specific gates are intentionally not claimed here.
 
 Note on running the backend suite: use the project runtime
 (`.\runtime\python.exe`). It puts only `backend` on `sys.path`, so test modules

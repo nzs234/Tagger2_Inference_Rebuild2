@@ -190,6 +190,40 @@ class PathAllowlist:
         with self._lock:
             return [root.public() for root in self._roots.values()]
 
+    def find_root_for_path(
+        self,
+        path: str | os.PathLike[str],
+        *,
+        kind: str | None = None,
+        writable: bool | None = None,
+    ) -> tuple[PathRoot, str] | None:
+        """Return the most specific registered root containing ``path``.
+
+        Manual-path workflow clients use this at the boundary where an
+        absolute user-entered directory is converted to the internal
+        ``root_id`` + relative-path contract.  The returned relative path is
+        always POSIX-normalised and is never a filesystem path sent back to a
+        client.
+        """
+
+        candidate = Path(path).expanduser().resolve(strict=False)
+        with self._lock:
+            roots = list(self._roots.values())
+        matches: list[tuple[int, PathRoot, str]] = []
+        for root in roots:
+            if kind is not None and root.kind != kind:
+                continue
+            if writable is not None and root.writable != writable:
+                continue
+            if not _within(candidate, root.path):
+                continue
+            relative = candidate.relative_to(root.path).as_posix()
+            matches.append((len(root.path.parts), root, relative))
+        if not matches:
+            return None
+        _depth, root, relative = max(matches, key=lambda item: item[0])
+        return root, relative
+
     def resolve(
         self,
         root_id: str,

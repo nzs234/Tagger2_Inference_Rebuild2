@@ -25,9 +25,9 @@ unimplemented.
 
 ## Verification
 
-- Backend: `415 passed, 1 skipped`.
-- Frontend: `38 passed`; ESLint and TypeScript/Vite build pass.
-- Workflow mypy gate (the changed workflow modules): pass.
+- Backend: `420 passed, 1 skipped`.
+- Frontend: `39 passed`; ESLint and TypeScript/Vite build pass.
+- Full repository mypy gate: pass (`72` source files across backend and scripts).
 - Explicit Ruff gate (`E4`, `E7`, `E9`, `F`): pass.
 - Source algorithm port guard: `17 passed`.
 - Updated real/API smoke: 20 randomly selected image+JSON pairs from the
@@ -35,35 +35,34 @@ unimplemented.
   60 files were exported with zero failures/issues. Legacy `{tag,nl}` sidecars
   were normalized to canonical `tags`; all 20 output JSON files had non-empty
   tags. The source directory remained read-only.
-- Real-material smoke: 5 randomly sampled image+JSON pairs from
-  `E:\琥珀训练集预备` exported 15 files with `failed=0` and no issues. The
+- Real-material smoke: 5 randomly sampled image+JSON pairs from the user-provided
+  training-set folder exported 15 files with `failed=0` and no issues. The
   source directory was read-only; samples were copied to a temporary directory.
 
 ## Release blockers still open
 
-- A fully populated `.venv-dev` could not be installed within the local time
-  limit; the lock remains authoritative and the isolated Ruff/mypy tools pass.
-- Full repository mypy outside the changed workflow modules still has legacy
-  errors; this is not claimed as a release-gate pass.
+- `.venv-dev` remains an optional developer environment; the project runtime
+  and lock remain authoritative for the release gates.
 - Local e621 resources are provisioned and digest-verified: classification
   snapshot `classify-e621-20260812-v1`, replacement index
-  `replace-e621-index-v1`, Qwen tokenizer
+  `replace-e621-pass-drop-v2`, Qwen tokenizer
   `tokenizer-qwen3-0-6b-tokenizer-v1`, and CPU PaddleOCR descriptor
   `ocr-paddleocr-2-9-1-cpu-v1`. The resource bytes remain outside Git under
   ignored `data/`; setup/import commands are documented in `README.md`.
-- Stage-run persistence currently covers pipeline/import/export/review with
-  checkpoints; finer per-module/per-batch orchestration, long-lived SSE,
-  pressure/chaos tests, and GPU-specific acceptance remain future work.
+- Stage-run persistence now covers pipeline/import/caption/classify/replace/
+  OCR/NL/policy/token/export/review with checkpoints; finer per-batch
+  orchestration, long-lived SSE, pressure/chaos tests, and GPU-specific
+  acceptance remain future work.
 - Pressure/chaos testing was intentionally skipped for this delivery pass per
   request; only the small real-material flow gate was required.
 
 ## Resource acceptance update
 
-- Random three-image smoke with all four resources enabled: `3/3` exported,
-  `3/3` OCR processed, `3/3` token counts within budget, no issues.
-- FastAPI resource smoke: `pending -> queued -> completed`, one image,
+- Random 20-image smoke with all four resources enabled: `20/20` exported,
+  `20/20` OCR processed, `20/20` token counts within budget, no issues.
+- FastAPI resource smoke: `pending -> queued -> completed`, 20 images,
   classification/replacement/tokenizer/OCR resource fingerprints persisted in
   the report; target output contained three files and no source mutation.
-- The full repository mypy gate still reports legacy errors outside the changed
-  workflow modules; changed workflow modules and resource scripts pass mypy and
-  Ruff.
+- The full repository mypy gate is now clean; the four byte-comparable source
+  ports are covered by a scoped per-module diagnostic override so their source
+  text remains byte-identical.

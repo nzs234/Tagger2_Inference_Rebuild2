@@ -4,13 +4,15 @@ import { useEffect, useMemo, useState } from 'react'
 import { JobControls } from '../components/JobControls'
 import { ClassifierSelector } from '../components/ClassifierSelector'
 import { PromptEditors } from '../components/PromptEditors'
-import { Button, EmptyState, Field, IconButton, Notice, Panel, ProgressBar, StatusBadge, VirtualList } from '../components/ui'
+import { Button, DialogLayer, EmptyState, Field, IconButton, Notice, Panel, ProgressBar, StatusBadge, VirtualList } from '../components/ui'
 import { useJobEvents } from '../hooks/useJobEvents'
 import { useOnlinePrompts } from '../hooks/useOnlinePrompts'
 import { api, ApiError } from '../lib/api'
 import type { JobMode, JobSummary, ModelProfile, ScanItem } from '../types'
 
 type BatchMode = JobMode | 'hybrid'
+
+const SCAN_PREVIEW_LIMIT = 250
 
 export function BatchJobs() {
   const queryClient = useQueryClient()
@@ -74,7 +76,7 @@ export function BatchJobs() {
         relative_path: '',
         recursive,
         patterns: pattern.split(',').map((value) => value.trim()).filter(Boolean),
-        page_size: 5000,
+        page_size: SCAN_PREVIEW_LIMIT,
       })
       return { path, root, scan }
     },
@@ -83,7 +85,12 @@ export function BatchJobs() {
       setScannedInputPath(path)
       setScanItems(scan.items)
       setScanTotal(scan.total)
-      setNotice({ tone: 'success', text: `扫描完成：找到 ${scan.total} 张图片` })
+      setNotice({
+        tone: 'success',
+        text: scan.items.length < scan.total
+          ? `扫描完成：找到 ${scan.total} 张图片，当前预览前 ${scan.items.length} 张`
+          : `扫描完成：找到 ${scan.total} 张图片`,
+      })
       void queryClient.invalidateQueries({ queryKey: ['roots'] })
     },
     onError: (error) => {
@@ -138,7 +145,7 @@ export function BatchJobs() {
     onError: (error) => setNotice({ tone: 'danger', text: error instanceof ApiError ? error.message : '任务操作失败' }),
   })
 
-  const jobItems = jobs.data?.items ?? []
+  const jobItems = useMemo(() => jobs.data?.items ?? [], [jobs.data?.items])
   const activeJob = useMemo(() => {
     const fromList = jobItems.find((job) => job.id === selectedJob)
     return selectedJob && stream.event?.job_id === selectedJob && fromList ? { ...fromList, ...stream.event } : fromList
@@ -172,14 +179,14 @@ export function BatchJobs() {
             <Field label="扫描范围"><label className="toggle standalone"><input type="checkbox" checked={recursive} onChange={(event) => setRecursive(event.target.checked)} /><span />包含子目录</label></Field>
           </div>
           <div className="form-actions"><Button variant="secondary" icon={scanMutation.isPending ? <LoaderCircle className="spin" size={16} /> : <FolderSearch size={16} />} disabled={!inputPath.trim() || scanMutation.isPending} onClick={() => scanMutation.mutate(inputPath.trim())}>扫描目录</Button>{scanTotal > 0 && <span className="scan-count"><CheckCircle2 size={14} /> {scanTotal} 张</span>}</div>
-          {scanItems.length > 0 ? <VirtualList items={scanItems} height={250} rowHeight={44} getKey={(item, index) => item.id ?? `${item.relative_path}:${index}`} renderRow={(item) => <div className="scan-row"><FileSearch size={15} /><span title={item.relative_path}>{item.relative_path}</span>{item.size != null && <small>{formatBytes(item.size)}</small>}</div>} /> : <EmptyState icon={<Search size={22} />} title="等待扫描" detail="填写文件夹路径后查看图片清单" />}
+          {scanItems.length > 0 ? <><p className="scan-preview-note">预览 {scanItems.length} / {scanTotal} 张；创建任务时仍会处理全部匹配图片。</p><VirtualList items={scanItems} height={250} rowHeight={44} getKey={(item, index) => item.id ?? `${item.relative_path}:${index}`} renderRow={(item) => <div className="scan-row"><FileSearch size={15} /><span title={item.relative_path}>{item.relative_path}</span>{item.size != null && <small>{formatBytes(item.size)}</small>}</div>} /></> : <EmptyState icon={<Search size={22} />} title="等待扫描" detail="填写文件夹路径后查看图片清单" />}
         </Panel>
 
         <Panel title="任务配置" eyebrow="02 / CONFIG">
-          <div className="mode-switch batch-mode" role="tablist" aria-label="推理模式">
-            <button className={mode === 'online' ? 'mode-active' : ''} onClick={() => setMode('online')} role="tab" aria-selected={mode === 'online'}>在线模型</button>
-            <button className={mode === 'local' ? 'mode-active' : ''} onClick={() => setMode('local')} role="tab" aria-selected={mode === 'local'}>本地模型</button>
-            <button className={isHybrid ? 'mode-active' : ''} onClick={() => setMode('hybrid')} role="tab" aria-selected={isHybrid}>本地 + 在线</button>
+          <div className="mode-switch batch-mode" role="group" aria-label="推理模式">
+            <button type="button" className={mode === 'online' ? 'mode-active' : ''} onClick={() => setMode('online')} aria-pressed={mode === 'online'}>在线模型</button>
+            <button type="button" className={mode === 'local' ? 'mode-active' : ''} onClick={() => setMode('local')} aria-pressed={mode === 'local'}>本地模型</button>
+            <button type="button" className={isHybrid ? 'mode-active' : ''} onClick={() => setMode('hybrid')} aria-pressed={isHybrid}>本地 + 在线</button>
           </div>
           <div className="form-grid two-columns">
             {usesLocal && <Field label="已加载本地模型"><div className="loaded-model-field">{models.isLoading ? <div className="loaded-model-empty"><LoaderCircle className="spin" size={15} />读取模型状态…</div> : loadedModels.length ? <div className="loaded-model-list" aria-label="批量已加载模型列表">{loadedModels.map((model) => <div className="loaded-model-row" key={model.id}><span className="loaded-model-icon"><Cpu size={14} /></span><div className="loaded-model-main"><strong title={model.name}>{model.name}</strong><small>{model.backend.toUpperCase()} · {thresholdSummary(model, thresholdOverrides[model.id])}</small></div><div className="loaded-model-actions"><Button type="button" size="sm" variant="secondary" icon={<Gauge size={14} />} aria-label={`调节 ${model.name} 阈值`} title={`调节 ${model.name} 阈值`} onClick={() => openThresholdEditor(model)}>阈值</Button>{thresholdOverrides[model.id] && <IconButton type="button" label={`清除 ${model.name} 本次阈值`} onClick={() => setThresholdOverrides((current) => { const next = { ...current }; delete next[model.id]; return next })}><RotateCcw size={14} /></IconButton>}</div></div>)}</div> : <div className="loaded-model-empty"><span>没有已加载模型</span></div>}</div></Field>}
@@ -231,11 +238,11 @@ export function BatchJobs() {
         </Panel>
       </div>
     </div>
-    {thresholdEditor && <div className="drawer-backdrop" role="presentation" onMouseDown={(event) => { if (event.currentTarget === event.target) setThresholdEditor(undefined) }}><div className="secret-dialog quick-threshold-dialog" role="dialog" aria-modal="true" aria-labelledby="batch-threshold-title">
+    {thresholdEditor && <DialogLayer onClose={() => setThresholdEditor(undefined)}><div className="secret-dialog quick-threshold-dialog" role="dialog" aria-modal="true" aria-labelledby="batch-threshold-title">
       <header><span className="dialog-icon"><Gauge size={20} /></span><div><p className="eyebrow">TASK THRESHOLD</p><h2 id="batch-threshold-title">{thresholdEditor.name}</h2></div><IconButton label="关闭" onClick={() => setThresholdEditor(undefined)}><X size={17} /></IconButton></header>
       <div className="dialog-body"><Notice tone="info">这里只调整当前批量任务，不会修改模型文件或本地模型页面的默认配置。</Notice><div className="threshold-list">{thresholdKeys(thresholdDraft).map((key) => { const value = thresholdDraft[key] ?? 0; return <Field key={key} label={`${thresholdName(key)} ${value.toFixed(2)}`}><input aria-label={`${thresholdName(key)}阈值`} type="range" min="0" max="1" step="0.01" value={value} onChange={(event) => setThresholdDraft((current) => ({ ...current, [key]: Number(event.target.value) }))} /></Field> })}</div></div>
       <footer><Button type="button" variant="quiet" icon={<RotateCcw size={14} />} onClick={() => setThresholdDraft(effectiveThresholds(thresholdEditor))}>恢复模型当前值</Button><span className="drawer-actions-spacer" /><Button type="button" variant="secondary" onClick={() => setThresholdEditor(undefined)}>取消</Button><Button type="button" icon={<Gauge size={15} />} onClick={applyThresholdDraft}>应用到本次任务</Button></footer>
-    </div></div>}
+    </div></DialogLayer>}
   </div>
 }
 

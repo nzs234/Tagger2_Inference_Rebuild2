@@ -1,6 +1,7 @@
 ﻿import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   AlertTriangle,
+  ArrowRight,
   Archive,
   CheckCircle2,
   Database,
@@ -15,8 +16,8 @@ import {
   Upload,
   Wrench,
 } from 'lucide-react'
-import { useMemo, useState } from 'react'
-import { Button, EmptyState, Field, Notice, Panel, StatusBadge } from '../components/ui'
+import { useEffect, useMemo, useState } from 'react'
+import { Button, DialogLayer, EmptyState, Field, HelpPopover, Notice, Panel, StatusBadge } from '../components/ui'
 import { api, ApiError } from '../lib/api'
 import { copyFor } from '../lib/workflowCopy'
 import { useWorkflowEvents } from '../hooks/useWorkflowEvents'
@@ -28,54 +29,106 @@ import type {
   WorkflowTokenReviewAction,
   WorkflowTokenReviewItem,
   WorkflowImportPreview,
+  ModelProfile,
   WorkflowPreflightReport,
   WorkflowProfile,
+  WorkflowResource,
   WorkflowWorkMode,
+  WorkflowPathBinding,
+  WorkflowPathBindingPreview,
 } from '../types'
+
+const DEFAULT_CLASSIFY_RESOURCE_ID = 'classify-e621-20260812-v1'
+const DEFAULT_REPLACEMENT_RESOURCE_ID = 'replace-e621-pass-drop-v2'
+const DEFAULT_OCR_RESOURCE_ID = 'ocr-paddleocr-2-9-1-cpu-v1'
+const DEFAULT_TOKENIZER_RESOURCE_ID = 'tokenizer-qwen3-0-6b-tokenizer-v1'
 
 interface JobDraft {
   profile: WorkflowProfile
   workMode: WorkflowWorkMode
+  captionModelId?: string
+  sourcePath: string
+  outputPath: string
   sourceRootId: string
   sourceRelativePath: string
   outputRootId: string
   outputRelativePath: string
   exportFormat: WorkflowExportFormat
   recursive: boolean
+  classifyEnabled: boolean
+  classifyResourceId: string
   replaceEnabled: boolean
   replaceResourceId: string
   ocrEnabled: boolean
+  ocrResourceId: string
   ocrMinConfidence: number
+  tokenBudgetEnabled: boolean
+  tokenizerResourceId: string
+  tokenMaxTokens: number
 }
 
 const emptyDraft: JobDraft = {
   profile: 'e621',
   workMode: 'full_copy',
+  sourcePath: '',
+  outputPath: '',
   sourceRootId: '',
   sourceRelativePath: '',
   outputRootId: '',
   outputRelativePath: '',
   exportFormat: 'both',
   recursive: false,
+  classifyEnabled: true,
+  classifyResourceId: DEFAULT_CLASSIFY_RESOURCE_ID,
   replaceEnabled: true,
-  replaceResourceId: '',
+  replaceResourceId: DEFAULT_REPLACEMENT_RESOURCE_ID,
   ocrEnabled: false,
+  ocrResourceId: DEFAULT_OCR_RESOURCE_ID,
   ocrMinConfidence: 0.5,
+  tokenBudgetEnabled: false,
+  tokenizerResourceId: DEFAULT_TOKENIZER_RESOURCE_ID,
+  tokenMaxTokens: 512,
 }
 
 // Mirrors COUNT_VALUES in backend/tagger2/workflow/count_review.py; the API rejects anything else.
 const COUNT_VALUES = ['solo', 'duo', 'trio', 'group'] as const
+const EMPTY_WORKFLOW_RESOURCES: WorkflowResource[] = []
+const REVIEW_PAGE_SIZE = 50
+const TERMINAL_WORKFLOW_STATUSES = new Set(['completed', 'failed', 'cancelled', 'interrupted', 'rollback_required'])
+
+type WorkflowStageId = 'dataset' | 'caption' | 'classify' | 'replace' | 'ocr' | 'count' | 'token' | 'export'
+
+const WORKFLOW_STAGE_IDS: WorkflowStageId[] = [
+  'dataset',
+  'caption',
+  'classify',
+  'replace',
+  'ocr',
+  'count',
+  'token',
+  'export',
+]
 
 export function DatasetWorkflow() {
   const language = usePreferences((state) => state.workflowLanguage)
   const setLanguage = usePreferences((state) => state.setWorkflowLanguage)
+  const setPage = usePreferences((state) => state.setPage)
   const text = copyFor(language)
   const queryClient = useQueryClient()
 
   const [draft, setDraft] = useState<JobDraft>(emptyDraft)
+  const [activeStage, setActiveStage] = useState<WorkflowStageId>('dataset')
   const [selectedJobId, setSelectedJobId] = useState<string>()
+  const [countPage, setCountPage] = useState(0)
+  const [tokenPage, setTokenPage] = useState(0)
   const [preflight, setPreflight] = useState<WorkflowPreflightReport>()
   const [preflightError, setPreflightError] = useState<string>()
+  const [createNotice, setCreateNotice] = useState<string>()
+  const [pathBindingPreview, setPathBindingPreview] = useState<WorkflowPathBindingPreview>()
+  const [pathBinding, setPathBinding] = useState<WorkflowPathBinding>()
+  const [pathBindingError, setPathBindingError] = useState<string>()
+  const [pathCreationConfirmOpen, setPathCreationConfirmOpen] = useState(false)
+  const [continuePreflightAfterBinding, setContinuePreflightAfterBinding] = useState(false)
   const [importForm, setImportForm] = useState({ rootId: '', relativePath: '', resourceId: '' })
   const [importPreview, setImportPreview] = useState<WorkflowImportPreview>()
   const [importError, setImportError] = useState<string>()
@@ -85,6 +138,12 @@ export function DatasetWorkflow() {
   const [tokenDraft, setTokenDraft] = useState<Record<number, string>>({})
 
   const roots = useQuery({ queryKey: ['roots'], queryFn: api.roots, retry: false })
+  const models = useQuery({ queryKey: ['models'], queryFn: api.models, retry: false })
+  const capabilities = useQuery({
+    queryKey: ['workflow', 'capabilities'],
+    queryFn: api.workflowCapabilities,
+    retry: false,
+  })
   const resources = useQuery({
     queryKey: ['workflow', 'resources'],
     queryFn: () => api.workflowResources(),
@@ -94,17 +153,28 @@ export function DatasetWorkflow() {
     queryKey: ['workflow', 'jobs'],
     queryFn: () => api.workflowJobs(),
     retry: false,
-    refetchInterval: 5_000,
+    refetchInterval: (query) => {
+      const listedJobs = query.state.data
+      return !listedJobs || listedJobs.some(
+        (job) => !TERMINAL_WORKFLOW_STATUSES.has(job.status),
+      ) ? 5_000 : false
+    },
   })
   const countReview = useQuery({
-    queryKey: ['workflow', 'count-review', selectedJobId],
-    queryFn: () => api.workflowCountReview(selectedJobId as string, { limit: 50 }),
+    queryKey: ['workflow', 'count-review', selectedJobId, countPage],
+    queryFn: () => api.workflowCountReview(selectedJobId as string, {
+      limit: REVIEW_PAGE_SIZE,
+      offset: countPage * REVIEW_PAGE_SIZE,
+    }),
     enabled: Boolean(selectedJobId),
     retry: false,
   })
   const tokenReview = useQuery({
-    queryKey: ['workflow', 'token-review', selectedJobId],
-    queryFn: () => api.workflowTokenReview(selectedJobId as string, { limit: 50 }),
+    queryKey: ['workflow', 'token-review', selectedJobId, tokenPage],
+    queryFn: () => api.workflowTokenReview(selectedJobId as string, {
+      limit: REVIEW_PAGE_SIZE,
+      offset: tokenPage * REVIEW_PAGE_SIZE,
+    }),
     enabled: Boolean(selectedJobId),
     retry: false,
   })
@@ -121,7 +191,117 @@ export function DatasetWorkflow() {
     retry: false,
   })
 
-  const rootOptions = roots.data?.items ?? []
+  const inputRoots = useMemo(
+    () => (roots.data?.items ?? []).filter((root) => root.kind === 'input'),
+    [roots.data?.items],
+  )
+  const loadedModels: ModelProfile[] = useMemo(
+    () => (models.data?.items ?? []).filter((model) => model.loaded),
+    [models.data],
+  )
+  const workflowResources = resources.data ?? EMPTY_WORKFLOW_RESOURCES
+  const classifyResources = useMemo(
+    () => workflowResources.filter((resource) => resource.category === 'classify' || resource.category === 'classification'),
+    [workflowResources],
+  )
+  const replacementResources = useMemo(
+    () =>
+      workflowResources.filter(
+        (resource) => resource.category === 'replace' || resource.category === 'replacement_index',
+      ),
+    [workflowResources],
+  )
+  const ocrResources = useMemo(
+    () => workflowResources.filter((resource) => resource.category === 'ocr' || resource.category === 'ocr_runtime'),
+    [workflowResources],
+  )
+  const tokenizerResources = useMemo(
+    () => workflowResources.filter((resource) => resource.category === 'tokenizer'),
+    [workflowResources],
+  )
+
+  const legacyReplacementResource = workflowResources.find((resource) => resource.category === 'replacement_index')
+
+  useEffect(() => {
+    if (!resources.data) return
+    setDraft((current) => ({
+      ...current,
+      classifyResourceId:
+        classifyResources.some((resource) => resource.resource_id === current.classifyResourceId)
+          ? current.classifyResourceId
+          : classifyResources[0]?.resource_id ?? '',
+      replaceResourceId:
+        replacementResources.some((resource) => resource.resource_id === current.replaceResourceId)
+          ? current.replaceResourceId
+          : replacementResources.find((resource) => resource.resource_id === DEFAULT_REPLACEMENT_RESOURCE_ID)?.resource_id
+            ?? legacyReplacementResource?.resource_id
+            ?? replacementResources[0]?.resource_id
+            ?? '',
+      ocrResourceId:
+        ocrResources.some((resource) => resource.resource_id === current.ocrResourceId)
+          ? current.ocrResourceId
+          : ocrResources[0]?.resource_id ?? '',
+      tokenizerResourceId:
+        tokenizerResources.some((resource) => resource.resource_id === current.tokenizerResourceId)
+          ? current.tokenizerResourceId
+          : tokenizerResources[0]?.resource_id ?? '',
+    }))
+  }, [resources.data, classifyResources, replacementResources, ocrResources, tokenizerResources, legacyReplacementResource])
+
+  useEffect(() => {
+    setDraft((current) => {
+      if (loadedModels.length === 0) {
+        return current.captionModelId ? { ...current, captionModelId: undefined } : current
+      }
+      if (loadedModels.length === 1) {
+        const model = loadedModels[0]
+        return model && !current.captionModelId ? { ...current, captionModelId: model.id } : current
+      }
+      const hasValidSelection = loadedModels.some((model) => model.id === current.captionModelId)
+      // A one-model auto-selection must not silently become the choice when a
+      // second model is loaded; the user must explicitly choose in that case.
+      if (!hasValidSelection || current.captionModelId === loadedModels[0]?.id) {
+        return { ...current, captionModelId: '' }
+      }
+      return current
+    })
+  }, [loadedModels])
+
+  const updateDraft = (patch: Partial<JobDraft>) => {
+    setPreflight(undefined)
+    setPreflightError(undefined)
+    setCreateNotice(undefined)
+    if ('sourcePath' in patch || 'outputPath' in patch || 'workMode' in patch) {
+      setPathBinding(undefined)
+      setPathBindingPreview(undefined)
+      setPathBindingError(undefined)
+    }
+    setDraft((current) => ({ ...current, ...patch }))
+  }
+
+  const bindPathsMutation = useMutation({
+    mutationFn: (createOutput: boolean) => api.workflowBindPaths({
+      source_path: draft.sourcePath.trim(),
+      ...(draft.workMode === 'full_copy' && draft.outputPath.trim()
+        ? { output_path: draft.outputPath.trim() }
+        : {}),
+      work_mode: draft.workMode,
+      create_output: createOutput,
+    }),
+    onSuccess: (result) => {
+      setPathBinding(result)
+      setPathBindingError(undefined)
+      setPathCreationConfirmOpen(false)
+      if (result.output_created) setContinuePreflightAfterBinding(true)
+      updateDraft({
+        sourceRootId: result.source.root_id,
+        sourceRelativePath: result.source.relative_path,
+        outputRootId: result.output?.root_id ?? '',
+        outputRelativePath: result.output?.relative_path ?? '',
+      })
+    },
+    onError: (error: Error) => setPathBindingError(error.message),
+  })
 
   const jobConfig = useMemo(() => {
     const config: Record<string, unknown> = {
@@ -130,19 +310,43 @@ export function DatasetWorkflow() {
       overwrite_mode: 'incremental',
       source_root: { root_id: draft.sourceRootId, relative_path: draft.sourceRelativePath },
       recursive: draft.recursive,
-      caption: { enabled: false, input_txt_mode: 'tag' },
-      classify: { enabled: false },
+      // Caption reuses the model already loaded by the Models/Workbench
+      // runtime.  The workflow API resolves the canonical opaque model id and
+      // preserves that model's thresholds and preprocessing profile.
+      caption: {
+        enabled: true,
+        input_txt_mode: 'tag',
+        ...(draft.captionModelId ? { model_id: draft.captionModelId } : {}),
+      },
+      classify: draft.classifyEnabled
+        ? {
+            enabled: true,
+            ...(draft.classifyResourceId ? { resource_id: draft.classifyResourceId } : {}),
+          }
+        : { enabled: false },
       replace: draft.replaceEnabled
         ? { enabled: true, resource_id: draft.replaceResourceId }
         : { enabled: false },
       ocr: draft.ocrEnabled
-        ? { enabled: true, min_confidence: draft.ocrMinConfidence }
+        ? {
+            enabled: true,
+            ...(draft.ocrResourceId ? { resource_id: draft.ocrResourceId } : {}),
+            min_confidence: draft.ocrMinConfidence,
+          }
         : { enabled: false },
       nl: { enabled: false },
       // Production UI jobs always stop at the explicit Count Review gate.
       // Legacy/API callers may opt out for deterministic compatibility tests.
       count_review: { enabled: true },
-      token_budget: { enabled: false },
+      token_budget: draft.tokenBudgetEnabled
+        ? {
+            enabled: true,
+            ...(draft.tokenizerResourceId
+              ? { tokenizer_resource_id: draft.tokenizerResourceId }
+              : {}),
+            max_tokens: draft.tokenMaxTokens,
+          }
+        : { enabled: false },
       export: { format: draft.exportFormat },
     }
     if (draft.workMode === 'full_copy') {
@@ -151,21 +355,77 @@ export function DatasetWorkflow() {
     return config
   }, [draft])
 
+  const effectiveJobConfig = useMemo(() => {
+    if (!pathBinding) return jobConfig
+    return {
+      ...jobConfig,
+      source_root: pathBinding.source,
+      ...(pathBinding.output ? { output_root: pathBinding.output } : {}),
+    }
+  }, [jobConfig, pathBinding])
+
+  const invalidateWorkflowJob = (jobId = selectedJobId) => {
+    void queryClient.invalidateQueries({ queryKey: ['workflow', 'jobs'] })
+    if (!jobId) return
+    void queryClient.invalidateQueries({ queryKey: ['workflow', 'count-review', jobId] })
+    void queryClient.invalidateQueries({ queryKey: ['workflow', 'token-review', jobId] })
+    void queryClient.invalidateQueries({ queryKey: ['workflow', 'report', jobId] })
+    void queryClient.invalidateQueries({ queryKey: ['workflow', 'issues', jobId] })
+  }
+
   const preflightMutation = useMutation({
-    mutationFn: () => api.workflowPreflight(jobConfig),
+    mutationFn: async () => {
+      const preview = await api.workflowPreviewPathBinding({
+        source_path: draft.sourcePath.trim(),
+        ...(draft.workMode === 'full_copy' && draft.outputPath.trim()
+          ? { output_path: draft.outputPath.trim() }
+          : {}),
+        work_mode: draft.workMode,
+      })
+      setPathBindingPreview(preview)
+      if (preview.errors.length) throw new Error(preview.errors.join('; '))
+      if (preview.output_create_required) {
+        setPathCreationConfirmOpen(true)
+        return undefined
+      }
+      const binding = await api.workflowBindPaths({
+        source_path: draft.sourcePath.trim(),
+        ...(draft.workMode === 'full_copy' && draft.outputPath.trim()
+          ? { output_path: draft.outputPath.trim() }
+          : {}),
+        work_mode: draft.workMode,
+      })
+      setPathBinding(binding)
+      const boundConfig = {
+        ...jobConfig,
+        source_root: binding.source,
+        ...(binding.output ? { output_root: binding.output } : {}),
+      }
+      return api.workflowPreflight(boundConfig)
+    },
     onMutate: () => {
       setPreflight(undefined)
       setPreflightError(undefined)
+      setCreateNotice(undefined)
     },
-    onSuccess: (report) => setPreflight(report),
+    onSuccess: (report) => { if (report) setPreflight(report) },
     onError: (error: Error) => setPreflightError(error.message),
   })
 
+  useEffect(() => {
+    if (!continuePreflightAfterBinding || !pathBinding) return
+    setContinuePreflightAfterBinding(false)
+    preflightMutation.mutate()
+  }, [continuePreflightAfterBinding, pathBinding, preflightMutation])
+
   const createMutation = useMutation({
-    mutationFn: () => api.workflowCreateJob(jobConfig),
+    mutationFn: () => api.workflowCreateJob(effectiveJobConfig),
     onSuccess: (created) => {
       setSelectedJobId(created.job_id)
-      void queryClient.invalidateQueries({ queryKey: ['workflow', 'jobs'] })
+      setCountPage(0)
+      setTokenPage(0)
+      setCreateNotice(text.taskCreatedPending)
+      invalidateWorkflowJob(created.job_id)
     },
     onError: (error: Error) => setPreflightError(error.message),
   })
@@ -223,7 +483,7 @@ export function DatasetWorkflow() {
     mutationFn: () => api.workflowConfirmCount(selectedJobId as string),
     onMutate: () => setCountError(undefined),
     onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: ['workflow', 'count-review'] })
+      invalidateWorkflowJob()
     },
     onError: (error: ApiError) => {
       setCountError(error.status === 409 ? text.countGateBlocked : error.message)
@@ -233,31 +493,38 @@ export function DatasetWorkflow() {
   const jobAction = useMutation({
     mutationFn: (action: 'pause' | 'resume' | 'cancel' | 'recover') =>
       api.workflowJobAction(selectedJobId as string, action),
-    onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: ['workflow', 'jobs'] })
-    },
+    onSuccess: () => invalidateWorkflowJob(),
     onError: (error: Error) => setCountError(error.message),
   })
 
   const startJob = useMutation({
     mutationFn: () => api.workflowStartJob(selectedJobId as string),
-    onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: ['workflow', 'jobs'] })
-    },
+    onSuccess: () => invalidateWorkflowJob(),
     onError: (error: Error) => setCountError(error.message),
   })
 
   const restoreJob = useMutation({
     mutationFn: () => api.workflowRestoreJob(selectedJobId as string),
-    onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: ['workflow', 'jobs'] })
-    },
+    onSuccess: () => invalidateWorkflowJob(),
     onError: (error: Error) => setCountError(error.message),
   })
 
   const discardJob = useMutation({
-    mutationFn: () => api.workflowDiscardJob(selectedJobId as string),
-    onSuccess: () => {
+    mutationFn: (jobId: string) => api.workflowDiscardJob(jobId),
+    onSuccess: (_, jobId) => {
+      if (selectedJobId === jobId) {
+        setSelectedJobId(undefined)
+        setCountPage(0)
+        setTokenPage(0)
+        setRepair(undefined)
+        setCountError(undefined)
+        setTokenError(undefined)
+        setTokenDraft({})
+      }
+      queryClient.removeQueries({ queryKey: ['workflow', 'count-review', jobId] })
+      queryClient.removeQueries({ queryKey: ['workflow', 'token-review', jobId] })
+      queryClient.removeQueries({ queryKey: ['workflow', 'report', jobId] })
+      queryClient.removeQueries({ queryKey: ['workflow', 'issues', jobId] })
       void queryClient.invalidateQueries({ queryKey: ['workflow', 'jobs'] })
     },
     onError: (error: Error) => setCountError(error.message),
@@ -265,9 +532,7 @@ export function DatasetWorkflow() {
 
   const pinJob = useMutation({
     mutationFn: (pinned: boolean) => api.workflowPinJob(selectedJobId as string, pinned),
-    onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: ['workflow', 'jobs'] })
-    },
+    onSuccess: () => invalidateWorkflowJob(),
     onError: (error: Error) => setCountError(error.message),
   })
 
@@ -275,7 +540,7 @@ export function DatasetWorkflow() {
     mutationFn: () => api.workflowRepairJob(selectedJobId as string),
     onSuccess: (report) => {
       setRepair(report)
-      void queryClient.invalidateQueries({ queryKey: ['workflow', 'jobs'] })
+      invalidateWorkflowJob()
     },
     onError: (error: Error) => setCountError(error.message),
   })
@@ -313,37 +578,91 @@ export function DatasetWorkflow() {
     mutationFn: () => api.workflowConfirmTokenReview(selectedJobId as string),
     onMutate: () => setTokenError(undefined),
     onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: ['workflow', 'token-review'] })
+      invalidateWorkflowJob()
     },
     onError: (error: ApiError) => setTokenError(error.message),
   })
 
   const selectedJob = jobs.data?.find((job) => job.job_id === selectedJobId)
   const workflowEvents = useWorkflowEvents(selectedJobId, {
-    enabled: Boolean(selectedJobId),
-    onEvent: () => {
-      // Event replay is the low-latency path; the regular query remains the
-      // source of truth for the complete job summary and status controls.
-      void queryClient.invalidateQueries({ queryKey: ['workflow', 'jobs'] })
+    enabled: Boolean(
+      selectedJobId && (!selectedJob || !TERMINAL_WORKFLOW_STATUSES.has(selectedJob.status)),
+    ),
+    onEvent: (event) => {
+      // Event replay is the low-latency path; the regular queries remain the
+      // source of truth for status controls, review gates, reports, and issues.
+      invalidateWorkflowJob(event.job_id)
     },
   })
 
-  // A repair report and a review error belong to one job, so clear them on switch.
+  // A repair report and review state belong to one job, so clear them on switch.
   function selectJob(jobId: string) {
     if (jobId === selectedJobId) return
     setSelectedJobId(jobId)
+    setCountPage(0)
+    setTokenPage(0)
     setRepair(undefined)
     setCountError(undefined)
     setTokenError(undefined)
     setTokenDraft({})
   }
 
+  const supportedProfiles = capabilities.data?.profiles ?? []
+  const supportedWorkModes = capabilities.data?.work_modes ?? []
+  const selectedResourcesAvailable =
+    (!draft.classifyEnabled || classifyResources.some((resource) => resource.resource_id === draft.classifyResourceId)) &&
+    (!draft.replaceEnabled || replacementResources.some((resource) => resource.resource_id === draft.replaceResourceId)) &&
+    (!draft.ocrEnabled || ocrResources.some((resource) => resource.resource_id === draft.ocrResourceId)) &&
+    (!draft.tokenBudgetEnabled || tokenizerResources.some((resource) => resource.resource_id === draft.tokenizerResourceId))
   const canPreflight = Boolean(
-    draft.sourceRootId && (draft.workMode === 'in_place' || draft.outputRootId),
+    capabilities.data &&
+      resources.data &&
+      supportedProfiles.includes(draft.profile) &&
+      supportedWorkModes.includes(draft.workMode) &&
+      selectedResourcesAvailable &&
+      draft.sourcePath.trim() &&
+      draft.captionModelId &&
+      (draft.workMode === 'in_place' || draft.outputPath.trim()),
   )
 
+  const stageTitle: Record<WorkflowStageId, string> = {
+    dataset: text.stageDataset,
+    caption: text.stageCaption,
+    classify: text.stageClassify,
+    replace: text.stageReplace,
+    ocr: text.stageOcr,
+    count: text.stageCount,
+    token: text.stageToken,
+    export: text.stageExport,
+  }
+  const stageDescription: Record<WorkflowStageId, string> = {
+    dataset: text.stageDatasetHint,
+    caption: text.stageCaptionHint,
+    classify: text.stageClassifyHint,
+    replace: text.stageReplaceHint,
+    ocr: text.stageOcrHint,
+    count: text.stageCountHint,
+    token: text.stageTokenHint,
+    export: text.stageExportHint,
+  }
+  const fieldHelp = (key: string) => text.help[key]
+  const selectedCaptionModel = loadedModels.find((model) => model.id === draft.captionModelId)
+  const enabledStageNames = [
+    draft.classifyEnabled && text.stageClassify,
+    draft.replaceEnabled && text.stageReplace,
+    draft.ocrEnabled && text.stageOcr,
+    text.stageCount,
+    draft.tokenBudgetEnabled && text.stageToken,
+  ].filter(Boolean).join(' · ')
+  const selectedResourceIds = [
+    draft.classifyEnabled && draft.classifyResourceId,
+    draft.replaceEnabled && draft.replaceResourceId,
+    draft.ocrEnabled && draft.ocrResourceId,
+    draft.tokenBudgetEnabled && draft.tokenizerResourceId,
+  ].filter(Boolean).join(' · ')
+
   return (
-    <div className="page page-dataset-workflow">
+    <div className="page page-dataset-workflow" lang={language === 'zh' ? 'zh-CN' : 'en'}>
       <div className="page-heading">
         <div className="page-heading-copy">
           <p className="eyebrow">DATASET WORKFLOW</p>
@@ -372,31 +691,73 @@ export function DatasetWorkflow() {
         <strong>{text.compatibilityTitle}</strong>
         <div>{text.compatibilityBody}</div>
       </Notice>
+      {(capabilities.isError || resources.isError) && (
+        <Notice tone="danger">
+          {language === 'zh'
+            ? '无法读取工作流能力或资源目录。为避免提交后端不支持的配置，任务预检已停用。'
+            : 'Workflow capabilities or resources are unavailable. Preflight is disabled to avoid submitting an unsupported configuration.'}
+        </Notice>
+      )}
 
+      <div className="workflow-step-layout">
+        <nav className="workflow-step-nav" aria-label={text.workflowSteps}>
+          <p className="eyebrow">{text.workflowSteps}</p>
+          {WORKFLOW_STAGE_IDS.map((stage, index) => (
+            <button
+              key={stage}
+              type="button"
+              className={`workflow-step-button${activeStage === stage ? ' is-active' : ''}`}
+              aria-current={activeStage === stage ? 'step' : undefined}
+              onClick={() => {
+                setActiveStage(stage)
+                document.getElementById(`workflow-stage-${stage}`)?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+              }}
+            >
+              <span className="workflow-step-number">{index + 1}</span>
+              <span>
+                <strong>{stageTitle[stage]}</strong>
+                <small>{stageDescription[stage]}</small>
+              </span>
+            </button>
+          ))}
+        </nav>
+        <div className="workflow-step-content">
+          <Notice tone="info">
+            <strong>{stageTitle[activeStage]}</strong>
+            <div>{stageDescription[activeStage]}</div>
+          </Notice>
+
+      <details className="workflow-advanced-resources">
+        <summary>
+          <span>
+            <strong>{text.advancedResources}</strong>
+            <small>{text.advancedResourcesHint}</small>
+          </span>
+        </summary>
       <Panel title={text.importTitle} eyebrow="Resources">
         <div className="form-grid">
-          <Field label={text.importRootId}>
-            <select
+          <Field label={text.importRootId} help={fieldHelp('importRoot')} helpLabels={text.helpLabels}>
+            <select aria-label={text.importRootId}
               value={importForm.rootId}
               onChange={(event) => setImportForm({ ...importForm, rootId: event.target.value })}
             >
               <option value="">—</option>
-              {rootOptions.map((root) => (
+              {inputRoots.map((root) => (
                 <option key={root.id} value={root.id}>
-                  {root.name} ({root.kind})
+                  {root.name}
                 </option>
               ))}
             </select>
           </Field>
-          <Field label={text.importRelativePath}>
-            <input
+          <Field label={text.importRelativePath} help={fieldHelp('importRelativePath')} helpLabels={text.helpLabels}>
+            <input aria-label={text.importRelativePath}
               value={importForm.relativePath}
               onChange={(event) => setImportForm({ ...importForm, relativePath: event.target.value })}
               placeholder="e621_general_tag_replacement_index.csv"
             />
           </Field>
-          <Field label={text.importResourceId}>
-            <input
+          <Field label={text.importResourceId} help={fieldHelp('importResourceId')} helpLabels={text.helpLabels}>
+            <input aria-label={text.importResourceId}
               value={importForm.resourceId}
               onChange={(event) => setImportForm({ ...importForm, resourceId: event.target.value })}
               placeholder="replace-e621-local-v1"
@@ -475,82 +836,86 @@ export function DatasetWorkflow() {
           <EmptyState icon={<Database size={20} />} title={text.resourcesEmpty} />
         )}
       </Panel>
+      </details>
 
-      <Panel title={text.createJobTitle} eyebrow="Pipeline">
-        <div className="form-grid">
-          <Field label={text.profile}>
-            <select
-              value={draft.profile}
+      <aside className="workflow-task-summary" aria-label={text.taskSummary}>
+        <p className="eyebrow">{text.taskSummary}</p>
+        <strong>{text.summaryOutputMode}</strong>
+        <span>{draft.workMode === 'full_copy' ? text.workModeFullCopy : text.workModeInPlace}</span>
+        <strong>{text.summarySource}</strong>
+        <span>{draft.sourcePath || '—'}</span>
+        <strong>{text.summaryCaption}</strong>
+        <span>{selectedCaptionModel?.name ?? '—'}</span>
+        <strong>{text.summarySteps}</strong>
+        <span>{enabledStageNames}</span>
+        <strong>{text.summaryResources}</strong>
+        <span>{selectedResourceIds || '—'}</span>
+        <strong>{text.summaryReview}</strong>
+        <span>{text.stageCount}</span>
+      </aside>
+
+      <div className="workflow-pipeline-panel" id="workflow-pipeline">
+        <Panel title={text.createJobTitle} eyebrow="Pipeline">
+          <Panel id="workflow-stage-dataset" title={text.stageDataset} className="workflow-stage-panel">
+          <div className="form-grid">
+          <Field label={text.profile} help={fieldHelp('profile')} helpLabels={text.helpLabels}>
+            <select aria-label={text.profile}
+              value={supportedProfiles.includes(draft.profile) ? draft.profile : ''}
+              disabled={!capabilities.data}
               onChange={(event) =>
-                setDraft({ ...draft, profile: event.target.value as WorkflowProfile })
+                updateDraft({ profile: event.target.value as WorkflowProfile })
               }
-            >
-              <option value="e621">e621</option>
-              <option value="danbooru">danbooru</option>
-            </select>
-          </Field>
-          <Field label={text.workMode}>
-            <select
-              value={draft.workMode}
-              onChange={(event) =>
-                setDraft({ ...draft, workMode: event.target.value as WorkflowWorkMode })
-              }
-            >
-              <option value="full_copy">{text.workModeFullCopy}</option>
-              <option value="in_place">{text.workModeInPlace}</option>
-            </select>
-          </Field>
-          <Field label={text.sourceRoot}>
-            <select
-              value={draft.sourceRootId}
-              onChange={(event) => setDraft({ ...draft, sourceRootId: event.target.value })}
             >
               <option value="">—</option>
-              {rootOptions.map((root) => (
-                <option key={root.id} value={root.id}>
-                  {root.name} ({root.kind})
+              {supportedProfiles.map((profile) => <option key={profile} value={profile}>{profile}</option>)}
+            </select>
+          </Field>
+          <Field label={text.workMode} help={fieldHelp('workMode')} helpLabels={text.helpLabels}>
+            <select aria-label={text.workMode}
+              value={supportedWorkModes.includes(draft.workMode) ? draft.workMode : ''}
+              disabled={!capabilities.data}
+              onChange={(event) =>
+                updateDraft({ workMode: event.target.value as WorkflowWorkMode })
+              }
+            >
+              <option value="">—</option>
+              {supportedWorkModes.map((mode) => (
+                <option key={mode} value={mode}>
+                  {mode === 'full_copy' ? text.workModeFullCopy : text.workModeInPlace}
                 </option>
               ))}
             </select>
           </Field>
-          <Field label={`${text.sourceRoot} · ${text.relativePath}`}>
+          {draft.workMode === 'in_place' && <Notice tone="warning">{text.inPlaceWarning}</Notice>}
+          <Field label={text.sourcePath} help={fieldHelp('sourceRoot')} helpLabels={text.helpLabels}>
             <input
-              value={draft.sourceRelativePath}
-              onChange={(event) => setDraft({ ...draft, sourceRelativePath: event.target.value })}
+              aria-label={text.sourcePath}
+              value={draft.sourcePath}
+              placeholder="E:\\datasets\\train"
+              onChange={(event) => updateDraft({ sourcePath: event.target.value })}
             />
           </Field>
+          {pathBindingPreview?.status === 'ready' && !pathBindingError && (
+            <Notice tone="success">{text.pathReady}</Notice>
+          )}
+          {pathBindingError && <Notice tone="danger">{pathBindingError}</Notice>}
           {draft.workMode === 'full_copy' && (
             <>
-              <Field label={text.outputRoot}>
-                <select
-                  value={draft.outputRootId}
-                  onChange={(event) => setDraft({ ...draft, outputRootId: event.target.value })}
-                >
-                  <option value="">—</option>
-                  {rootOptions
-                    .filter((root) => root.writable)
-                    .map((root) => (
-                      <option key={root.id} value={root.id}>
-                        {root.name} ({root.kind})
-                      </option>
-                    ))}
-                </select>
-              </Field>
-              <Field label={`${text.outputRoot} · ${text.relativePath}`}>
+              <Field label={text.outputPath} help={fieldHelp('outputRoot')} helpLabels={text.helpLabels}>
                 <input
-                  value={draft.outputRelativePath}
-                  onChange={(event) =>
-                    setDraft({ ...draft, outputRelativePath: event.target.value })
-                  }
+                  aria-label={text.outputPath}
+                  value={draft.outputPath}
+                  placeholder="E:\\datasets\\train_processed"
+                  onChange={(event) => updateDraft({ outputPath: event.target.value })}
                 />
               </Field>
             </>
           )}
-          <Field label={text.exportFormat}>
-            <select
+          <Field label={text.exportFormat} help={fieldHelp('exportFormat')} helpLabels={text.helpLabels}>
+            <select aria-label={text.exportFormat}
               value={draft.exportFormat}
               onChange={(event) =>
-                setDraft({ ...draft, exportFormat: event.target.value as WorkflowExportFormat })
+                updateDraft({ exportFormat: event.target.value as WorkflowExportFormat })
               }
             >
               <option value="both">{text.exportBoth}</option>
@@ -558,11 +923,76 @@ export function DatasetWorkflow() {
               <option value="txt">{text.exportTxt}</option>
             </select>
           </Field>
-          <Field label={text.enableReplace}>
-            <select
+          </div>
+          </Panel>
+
+          <Panel id="workflow-stage-caption" title={text.stageCaption} className="workflow-stage-panel">
+          <div className="form-grid">
+          <Field label={text.captionModel} help={fieldHelp('captionModel')} helpLabels={text.helpLabels}>
+            {loadedModels.length === 0 ? (
+              <Notice tone="warning">
+                <div>{text.noLoadedModel}</div>
+                <Button type="button" size="sm" variant="secondary" icon={<ArrowRight size={14} />} onClick={() => setPage('models')}>
+                  {text.chooseModel}
+                </Button>
+              </Notice>
+            ) : loadedModels.length > 1 ? (
+              <select aria-label={text.captionModel}
+                value={draft.captionModelId ?? ''}
+                onChange={(event) => updateDraft({ captionModelId: event.target.value })}
+              >
+                <option value="">—</option>
+                {loadedModels.map((model) => <option key={model.id} value={model.id}>{model.name}</option>)}
+              </select>
+            ) : (
+              <select aria-label={text.captionModel} value={draft.captionModelId ?? ''} disabled>
+                <option value={loadedModels[0]?.id}>{loadedModels[0]?.name}</option>
+              </select>
+            )}
+          </Field>
+          <div className="workflow-hint">{loadedModels.length > 1 ? text.multipleModels : text.captionRuntimeHint}</div>
+          {selectedCaptionModel && <div className="workflow-hint">{selectedCaptionModel.backend.toUpperCase()} / {text.captionModelDetails}: {selectedCaptionModel.threshold_source ?? 'model'}</div>}
+          </div>
+          </Panel>
+
+          <Panel id="workflow-stage-classify" title={text.stageClassify} className="workflow-stage-panel">
+          <div className="form-grid">
+          <Field label={text.enableClassify} help={fieldHelp('classifyEnabled')} helpLabels={text.helpLabels}>
+            <select aria-label={text.enableClassify}
+              value={draft.classifyEnabled ? 'yes' : 'no'}
+              onChange={(event) =>
+                updateDraft({ classifyEnabled: event.target.value === 'yes' })
+              }
+            >
+              <option value="no">{text.no}</option>
+              <option value="yes">{text.yes}</option>
+            </select>
+          </Field>
+          {draft.classifyEnabled && (
+              <Field label={text.classifyResource} help={fieldHelp('classifyResource')} helpLabels={text.helpLabels}>
+              <select aria-label={text.classifyResource}
+                value={draft.classifyResourceId}
+                onChange={(event) => updateDraft({ classifyResourceId: event.target.value })}
+              >
+                <option value="">—</option>
+                {classifyResources.map((resource) => (
+                  <option key={resource.resource_id} value={resource.resource_id}>
+                    {resource.resource_id}
+                  </option>
+                ))}
+              </select>
+            </Field>
+          )}
+          </div>
+          </Panel>
+
+          <Panel id="workflow-stage-replace" title={text.stageReplace} className="workflow-stage-panel">
+          <div className="form-grid">
+          <Field label={text.enableReplace} help={fieldHelp('replaceEnabled')} helpLabels={text.helpLabels}>
+            <select aria-label={text.enableReplace}
               value={draft.replaceEnabled ? 'yes' : 'no'}
               onChange={(event) =>
-                setDraft({ ...draft, replaceEnabled: event.target.value === 'yes' })
+                updateDraft({ replaceEnabled: event.target.value === 'yes' })
               }
             >
               <option value="yes">{text.yes}</option>
@@ -570,32 +1000,35 @@ export function DatasetWorkflow() {
             </select>
           </Field>
           {draft.replaceEnabled && (
-            <Field label="Replace resource">
-              <select
-                value={draft.replaceResourceId}
-                onChange={(event) => setDraft({ ...draft, replaceResourceId: event.target.value })}
-              >
-                <option value="">—</option>
-                {(resources.data ?? [])
-                  // Existing catalogs use `replacement_index`; older imports
-                  // used `replace`. Both are valid replacement resources.
-                  .filter(
-                    (resource) =>
-                      resource.category === 'replace' || resource.category === 'replacement_index',
-                  )
-                  .map((resource) => (
-                    <option key={resource.resource_id} value={resource.resource_id}>
-                      {resource.resource_id}
-                    </option>
-                  ))}
-              </select>
-            </Field>
+            <>
+              <Field label={text.replaceResource} help={fieldHelp('replaceResource')} helpLabels={text.helpLabels}>
+                <select aria-label={text.replaceResource}
+                  value={draft.replaceResourceId}
+                  onChange={(event) => updateDraft({ replaceResourceId: event.target.value })}
+                >
+                  <option value="">—</option>
+                  {replacementResources.map((resource) => (
+                      <option key={resource.resource_id} value={resource.resource_id}>
+                        {resource.resource_id}
+                      </option>
+                    ))}
+                </select>
+              </Field>
+              {draft.replaceResourceId === DEFAULT_REPLACEMENT_RESOURCE_ID && (
+                <Notice tone="info">{text.replacePassDropNotice}</Notice>
+              )}
+            </>
           )}
-          <Field label={text.enableOcr}>
-            <select
+          </div>
+          </Panel>
+
+          <Panel id="workflow-stage-ocr" title={text.stageOcr} className="workflow-stage-panel">
+          <div className="form-grid">
+          <Field label={text.enableOcr} help={fieldHelp('ocrEnabled')} helpLabels={text.helpLabels}>
+            <select aria-label={text.enableOcr}
               value={draft.ocrEnabled ? 'yes' : 'no'}
               onChange={(event) =>
-                setDraft({ ...draft, ocrEnabled: event.target.value === 'yes' })
+                updateDraft({ ocrEnabled: event.target.value === 'yes' })
               }
             >
               <option value="no">{text.no}</option>
@@ -603,28 +1036,102 @@ export function DatasetWorkflow() {
             </select>
           </Field>
           {draft.ocrEnabled && (
-            <Field label={text.ocrMinConfidence}>
-              <input
-                type="number"
-                min={0}
-                max={1}
-                step={0.05}
-                value={draft.ocrMinConfidence}
-                onChange={(event) =>
-                  setDraft({ ...draft, ocrMinConfidence: Number(event.target.value) })
-                }
-              />
-            </Field>
+            <>
+              <Field label={text.ocrResource} help={fieldHelp('ocrResource')} helpLabels={text.helpLabels}>
+                <select aria-label={text.ocrResource}
+                  value={draft.ocrResourceId}
+                  onChange={(event) => updateDraft({ ocrResourceId: event.target.value })}
+                >
+                  <option value="">—</option>
+                  {ocrResources.map((resource) => (
+                    <option key={resource.resource_id} value={resource.resource_id}>
+                      {resource.resource_id}
+                    </option>
+                  ))}
+                </select>
+              </Field>
+              <Field label={text.ocrMinConfidence} help={fieldHelp('ocrMinConfidence')} helpLabels={text.helpLabels}>
+                <input aria-label={text.ocrMinConfidence}
+                  type="number"
+                  min={0}
+                  max={1}
+                  step={0.05}
+                  value={draft.ocrMinConfidence}
+                  onChange={(event) =>
+                    updateDraft({ ocrMinConfidence: Number(event.target.value) })
+                  }
+                />
+              </Field>
+            </>
           )}
-          <Field label={text.recursive}>
-            <select
-              value={draft.recursive ? 'yes' : 'no'}
-              onChange={(event) => setDraft({ ...draft, recursive: event.target.value === 'yes' })}
+          </div>
+          </Panel>
+
+          <Panel id="workflow-stage-token" title={text.stageToken} className="workflow-stage-panel">
+          <div className="form-grid">
+          <Field label={text.enableTokenBudget} help={fieldHelp('tokenBudgetEnabled')} helpLabels={text.helpLabels}>
+            <select aria-label={text.enableTokenBudget}
+              value={draft.tokenBudgetEnabled ? 'yes' : 'no'}
+              onChange={(event) =>
+                updateDraft({ tokenBudgetEnabled: event.target.value === 'yes' })
+              }
             >
               <option value="no">{text.no}</option>
               <option value="yes">{text.yes}</option>
             </select>
           </Field>
+          {draft.tokenBudgetEnabled && (
+            <>
+              <Field label={text.tokenizerResource} help={fieldHelp('tokenizerResource')} helpLabels={text.helpLabels}>
+                <select aria-label={text.tokenizerResource}
+                  value={draft.tokenizerResourceId}
+                  onChange={(event) =>
+                    updateDraft({ tokenizerResourceId: event.target.value })
+                  }
+                >
+                  <option value="">—</option>
+                  {tokenizerResources.map((resource) => (
+                    <option key={resource.resource_id} value={resource.resource_id}>
+                      {resource.resource_id}
+                    </option>
+                  ))}
+                </select>
+              </Field>
+              <Field label={text.tokenMaxTokens} help={fieldHelp('tokenMaxTokens')} helpLabels={text.helpLabels}>
+                <input aria-label={text.tokenMaxTokens}
+                  type="number"
+                  min={1}
+                  max={8192}
+                  value={draft.tokenMaxTokens}
+                  onChange={(event) =>
+                    updateDraft({ tokenMaxTokens: Number(event.target.value) })
+                  }
+                />
+              </Field>
+            </>
+          )}
+          <Field label={text.recursive} help={fieldHelp('recursive')} helpLabels={text.helpLabels}>
+            <select aria-label={text.recursive}
+              value={draft.recursive ? 'yes' : 'no'}
+              onChange={(event) => updateDraft({ recursive: event.target.value === 'yes' })}
+            >
+              <option value="no">{text.no}</option>
+              <option value="yes">{text.yes}</option>
+            </select>
+          </Field>
+          </div>
+          </Panel>
+
+          <Panel id="workflow-stage-export" title={text.stageExport} className="workflow-stage-panel">
+        <div className="workflow-summary-card">
+          <strong>{text.stageExportHint}</strong>
+          <div>{text.summaryOutputMode}: {draft.workMode === 'full_copy' ? text.workModeFullCopy : text.workModeInPlace}</div>
+          <div>{text.summarySource}: {draft.sourcePath || '—'}</div>
+          {draft.workMode === 'full_copy' && <div>{text.summaryDestination}: {draft.outputPath || '—'}</div>}
+          <div>{text.summaryCaption}: {selectedCaptionModel?.name ?? '—'}{selectedCaptionModel ? ` · ${selectedCaptionModel.backend.toUpperCase()}` : ''}</div>
+          <div>{text.summarySteps}: {enabledStageNames}</div>
+          <div>{text.summaryResources}: {selectedResourceIds || '—'}</div>
+          <div>{text.summaryReview}: {text.stageCount}</div>
         </div>
 
         <div className="workflow-button-row">
@@ -632,18 +1139,22 @@ export function DatasetWorkflow() {
             onClick={() => preflightMutation.mutate()}
             disabled={preflightMutation.isPending || !canPreflight}
           >
-            {text.preflight}
+            {text.checkSettings}
           </Button>
+          <HelpPopover label={text.checkSettings} help={fieldHelp('preflight')!} labels={text.helpLabels} />
           <Button
             variant="primary"
             onClick={() => createMutation.mutate()}
             disabled={createMutation.isPending || !preflight?.valid}
           >
-            {text.createJob}
+            {text.createPendingTask}
           </Button>
+          <HelpPopover label={text.createPendingTask} help={fieldHelp('createJob')!} labels={text.helpLabels} />
         </div>
 
         {preflightError && <Notice tone="danger">{preflightError}</Notice>}
+        {createNotice && <Notice tone="success">{createNotice}</Notice>}
+        {!preflight && <div className="workflow-hint">{text.summaryNotChecked}</div>}
         {preflight && (
           <Notice tone={preflight.valid ? 'success' : 'danger'}>
             <strong>
@@ -660,6 +1171,37 @@ export function DatasetWorkflow() {
           </Notice>
         )}
       </Panel>
+      </Panel>
+      </div>
+        </div>
+      </div>
+
+      {pathCreationConfirmOpen && (
+        <DialogLayer className="workflow-dialog-backdrop" onClose={() => setPathCreationConfirmOpen(false)}>
+          <div
+            className="workflow-dialog"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="workflow-create-output-title"
+          >
+            <h2 id="workflow-create-output-title">{text.pathCreateConfirm}</h2>
+            <p>{text.pathCreateRequired}</p>
+            <code>{draft.outputPath}</code>
+            <div className="workflow-actions">
+              <Button variant="quiet" onClick={() => setPathCreationConfirmOpen(false)}>
+                {text.pathCreateCancel}
+              </Button>
+              <Button
+                variant="primary"
+                onClick={() => bindPathsMutation.mutate(true)}
+                disabled={bindPathsMutation.isPending}
+              >
+                {text.pathCreateOutput}
+              </Button>
+            </div>
+          </div>
+        </DialogLayer>
+      )}
 
       <Panel
         title={text.jobsTitle}
@@ -691,10 +1233,18 @@ export function DatasetWorkflow() {
               {jobs.data.map((job) => (
                 <tr
                   key={job.job_id}
-                  onClick={() => selectJob(job.job_id)}
                   className={job.job_id === selectedJobId ? 'row-active' : ''}
                 >
-                  <td className="workflow-mono">{job.job_id.slice(0, 12)}…</td>
+                  <td className="workflow-mono">
+                    <button
+                      type="button"
+                      className="workflow-job-select"
+                      aria-pressed={job.job_id === selectedJobId}
+                      onClick={() => selectJob(job.job_id)}
+                    >
+                      {job.job_id.slice(0, 12)}…
+                    </button>
+                  </td>
                   <td>
                     <StatusBadge state={job.status} />
                   </td>
@@ -738,13 +1288,16 @@ export function DatasetWorkflow() {
               {selectedJob.pinned ? text.unpinJob : text.pinJob}
             </Button>
             {selectedJob.status === 'pending' && (
-              <Button
-                onClick={() => startJob.mutate()}
-                disabled={startJob.isPending}
-              >
-                <Play size={15} aria-hidden="true" />
-                {text.startJob}
-              </Button>
+              <>
+                <Button
+                  onClick={() => startJob.mutate()}
+                  disabled={startJob.isPending}
+                >
+                  <Play size={15} aria-hidden="true" />
+                  {text.startJob}
+                </Button>
+                <HelpPopover label={text.startJob} help={fieldHelp('startJob')!} labels={text.helpLabels} />
+              </>
             )}
             {selectedJob.status === 'running' && (
               <Button
@@ -803,7 +1356,7 @@ export function DatasetWorkflow() {
             {['completed', 'failed', 'cancelled', 'interrupted', 'rollback_required'].includes(selectedJob.status) && (
               <Button
                 variant="quiet"
-                onClick={() => discardJob.mutate()}
+                onClick={() => discardJob.mutate(selectedJob.job_id)}
                 disabled={discardJob.isPending || selectedJob.pinned === true}
                 title={selectedJob.pinned ? text.discardPinnedHint : undefined}
               >
@@ -884,8 +1437,10 @@ export function DatasetWorkflow() {
 
       {selectedJobId && countReview.data?.items && (
         <Panel
+          id="workflow-stage-count"
           title={text.countReviewTitle}
           eyebrow={`${text.countReviewPending} ${countReview.data.pending ?? 0}`}
+          actions={<HelpPopover label={text.countReviewTitle} help={fieldHelp('countReview')!} labels={text.helpLabels} />}
         >
           {countError && <Notice tone="danger">{countError}</Notice>}
           {countReview.data.items.length === 0 ? (
@@ -944,6 +1499,29 @@ export function DatasetWorkflow() {
                 </article>
               ))}
             </div>
+          )}
+          {(countPage > 0 || countReview.data.items.length === REVIEW_PAGE_SIZE) && (
+            <nav className="workflow-pagination" aria-label={language === 'zh' ? '数量审核分页' : 'Count review pagination'}>
+              <Button
+                type="button"
+                variant="secondary"
+                size="sm"
+                disabled={countPage === 0 || countReview.isFetching}
+                onClick={() => setCountPage((page) => Math.max(0, page - 1))}
+              >
+                {language === 'zh' ? '上一页' : 'Previous'}
+              </Button>
+              <span aria-live="polite">{language === 'zh' ? `第 ${countPage + 1} 页` : `Page ${countPage + 1}`}</span>
+              <Button
+                type="button"
+                variant="secondary"
+                size="sm"
+                disabled={countReview.data.items.length < REVIEW_PAGE_SIZE || countReview.isFetching}
+                onClick={() => setCountPage((page) => page + 1)}
+              >
+                {language === 'zh' ? '下一页' : 'Next'}
+              </Button>
+            </nav>
           )}
           <div className="workflow-actions">
             <Button
@@ -1055,6 +1633,29 @@ export function DatasetWorkflow() {
                 ))}
               </div>
             </>
+          )}
+          {(tokenPage > 0 || tokenReview.data.items.length === REVIEW_PAGE_SIZE) && (
+            <nav className="workflow-pagination" aria-label={language === 'zh' ? 'Token 审核分页' : 'Token review pagination'}>
+              <Button
+                type="button"
+                variant="secondary"
+                size="sm"
+                disabled={tokenPage === 0 || tokenReview.isFetching}
+                onClick={() => setTokenPage((page) => Math.max(0, page - 1))}
+              >
+                {language === 'zh' ? '上一页' : 'Previous'}
+              </Button>
+              <span aria-live="polite">{language === 'zh' ? `第 ${tokenPage + 1} 页` : `Page ${tokenPage + 1}`}</span>
+              <Button
+                type="button"
+                variant="secondary"
+                size="sm"
+                disabled={tokenReview.data.items.length < REVIEW_PAGE_SIZE || tokenReview.isFetching}
+                onClick={() => setTokenPage((page) => page + 1)}
+              >
+                {language === 'zh' ? '下一页' : 'Next'}
+              </Button>
+            </nav>
           )}
           <div className="workflow-actions">
             <Button

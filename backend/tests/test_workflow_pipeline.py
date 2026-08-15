@@ -224,6 +224,85 @@ def test_pipeline_stage_tracker_closes_running_stage_on_exception():
     }
 
 
+def test_pipeline_records_enabled_stage_runs(tmp_path):
+    """Enabled model/control stages have durable completed checkpoints."""
+    from backend.tagger2.workflow.db import WorkflowDatabase
+    from backend.tagger2.workflow.pipeline import run_offline_pipeline
+    from backend.tagger2.workflow.stages.classify import ClassificationRules
+
+    source, output = tmp_path / "src", tmp_path / "out"
+    source.mkdir()
+    output.mkdir()
+    _write_image(source / "a.png")
+    (source / "a.txt").write_text("male, anthro", encoding="utf-8")
+    database = WorkflowDatabase(tmp_path / "workflow.sqlite3")
+    job_id, _ = database.create_job(
+        config_json={},
+        config_hash="h",
+        profile="e621",
+        work_mode="full_copy",
+        overwrite_mode="incremental",
+        source_root_id="in",
+        output_root_id="out",
+        workspace_root=tmp_path / "jobs",
+    )
+    config = _config(source, output)
+    config = config.from_payload(
+        {
+            **config.to_dict(),
+            "classify": {"enabled": True},
+            "ocr": {"enabled": False},
+            "token_budget": {"enabled": False},
+        }
+    )
+    report = run_offline_pipeline(
+        config,
+        source_root=source,
+        output_root=output,
+        workspace=tmp_path / "ws",
+        replacement_index_path=_index(tmp_path / "index.csv"),
+        classification_rules=ClassificationRules(
+            profile="e621", tags={}, aliases={}, implications={}
+        ),
+        database=database,
+        job_id=job_id,
+    )
+    assert report.exported_samples == 1
+    with database.connection() as conn:
+        rows = conn.execute(
+            "SELECT stage_id, status, checkpoint_json FROM workflow_stage_runs "
+            "WHERE job_id = ? ORDER BY stage_id",
+            (job_id,),
+        ).fetchall()
+    statuses = {row["stage_id"]: row["status"] for row in rows}
+    assert statuses["classify"] == "completed"
+    assert statuses["replace"] == "completed"
+    assert statuses["import"] == "completed"
+    assert statuses["export"] == "completed"
+    assert all(row["status"] != "running" for row in rows)
+
+
+def test_pipeline_resource_verifier_blocks_commit(tmp_path):
+    """A resource drift detected at the commit boundary leaves output untouched."""
+    from backend.tagger2.workflow.pipeline import run_offline_pipeline
+
+    source, output = tmp_path / "src", tmp_path / "out"
+    source.mkdir()
+    output.mkdir()
+    _write_image(source / "a.png")
+    (source / "a.txt").write_text("male", encoding="utf-8")
+    report = run_offline_pipeline(
+        _config(source, output, replace=False),
+        source_root=source,
+        output_root=output,
+        workspace=tmp_path / "ws",
+        resource_verifier=lambda: (_ for _ in ()).throw(RuntimeError("drift")),
+    )
+    assert report.committed_files == 0
+    assert any(issue.code == "resource_hash_drift" for issue in report.issues)
+    assert not (output / "a.json").exists()
+
+
 def test_offline_pipeline_full_copy_exports_json_and_flat_txt():
     """The vertical produces nine-field JSON plus flat TXT and commits atomically."""
     from backend.tagger2.workflow.pipeline import run_offline_pipeline

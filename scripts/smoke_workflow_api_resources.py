@@ -64,7 +64,7 @@ def main() -> int:
         "output_root": {"root_id": "out", "relative_path": ""},
         "caption": {"enabled": False},
         "classify": {"enabled": True, "resource_id": "classify-e621-20260812-v1"},
-        "replace": {"enabled": True, "resource_id": "replace-e621-index-v1"},
+        "replace": {"enabled": True, "resource_id": "replace-e621-pass-drop-v2"},
         "ocr": {"enabled": True, "resource_id": "ocr-paddleocr-2-9-1-cpu-v1"},
         "nl": {"enabled": False},
         "count_review": {"enabled": False},

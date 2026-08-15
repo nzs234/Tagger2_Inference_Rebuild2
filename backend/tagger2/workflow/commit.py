@@ -31,6 +31,17 @@ def sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def _sha256_stream(stream: Any) -> tuple[str, int]:
+    """Hash a readable binary stream without materialising its contents."""
+
+    digest = hashlib.sha256()
+    size = 0
+    for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+        digest.update(chunk)
+        size += len(chunk)
+    return digest.hexdigest(), size
+
+
 def sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as stream:
@@ -115,7 +126,9 @@ def write_annotation_backup(
                     info = archive.getinfo(str(recorded["path"]))
                     if info.file_size != recorded["size"]:
                         raise CommitError("backup verification failed")
-                    if sha256_bytes(archive.read(info)) != recorded["sha256"]:
+                    with archive.open(info) as stream:
+                        digest, size = _sha256_stream(stream)
+                    if digest != recorded["sha256"] or size != recorded["size"]:
                         raise CommitError("backup verification failed")
 
         os.replace(partial, target)
@@ -152,11 +165,8 @@ def restore_annotation_backup(backup_zip: Path, dataset_root: Path) -> int:
                     restored += 1
                     continue
                 info = archive.getinfo(relative)
-                data = archive.read(info)
-                if sha256_bytes(data) != entry["sha256"]:
-                    raise CommitError("backup archive digest mismatch")
                 target.parent.mkdir(parents=True, exist_ok=True)
-                _atomic_write(target, data)
+                _atomic_write_stream(target, archive.open(info), entry["sha256"], entry["size"])
                 os.utime(target, ns=(entry["mtimeNs"], entry["mtimeNs"]))
                 restored += 1
     return restored
@@ -210,6 +220,79 @@ def _atomic_write(target: Path, data: bytes) -> Path:
     return target
 
 
+def _atomic_write_stream(
+    target: Path,
+    source: Any,
+    expected_sha256: str | None = None,
+    expected_size: int | None = None,
+) -> Path:
+    """Copy a binary stream to ``target`` atomically while checking its digest."""
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    handle, temporary = tempfile.mkstemp(
+        prefix=f".{target.name}.", suffix=".tmp", dir=target.parent
+    )
+    temp_path = Path(temporary)
+    try:
+        digest = hashlib.sha256()
+        size = 0
+        with os.fdopen(handle, "wb") as stream:
+            for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                stream.write(chunk)
+                digest.update(chunk)
+                size += len(chunk)
+            stream.flush()
+            os.fsync(stream.fileno())
+        if expected_sha256 is not None and digest.hexdigest() != expected_sha256:
+            raise CommitError("stream digest differs from the recorded digest")
+        if expected_size is not None and size != int(expected_size):
+            raise CommitError("stream size differs from the recorded size")
+        os.replace(temp_path, target)
+    except Exception:
+        temp_path.unlink(missing_ok=True)
+        raise
+    finally:
+        close = getattr(source, "close", None)
+        if callable(close):
+            close()
+    return target
+
+
+def _atomic_copy(
+    source: Path,
+    target: Path,
+    expected_sha256: str | None = None,
+    expected_size: int | None = None,
+) -> tuple[str, int]:
+    """Stream-copy one file through an atomic temporary target."""
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    handle, temporary = tempfile.mkstemp(
+        prefix=f".{target.name}.", suffix=".tmp", dir=target.parent
+    )
+    temp_path = Path(temporary)
+    try:
+        digest = hashlib.sha256()
+        size = 0
+        with source.open("rb") as source_stream, os.fdopen(handle, "wb") as target_stream:
+            for chunk in iter(lambda: source_stream.read(1024 * 1024), b""):
+                target_stream.write(chunk)
+                digest.update(chunk)
+                size += len(chunk)
+            target_stream.flush()
+            os.fsync(target_stream.fileno())
+        actual = digest.hexdigest()
+        if expected_sha256 is not None and actual != expected_sha256:
+            raise CommitError("staged file changed after validation")
+        if expected_size is not None and size != int(expected_size):
+            raise CommitError("staged file size changed after validation")
+        os.replace(temp_path, target)
+        return actual, size
+    except Exception:
+        temp_path.unlink(missing_ok=True)
+        raise
+
+
 @dataclass(frozen=True)
 class StagedFile:
     """One validated file waiting to be promoted into the dataset."""
@@ -233,6 +316,14 @@ class ExportStaging:
         return StagedFile(
             relative_path=relative, sha256=sha256_bytes(data), size=len(data)
         )
+
+    def stage_file(self, relative_path: str, source: Path) -> StagedFile:
+        """Stage a file by streaming it from disk rather than reading bytes."""
+
+        relative = _safe_relative(relative_path)
+        target = self.staging_root / Path(relative.replace("/", os.sep))
+        digest, size = _atomic_copy(Path(source), target)
+        return StagedFile(relative_path=relative, sha256=digest, size=size)
 
     def staged_path(self, relative_path: str) -> Path:
         return self.staging_root / Path(_safe_relative(relative_path).replace("/", os.sep))
@@ -309,13 +400,14 @@ def commit_staged_files(
             source = staging.staged_path(item.relative_path)
             if not source.is_file():
                 raise CommitError(f"staged file is missing: {item.relative_path}")
-            data = source.read_bytes()
-            if sha256_bytes(data) != item.sha256 or len(data) != item.size:
-                raise CommitError(f"staged file changed after validation: {item.relative_path}")
-
             target = dataset_root / Path(item.relative_path.replace("/", os.sep))
             undo.append((target, _displace_for_undo(target, undo_root, len(undo))))
-            _atomic_write(target, data)
+            try:
+                _atomic_copy(source, target, item.sha256, item.size)
+            except CommitError as exc:
+                raise CommitError(
+                    f"staged file changed after validation: {item.relative_path}"
+                ) from exc
             committed += 1
             journal.append(
                 {

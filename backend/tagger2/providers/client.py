@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence, cast
 from urllib.parse import quote
 
 import httpx
@@ -185,7 +185,7 @@ class VisionProvider(ProviderHTTPMixin):
         if isinstance(image, (str, Path, bytes, bytearray, PreparedImage)):
             inputs: Sequence[ImageInput] = [image]
         elif isinstance(image, Sequence):
-            inputs = image
+            inputs = list(cast(Sequence[ImageInput], image))
         else:
             raise TypeError("image must be an image source, a sequence of image sources, or None")
 
