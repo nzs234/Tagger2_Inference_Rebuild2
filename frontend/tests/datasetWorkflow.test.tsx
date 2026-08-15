@@ -1,5 +1,5 @@
 ﻿import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { DatasetWorkflow } from '../src/pages/DatasetWorkflow'
 import { copyFor, workflowCopy } from '../src/lib/workflowCopy'
@@ -7,11 +7,12 @@ import { usePreferences } from '../src/store/app'
 
 function renderPage() {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
-  return render(
+  const result = render(
     <QueryClientProvider client={client}>
       <DatasetWorkflow />
     </QueryClientProvider>,
   )
+  return { ...result, queryClient: client }
 }
 
 describe('workflow copy', () => {
@@ -36,7 +37,10 @@ describe('workflow copy', () => {
 })
 
 describe('DatasetWorkflow page', () => {
+  let modelItems: Array<Record<string, unknown>> = []
+
   beforeEach(() => {
+    modelItems = []
     usePreferences.setState({ workflowLanguage: 'zh' })
     vi.spyOn(globalThis, 'fetch').mockImplementation(async (input: RequestInfo | URL) => {
       const url = String(input)
@@ -71,6 +75,7 @@ describe('DatasetWorkflow page', () => {
         ])
       }
       if (url.includes('/workflows/jobs')) return json([])
+      if (url.includes('/models')) return json({ items: modelItems })
       if (url.includes('/roots')) {
         return json({ items: [{ id: 'in', name: 'Input', kind: 'input', writable: false }] })
       }
@@ -170,6 +175,28 @@ describe('DatasetWorkflow page', () => {
     expect(screen.getAllByRole('dialog')).toHaveLength(1)
     fireEvent.keyDown(document, { key: 'Escape' })
     expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+  })
+
+  it('preserves an explicitly selected first model across query refreshes', async () => {
+    modelItems = [
+      { id: 'model-a', name: 'Model A', backend: 'onnx', loaded: true, threshold_source: 'model' },
+      { id: 'model-b', name: 'Model B', backend: 'onnx', loaded: true, threshold_source: 'model' },
+    ]
+    const { queryClient } = renderPage()
+    const captionModel = await screen.findByRole('combobox', { name: copyFor('zh').captionModel }) as HTMLSelectElement
+
+    fireEvent.change(captionModel, { target: { value: 'model-a' } })
+    expect(captionModel.value).toBe('model-a')
+
+    modelItems = [
+      { ...modelItems[0], memory_mb: 2048 },
+      modelItems[1]!,
+    ]
+    await act(async () => {
+      queryClient.setQueryData(['models'], { items: modelItems })
+      await new Promise((resolve) => setTimeout(resolve, 0))
+    })
+    expect(captionModel.value).toBe('model-a')
   })
 
   it('uses the e621 defaults and accepts complete manual dataset paths', async () => {

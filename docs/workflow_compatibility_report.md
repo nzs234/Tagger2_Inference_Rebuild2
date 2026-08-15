@@ -8,12 +8,18 @@ verified. Local resources listed below are provisioned outside Git under
 `data/workflows/resources`; a fresh checkout must import them before enabling
 the corresponding stage.
 
+The source compatibility baseline for V1.02 is pinned to
+`lse14/e621-standard-capotion-workflow@ccc9d07497be637fc097c5da009d791f017144c9`.
+The port manifest and SHA-256 checks are in
+`backend/tests/fixtures/workflow_upstream_manifest.json`; an optional source
+checkout is accepted only when its HEAD matches this commit.
+
 ## 1. Summary
 
 | Area | State |
 | --- | --- |
 | Nine-field standard JSON + flat TXT | Ported verbatim, tested |
-| Replacement engine (keep/replace/drop) | Ported verbatim, tested |
+| Replacement engine (keep/replace/drop + upstream random rule) | Ported from the pinned baseline, tested |
 | Designated e621 replacement index | Imported and validated end to end |
 | Dataset import (mixed annotation formats) | Implemented, tested |
 | Annotation backup / restore / atomic commit | Implemented, tested |
@@ -24,7 +30,7 @@ the corresponding stage.
 | Caption (adapter onto the host inference engine) | Implemented, tested |
 | Classify (official snapshot -> nine fields) | Implemented, tested, e621 snapshot provisioned |
 | OCR (isolated PaddleOCR runtime, sidecar output) | Implemented, CPU runtime provisioned and probed |
-| NL / Count Review / Policy / Token Budget | Implemented, tested |
+| NL / Count Review / Policy / Token Budget | Implemented, tested; NL image contract follows the pinned baseline |
 | Pause / resume / repair / lease recovery | Implemented, tested |
 | Bilingual page incl. OCR controls and per-stage report | Implemented, tested |
 
@@ -43,7 +49,7 @@ adjustments, so their rules are identical rather than re-derived:
 - `backend/tagger2/workflow/caption_format/flat_txt.py`
   (from `shared/anima_caption_format/.../flat_txt.py`)
 - `backend/tagger2/workflow/stages/replacement.py`
-  (from `workers/replace/.../replacement.py`)
+  (from `workers/replace/.../replacement.py`; exact body match at the pinned commit)
 - `backend/tagger2/workflow/raw_e621.py`
   (from `core/src/anima_core/raw_e621.py`)
 
@@ -58,6 +64,19 @@ Consequences that are therefore guaranteed, not approximated:
   parenthesis escaping, and terminates with a period.
 - Raw e621 grouped JSON must contain exactly the nine e621 groups; `series` is
   left empty for raw e621 input, matching source behaviour.
+
+The replacement port now includes the pinned upstream rule that changes a
+candidate containing `anthro` to `furry` with a 50% random decision. The
+decision is injectable in tests, but production uses the upstream default
+random source. This is intentional V1.02 behaviour and means repeated runs
+are not byte-identical when that rule is reached.
+
+NL validation is source-compatible except for one stricter safety rule: the
+`__NL_IMAGE_NOT_RECEIVED__` sentinel is accepted only when it is the complete
+response. A response containing the sentinel as ordinary text is rejected.
+The stage records an exact sentinel as a non-retriable `nl_image_not_received`
+issue and never writes it to the nine-field `nl` value. A configured NL
+provider also requires image input during preflight.
 
 ## 3. Designated replacement index
 
@@ -233,9 +252,14 @@ npm run lint
 npm run build
 ```
 
-Current results (2026-08-14): backend 416 passed / 1 skipped; frontend 41
-passed; changed workflow modules pass targeted mypy and Ruff checks. The
-20-image real-resource smoke completed with 20/20 samples and no issues.
+Current V1.02 verification (2026-08-16): backend `433 passed / 1 skipped`,
+frontend `69 passed`, and Playwright `49 passed / 1 skipped`; mypy, Ruff,
+ESLint, TypeScript and Vite are clean. The fixed-source port gate passes 26
+tests. A 20-image run from `E:\琥珀训练集预备` completed with 20/20 exported,
+60 committed files, 20 OCR results, 20 tokenizer checks, no issues, unchanged
+source hashes, and frozen fingerprints for classification, replacement,
+Tokenizer and CPU OCR. The API manual-path full-copy run also completed 20/20
+with 60 output files and an unchanged source.
 Ruff clean; frontend lint and `tsc -b` clean. The real local-model/resource
 smoke completed a one-image Caption + Classify + Replace + OCR + Tokenizer run
 and a separate 20-image offline/API run without blocking issues. Stress and
@@ -246,8 +270,7 @@ Note on running the backend suite: use the project runtime
 must import as `tagger2.*` at module level. A `backend.tagger2.*` import at
 module level passes under a system Python and fails under the project runtime.
 
-`backend/tests/test_workflow_ports.py` asserts that each verbatim-ported file is
-still byte-identical to its source counterpart (skipped automatically when the
-source project is not present). Two `ruff` unused-import warnings remain inside
-those ported files; they exist in the originals and are left alone so the ports
-stay byte-comparable.
+`backend/tests/test_workflow_ports.py` asserts the pinned source commit and
+file manifest. Exact ports are byte-identical after removing the provenance
+banner; token-budget imports and the NL sentinel safety rule are explicitly
+classified as adapted ports rather than being reported as exact matches.

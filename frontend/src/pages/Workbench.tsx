@@ -11,6 +11,7 @@ import { Button, DialogLayer, EmptyState, Field, IconButton, Notice, Panel, Prog
 import { useJobEvents, type StreamState } from '../hooks/useJobEvents'
 import { useOnlinePrompts } from '../hooks/useOnlinePrompts'
 import { api, ApiError } from '../lib/api'
+import { effectiveThresholds, thresholdKeys, thresholdMapsEqual, thresholdName, thresholdSummary } from '../lib/modelThresholds'
 import { usePreferences, useQueueStore } from '../store/app'
 import type { ImageResult, JobEvent, JobMode, JobState, ModelProfile } from '../types'
 
@@ -311,6 +312,16 @@ export function Workbench() {
     && (!localEnabled || localModelIds.length > 0)
     && (!onlineEnabled || Boolean(providerId))
 
+  const copyText = async (value: string, label: string) => {
+    try {
+      if (!navigator.clipboard) throw new Error('clipboard unavailable')
+      await navigator.clipboard.writeText(value)
+      setMessage({ tone: 'success', text: `已复制${label}` })
+    } catch {
+      setMessage({ tone: 'danger', text: '浏览器未授予剪贴板权限，复制失败。' })
+    }
+  }
+
   const openThresholdEditor = (model: ModelProfile) => {
     setThresholdEditor(model)
     setThresholdDraft({ ...(thresholdOverrides[model.id] ?? effectiveThresholds(model)) })
@@ -359,8 +370,8 @@ export function Workbench() {
         {activeCount > 0 && <div className="stream-stack" aria-live="polite">{activeJobs.local && <StreamLine label="本地" state={localStream.streamState} error={localStream.error} />}{activeJobs.online && <StreamLine label="在线" state={onlineStream.streamState} error={onlineStream.error} />}</div>}
       </Panel>
 
-      <Panel title="标注结果" eyebrow="03 / RESULT" className="result-panel" actions={hasResult && <IconButton label="复制全部标签" onClick={() => navigator.clipboard.writeText(visibleTags.map((tag) => tag.text).join(', '))}><Clipboard size={15} /></IconButton>}>
-        {hasResult ? <div className="result-content"><div className="result-file-line"><StatusBadge state={selected?.state === 'error' ? 'failed' : 'done'} /><span>{selected?.file.name}</span></div><div className={`result-channel-list ${localResult && onlineResult ? 'result-channel-list-dual' : ''}`}>{localResult && <LocalResultSection result={localResult} />}{onlineResult && <OnlineResultSection result={onlineResult} />}</div></div> : <EmptyState icon={<FileJson size={23} />} title="结果会显示在这里" detail="本地标签与在线 Anima 结果会独立更新" />}
+      <Panel title="标注结果" eyebrow="03 / RESULT" className="result-panel" actions={hasResult && <IconButton label="复制全部标签" onClick={() => void copyText(visibleTags.map((tag) => tag.text).join(', '), '全部标签')}><Clipboard size={15} /></IconButton>}>
+        {hasResult ? <div className="result-content"><div className="result-file-line"><StatusBadge state={selected?.state === 'error' ? 'failed' : 'done'} /><span>{selected?.file.name}</span></div><div className={`result-channel-list ${localResult && onlineResult ? 'result-channel-list-dual' : ''}`}>{localResult && <LocalResultSection result={localResult} onCopy={copyText} />}{onlineResult && <OnlineResultSection result={onlineResult} />}</div></div> : <EmptyState icon={<FileJson size={23} />} title="结果会显示在这里" detail="本地标签与在线 Anima 结果会独立更新" />}
       </Panel>
     </div>
 
@@ -394,9 +405,9 @@ export function Workbench() {
   </div>
 }
 
-function LocalResultSection({ result }: { result: ImageResult }) {
+function LocalResultSection({ result, onCopy }: { result: ImageResult; onCopy: (value: string, label: string) => Promise<void> }) {
   const groups = result.model_results?.length ? result.model_results : [{ model_id: 'local', model_name: '本地模型', tags: result.tags }]
-  return <section className="result-channel"><header className="result-channel-heading"><Cpu size={15} /><strong>本地模型</strong><small>{groups.length} 个结果</small></header><div className="model-result-list">{groups.map((group) => <section className="result-section model-result-section" key={group.model_id}><div className="model-result-heading"><div className="section-label"><Tags size={14} /><span>{group.model_name}</span><small>{group.tags.length}</small></div><IconButton label={`复制 ${group.model_name} 标签`} onClick={() => navigator.clipboard.writeText(group.tags.map((tag) => tag.text).join(', '))}><Clipboard size={14} /></IconButton></div><TagCloud tags={group.tags} /></section>)}</div>{result.warnings.length > 0 && <Notice tone="warning">{result.warnings.join('；')}</Notice>}</section>
+  return <section className="result-channel"><header className="result-channel-heading"><Cpu size={15} /><strong>本地模型</strong><small>{groups.length} 个结果</small></header><div className="model-result-list">{groups.map((group) => <section className="result-section model-result-section" key={group.model_id}><div className="model-result-heading"><div className="section-label"><Tags size={14} /><span>{group.model_name}</span><small>{group.tags.length}</small></div><IconButton label={`复制 ${group.model_name} 标签`} onClick={() => void onCopy(group.tags.map((tag) => tag.text).join(', '), `${group.model_name} 标签`)}><Clipboard size={14} /></IconButton></div><TagCloud tags={group.tags} /></section>)}</div>{result.warnings.length > 0 && <Notice tone="warning">{result.warnings.join('；')}</Notice>}</section>
 }
 
 function OnlineResultSection({ result }: { result: ImageResult }) {
@@ -424,31 +435,4 @@ function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
-}
-
-function effectiveThresholds(model: ModelProfile): Record<string, number> {
-  return { default: model.threshold ?? 0.35, ...(model.thresholds ?? {}) }
-}
-
-function thresholdKeys(values: Record<string, number>) {
-  const order = ['default', 'general', 'character', 'species', 'rating', 'other']
-  return Object.keys(values).sort((left, right) => {
-    const leftIndex = order.indexOf(left)
-    const rightIndex = order.indexOf(right)
-    return (leftIndex < 0 ? 99 : leftIndex) - (rightIndex < 0 ? 99 : rightIndex) || left.localeCompare(right)
-  })
-}
-
-function thresholdName(key: string) {
-  return { default: '默认', general: '通用', character: '角色', species: '物种', rating: '分级', other: '其他' }[key] ?? key
-}
-
-function thresholdMapsEqual(left: Record<string, number>, right: Record<string, number>) {
-  const keys = new Set([...Object.keys(left), ...Object.keys(right)])
-  return [...keys].every((key) => left[key] === right[key])
-}
-
-function thresholdSummary(model: ModelProfile, override?: Record<string, number>) {
-  if (override) return `本次自定义 · ${Object.keys(override).length} 类`
-  return `${model.threshold_source === 'custom' ? '模型自定义' : '模型预设'} · 通用 ${(model.thresholds?.general ?? model.threshold ?? 0.35).toFixed(2)}`
 }

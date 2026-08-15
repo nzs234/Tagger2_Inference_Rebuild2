@@ -132,6 +132,62 @@ def test_nl_stage_generates_and_captures_observation():
         assert result.observation["countValue"] == "duo"
 
 
+def test_nl_image_not_received_is_a_non_retriable_issue():
+    from backend.tagger2.workflow.stages.nl import run_nl_stage
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+        Image.new("RGB", (8, 8)).save(root / "a.png")
+        report = run_nl_stage(
+            [Sample("a.png")],
+            {"a.png": {"tags": []}},
+            source_root=root,
+            client=FakeClient(default=_completion("__NL_IMAGE_NOT_RECEIVED__")),
+        )
+
+        result = report.by_path()["a.png"]
+        assert report.failed == 1
+        assert report.generated == 0
+        assert result.error == "nl_image_not_received"
+        assert result.nl == ""
+
+
+def test_nl_sentinel_must_not_be_embedded_in_normal_text():
+    from backend.tagger2.workflow.stages.nl import run_nl_stage
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+        Image.new("RGB", (8, 8)).save(root / "a.png")
+        report = run_nl_stage(
+            [Sample("a.png")],
+            {"a.png": {"tags": []}},
+            source_root=root,
+            client=FakeClient(default=_completion("caption __NL_IMAGE_NOT_RECEIVED__ here")),
+        )
+
+        assert report.failed == 1
+        assert report.by_path()["a.png"].nl == ""
+
+
+def test_nl_does_not_call_provider_for_missing_or_escaping_images():
+    from backend.tagger2.workflow.stages.nl import run_nl_stage
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+        client = FakeClient()
+        report = run_nl_stage(
+            [Sample("missing.png"), Sample("../outside.png")],
+            {"missing.png": {"tags": []}, "../outside.png": {"tags": []}},
+            source_root=root,
+            client=client,
+        )
+
+        assert report.failed == 2
+        assert client.requests == []
+        assert report.by_path()["missing.png"].error == "nl_image_missing"
+        assert report.by_path()["../outside.png"].error == "nl_image_path_escape"
+
+
 def test_nl_stage_rejects_model_refusal():
     """A refusal is a failure, never written as a caption."""
     from backend.tagger2.workflow.stages.nl import run_nl_stage

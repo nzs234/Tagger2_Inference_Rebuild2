@@ -1,0 +1,53 @@
+{
+  "commit": "ccc9d07497be637fc097c5da009d791f017144c9",
+  "files": {
+    "backend/tagger2/workflow/caption_format/normalizer.py": {
+      "source": "shared/anima_caption_format/anima_caption_format/normalizer.py",
+      "source_sha256": "e46d3faece24aee9a45c044fec98b27e27269ab6a8018ac157f24d7c123118a4",
+      "local_body_sha256": "e46d3faece24aee9a45c044fec98b27e27269ab6a8018ac157f24d7c123118a4",
+      "mode": "exact"
+    },
+    "backend/tagger2/workflow/caption_format/flat_txt.py": {
+      "source": "shared/anima_caption_format/anima_caption_format/flat_txt.py",
+      "source_sha256": "919fc406ce82acb8756d0b83e22bb73da89fff63b6ea1131d8103543f1f03878",
+      "local_body_sha256": "919fc406ce82acb8756d0b83e22bb73da89fff63b6ea1131d8103543f1f03878",
+      "mode": "exact"
+    },
+    "backend/tagger2/workflow/stages/replacement.py": {
+      "source": "workers/replace/src/anima_replace_worker/replacement.py",
+      "source_sha256": "d7533bbc4cbfdcd46a8a39df80cdbb145541b90fef679ea4e2e5c78afd647b80",
+      "local_body_sha256": "d7533bbc4cbfdcd46a8a39df80cdbb145541b90fef679ea4e2e5c78afd647b80",
+      "mode": "exact"
+    },
+    "backend/tagger2/workflow/raw_e621.py": {
+      "source": "core/src/anima_core/raw_e621.py",
+      "source_sha256": "53df0727dc0ce3a024f564750e1a83cd55a5d31fee188fd6ccadc2bc973969e0",
+      "local_body_sha256": "53df0727dc0ce3a024f564750e1a83cd55a5d31fee188fd6ccadc2bc973969e0",
+      "mode": "exact"
+    },
+    "backend/tagger2/workflow/stages/nl_validation.py": {
+      "source": "workers/nl/src/anima_nl_worker/validation.py",
+      "source_sha256": "b4a5cf7c869d1357aa202af6b9d884739788c29eb5929374bf1c97ce9fcdb24e",
+      "local_body_sha256": "831ff81562af77b1394286943d914601ecc34a3ee50caf959b25689cd5b03a41",
+      "mode": "policy-adapted"
+    },
+    "backend/tagger2/workflow/stages/count_rules.py": {
+      "source": "workers/classify/src/anima_classify_worker/count.py",
+      "source_sha256": "e49d2daa6beb94f8364bdb011a5a721f0ee7f004862663d957ea30c43eef25b6",
+      "local_body_sha256": "e49d2daa6beb94f8364bdb011a5a721f0ee7f004862663d957ea30c43eef25b6",
+      "mode": "exact"
+    },
+    "backend/tagger2/workflow/stages/policy.py": {
+      "source": "workers/policy/src/anima_policy_worker/policy.py",
+      "source_sha256": "217a23bba44d386995f6ee3a968aa6c31902507afab31c542ef396d53eedee64",
+      "local_body_sha256": "217a23bba44d386995f6ee3a968aa6c31902507afab31c542ef396d53eedee64",
+      "mode": "exact"
+    },
+    "backend/tagger2/workflow/stages/token_budget.py": {
+      "source": "workers/token_budget/src/anima_token_budget_worker/budget.py",
+      "source_sha256": "4171ea499a84084b62330a6d1f011528b5d38eb9712c191cc9a56a101157d99d",
+      "local_body_sha256": "2c4976298d3a5bd39ac657504db8503e736a2c31964a22ed6f810b68b3fe2ad6",
+      "mode": "import-adapted"
+    }
+  }
+}

@@ -83,6 +83,15 @@ def main() -> int:
         print("one or more provisioned resources are unavailable")
         return 3
     assert all(path is not None for path in paths.values())
+    resource_fingerprints = {}
+    resource_manifests = {}
+    for resource_id in resource_ids.values():
+        manifest = catalog.get_manifest(resource_id)
+        if manifest is None:
+            print(f"resource manifest is unavailable: {resource_id}")
+            return 3
+        resource_fingerprints[resource_id] = manifest.resource_fingerprint
+        resource_manifests[resource_id] = dict(manifest.__dict__)
     replacement_report = validate_replacement_index(paths["replace"])
     if not replacement_report.valid:
         print(json.dumps(replacement_report.as_dict(), ensure_ascii=False))
@@ -123,6 +132,8 @@ def main() -> int:
         output_root=output_root,
         workspace=workspace,
         replacement_index_path=paths["replace"],
+        resource_fingerprints=resource_fingerprints,
+        resource_manifests=resource_manifests,
         classification_rules=load_classification_rules(paths["classify"]),
         token_counter=load_tokenizer_counter(paths["tokenizer"]),
         ocr_engine=PaddleOCREngine(),

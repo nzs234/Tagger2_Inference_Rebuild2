@@ -95,8 +95,10 @@ test('video prompt desk generates, restores, and clears in-memory revisions', as
   await page.getByRole('button', { name: '恢复第 1 版' }).click()
   await expect(page.getByRole('article').getByText('第 1 版 · 当前基线')).toBeVisible()
 
-  page.once('dialog', (dialog) => dialog.accept())
   await page.getByRole('button', { name: '清空任务' }).click()
+  const clearDialog = page.getByRole('alertdialog', { name: '清空当前任务？' })
+  await expect(clearDialog).toBeVisible()
+  await clearDialog.getByRole('button', { name: '确认清空' }).click()
   await expect(page.getByText('上传 1 到 9 张参考图片')).toBeVisible()
   await page.getByRole('group', { name: '视频提示词模型' }).getByRole('button', { name: 'FL2VA', exact: true }).click()
   await expect(page.getByText('H3 T2VA PROMPT DESK', { exact: true })).toBeVisible()
@@ -427,8 +429,10 @@ test('provider types can be created, reconfigured, and deleted', async ({ page }
   await expect(editor.getByRole('textbox', { name: 'Base URL' })).toHaveValue('https://api.openai.com/v1')
   await editor.getByRole('button', { name: '保存修改' }).click()
 
-  page.once('dialog', (dialog) => dialog.accept())
   await row.getByRole('button', { name: '删除 Provider' }).click()
+  const deleteDialog = page.getByRole('alertdialog', { name: '删除 Custom Claude Gateway？' })
+  await expect(deleteDialog).toBeVisible()
+  await deleteDialog.getByRole('button', { name: '删除 Provider' }).click()
   await expect(page.getByText('Custom Claude Gateway', { exact: true })).toHaveCount(0)
   await expectNoHorizontalOverflow(page)
 })

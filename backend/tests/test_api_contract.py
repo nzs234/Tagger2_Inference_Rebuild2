@@ -63,6 +63,26 @@ def test_api_errors_use_one_structured_envelope(tmp_path: Path) -> None:
         assert client.get("/openapi.json").status_code == 404
 
 
+def test_failed_upload_batch_removes_partial_files(tmp_path: Path) -> None:
+    stream = io.BytesIO()
+    Image.new("RGB", (8, 8), "white").save(stream, format="PNG")
+
+    with _client(tmp_path) as client:
+        response = client.post(
+            "/api/v1/uploads",
+            files=[
+                ("files", ("valid.png", stream.getvalue(), "image/png")),
+                ("files", ("broken.png", b"not-an-image", "image/png")),
+            ],
+        )
+
+        assert response.status_code == 400
+        assert client.app.state.runtime.upload_index == {}
+        upload_root = tmp_path / "data" / "uploads"
+        assert not [path for path in upload_root.rglob("*") if path.is_file()]
+        assert not [path for path in upload_root.iterdir() if path.is_dir()]
+
+
 def test_scanned_job_defaults_to_source_folder(tmp_path: Path) -> None:
     images = tmp_path / "images"
     images.mkdir()

@@ -1,10 +1,9 @@
 # Tagger2 发布包说明
 
-这个压缩包用于分享和部署 Tagger2 Inference。当前 GitHub V1.01 Release 提供的是
-精简包：不内置 Python 运行时，解压后运行 `setup.bat`，脚本会下载 Python 3.12 并安装
-锁定依赖；之后运行 `start.bat`，浏览器打开 `http://127.0.0.1:20000`。也可以在启动前
-设置 `TAGGER2_TORCH_VARIANT=cpu` 强制使用 CPU。包含 `runtime/` 目录的本地完整包则可以
-直接跳过 Python 下载步骤。
+这个压缩包用于分享和部署 Tagger2 Inference。V1.02 基础 Python 包内置便携式 Python
+3.12，但不包含第三方 site-packages；解压后运行 `setup.bat`，脚本会在该 runtime 中安装
+锁定依赖，之后运行 `start.bat`，浏览器打开 `http://127.0.0.1:20000`。也可以在启动前
+设置 `TAGGER2_TORCH_VARIANT=cpu` 强制使用 CPU。
 
 ## 已包含
 
@@ -26,9 +25,14 @@
 
 - `models/` 和 `data_cache/`：模型文件体积较大，需要在本机单独准备。模型配置仍使用
   Tagger2 的本地模型页面导入/选择，任务会冻结明确的 `caption.model_id`。
-- 精简包不包含 `runtime/`；首次运行 `setup.bat` 会自动准备便携 Python 和依赖。
+- 基础 Python 包包含 `runtime/python.exe`，但不包含第三方依赖；首次运行 `setup.bat`
+  会在包内 runtime 安装锁定依赖。
 - `runtime_ocr/`、PaddleOCR 模型缓存和 OCR 资源描述：这些文件体积较大，且描述中可能含
   原机器的绝对路径。需要 OCR 时，请按项目文档单独安装隔离 OCR 运行时并注册本机资源。
+
+V1.02 同步上游固定基线 `ccc9d07497be637fc097c5da009d791f017144c9`。Replacement
+保留上游的随机 `anthro` → `furry` 规则；同一输入重复运行可能产生不同结果，需固定
+输出时请关闭该阶段或使用单独的确定性规则资源。
 
 ## 第一次使用
 
@@ -38,3 +42,7 @@
 4. 默认 e621 任务使用 `replace-e621-pass-drop-v2`；旧作业或明确选择旧资源的任务不会被改写。
 
 发布包不包含用户数据、数据库、日志、访问令牌或密钥。
+
+V1.02 发布验收：后端 `433 passed / 1 skipped`、前端 `69 passed`、Playwright
+`49 passed / 1 skipped`；从 `E:\琥珀训练集预备` 随机抽取 20 组图片完成 full-copy，
+源数据未修改，输出 60 个文件，分类/替换/Tokenizer/OCR 资源指纹均已冻结。

@@ -2,10 +2,13 @@ import { Clapperboard, Copy, Eye, FileText, Image as ImageIcon, LoaderCircle, Ro
 import { useQuery } from '@tanstack/react-query'
 import { useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from 'react'
 import { FileDropzone } from '../components/FileDropzone'
-import { Button, EmptyState, Field, IconButton, Notice, Panel } from '../components/ui'
+import { Button, ConfirmDialog, EmptyState, Field, IconButton, Notice, Panel } from '../components/ui'
 import { api, ApiError } from '../lib/api'
 import { usePreferences, useVideoPromptStore } from '../store/app'
 import type { BilingualText, Fl2vaPromptPackage, Fl2vaSingleImageRole, H3BasePromptMode, Ref2vaPromptPackage, VideoPromptLanguage, VideoPromptMode, VideoPromptRevision } from '../types'
+
+type VideoNotice = { tone: 'success' | 'warning' | 'danger' | 'info'; text: string }
+type PendingConfirmation = { title: string; detail: string; confirmLabel: string; action: () => void }
 
 export function VideoPrompts() {
   const setPage = usePreferences((state) => state.setPage)
@@ -37,7 +40,8 @@ export function VideoPrompts() {
   const clearRevisions = useVideoPromptStore((state) => state.clearRevisions)
   const clearTask = useVideoPromptStore((state) => state.clearTask)
   const clearError = useVideoPromptStore((state) => state.clearError)
-  const [notice, setNotice] = useState<string>()
+  const [notice, setNotice] = useState<VideoNotice>()
+  const [confirmation, setConfirmation] = useState<PendingConfirmation>()
   const controllerRef = useRef<AbortController | undefined>(undefined)
 
   const providers = useQuery({ queryKey: ['providers'], queryFn: api.providers, staleTime: 60_000 })
@@ -66,55 +70,108 @@ export function VideoPrompts() {
     setProvider(providerItems[0].id, providerItems[0].primary_model)
   }, [providerId, providerItems, setProvider])
 
+  const requestConfirmation = (confirmation: PendingConfirmation) => setConfirmation(confirmation)
+
   const selectImages = (files: File[]) => {
     const additions = files.slice(0, availableImageSlots)
     if (!additions.length) {
-      setNotice(`当前预设最多使用 ${imageLimit} 张参考图片。`)
+      setNotice({ tone: 'warning', text: `当前预设最多使用 ${imageLimit} 张参考图片。` })
       return
     }
-    if (revisions.length && !window.confirm('调整参考图片会清空当前提示词历史，是否继续？')) return
-    controllerRef.current?.abort()
-    addImages(additions)
-    setNotice(files.length > additions.length ? `仅添加了前 ${additions.length} 张，当前预设最多使用 ${imageLimit} 张。` : undefined)
+    const apply = () => {
+      controllerRef.current?.abort()
+      addImages(additions)
+      setNotice(files.length > additions.length
+        ? { tone: 'warning', text: `仅添加了前 ${additions.length} 张，当前预设最多使用 ${imageLimit} 张。` }
+        : undefined)
+    }
+    if (revisions.length) {
+      requestConfirmation({
+        title: '调整参考图片？',
+        detail: '添加新的参考图片会清空当前提示词历史，已有版本将无法恢复。',
+        confirmLabel: '添加并清空历史',
+        action: apply,
+      })
+      return
+    }
+    apply()
   }
 
   const removeReferenceImage = (index: number) => {
-    if (revisions.length && !window.confirm('删除参考图片会清空当前提示词历史，是否继续？')) return
-    controllerRef.current?.abort()
-    removeImage(index)
-    setNotice(undefined)
+    const apply = () => {
+      controllerRef.current?.abort()
+      removeImage(index)
+      setNotice(undefined)
+    }
+    if (revisions.length) {
+      requestConfirmation({
+        title: '删除参考图片？',
+        detail: '删除参考图片会同时清空当前提示词历史，已有版本将无法恢复。',
+        confirmLabel: '删除并清空历史',
+        action: apply,
+      })
+      return
+    }
+    apply()
   }
 
   const clear = () => {
     if (!images.length && !revisions.length) return
-    if (!window.confirm('清空后将失去当前图片、对话和版本历史，是否继续？')) return
-    controllerRef.current?.abort()
-    controllerRef.current = undefined
-    clearTask()
-    setNotice(undefined)
+    requestConfirmation({
+      title: '清空当前任务？',
+      detail: '当前图片、需求对话和全部版本历史都会被永久清空。',
+      confirmLabel: '确认清空',
+      action: () => {
+        controllerRef.current?.abort()
+        controllerRef.current = undefined
+        clearTask()
+        setNotice(undefined)
+      },
+    })
   }
 
   const changePromptMode = (nextMode: VideoPromptMode) => {
     if (nextMode === promptMode) return
     const needsTrim = nextMode === 'fl2va' && images.length > 2
-    const message = needsTrim
-      ? 'FL2VA 最多支持 2 张图片。切换后会保留前两张、移除其余参考图并清空版本历史，是否继续？'
-      : '切换提示词预设会清空当前版本历史，但会保留参考图、Provider 和语言选择，是否继续？'
-    if ((revisions.length || needsTrim) && !window.confirm(message)) return
-    controllerRef.current?.abort()
-    if (revisions.length) clearRevisions()
-    if (needsTrim) limitImages(2)
-    setPromptMode(nextMode)
-    setNotice(undefined)
+    const apply = () => {
+      controllerRef.current?.abort()
+      if (revisions.length) clearRevisions()
+      if (needsTrim) limitImages(2)
+      setPromptMode(nextMode)
+      setNotice(undefined)
+    }
+    if (revisions.length || needsTrim) {
+      requestConfirmation({
+        title: '切换提示词预设？',
+        detail: needsTrim
+          ? 'FL2VA 最多支持 2 张图片。切换后只保留前两张参考图，并清空版本历史。'
+          : '切换预设会保留参考图、Provider 和语言选择，但会清空版本历史。',
+        confirmLabel: '确认切换',
+        action: apply,
+      })
+      return
+    }
+    apply()
   }
 
   const changeSingleImageRole = (role: Fl2vaSingleImageRole) => {
     if (role === fl2vaSingleImageRole) return
-    if (revisions.length && !window.confirm('切换单图的首帧或末帧角色会清空当前版本历史，是否继续？')) return
-    controllerRef.current?.abort()
-    if (revisions.length) clearRevisions()
-    setFl2vaSingleImageRole(role)
-    setNotice(undefined)
+    const apply = () => {
+      controllerRef.current?.abort()
+      if (revisions.length) clearRevisions()
+      setFl2vaSingleImageRole(role)
+      setNotice(undefined)
+    }
+    if (revisions.length) {
+      requestConfirmation({
+        title: '切换关键帧角色？',
+        detail: '切换单图的首帧或末帧角色会清空当前版本历史。',
+        confirmLabel: '确认切换',
+        action: apply,
+      })
+      return
+    }
+    apply()
   }
 
   const submit = async (event: FormEvent<HTMLFormElement>) => {
@@ -135,7 +192,7 @@ export function VideoPrompts() {
         currentPackage: currentRevision?.package,
       }, controller.signal)
       completeGeneration(requestToken, promptMode, requestInstruction, packageResult)
-      setNotice(currentRevision ? '已基于当前版本生成新版本。' : '已生成第一版视频提示词。')
+      setNotice({ tone: 'success', text: currentRevision ? '已基于当前版本生成新版本。' : '已生成第一版视频提示词。' })
     } catch (reason) {
       if (reason instanceof DOMException && reason.name === 'AbortError') return
       const message = reason instanceof ApiError
@@ -152,9 +209,9 @@ export function VideoPrompts() {
   const copy = async (value: string, label: string) => {
     try {
       await navigator.clipboard.writeText(value)
-      setNotice(`已复制${label}。`)
+      setNotice({ tone: 'success', text: `已复制${label}。` })
     } catch {
-      setNotice('浏览器未授予剪贴板权限。')
+      setNotice({ tone: 'danger', text: '浏览器未授予剪贴板权限。' })
     }
   }
 
@@ -166,7 +223,7 @@ export function VideoPrompts() {
       <Button variant="danger" icon={<Trash2 size={16} />} aria-label="清空任务" title="清空任务" onClick={clear} disabled={!images.length && !revisions.length}>清空任务</Button>
     </div>
 
-    {notice && <Notice tone="success">{notice}<IconButton label="关闭提示" onClick={() => setNotice(undefined)}><X size={15} /></IconButton></Notice>}
+    {notice && <Notice tone={notice.tone}>{notice.text}<IconButton label="关闭提示" onClick={() => setNotice(undefined)}><X size={15} /></IconButton></Notice>}
     {error && <Notice tone="danger">{error}<IconButton label="关闭错误提示" onClick={clearError}><X size={15} /></IconButton></Notice>}
 
     <div className="video-prompts-grid">
@@ -199,7 +256,7 @@ export function VideoPrompts() {
             current={revision.id === currentRevisionId}
             viewed={revision.id === viewedRevision?.id}
             onView={() => viewRevision(revision.id)}
-            onRestore={() => { restoreRevision(revision.id); setNotice(`已恢复第 ${revision.version} 版，下一轮将以它为基线。`) }}
+            onRestore={() => { restoreRevision(revision.id); setNotice({ tone: 'info', text: `已恢复第 ${revision.version} 版，下一轮将以它为基线。` }) }}
           />) : <EmptyState icon={<Clapperboard size={23} />} title="描述你希望画面如何动起来" detail="首轮会创建完整提示词，后续要求会生成新的版本。" />}
           {isGenerating && <div className="video-generating"><LoaderCircle className="spin" size={16} /><span>在线模型正在生成完整提示词套件…</span></div>}
         </div>
@@ -218,6 +275,17 @@ export function VideoPrompts() {
         /> : <EmptyState icon={<FileText size={23} />} title={promptMode === 'fl2va' ? `H3 ${baseMode.toUpperCase()} 提示词会显示在这里` : 'H3 Ref2VA 提示词会显示在这里'} detail={promptMode === 'fl2va' ? '生成后可复制官方基础指南的对齐说明和三段核心字段。' : '生成后可按中文、英文或中英对照查看并复制六段式结构。'} />}
       </Panel>
     </div>
+    {confirmation && <ConfirmDialog
+      title={confirmation.title}
+      detail={confirmation.detail}
+      confirmLabel={confirmation.confirmLabel}
+      onClose={() => setConfirmation(undefined)}
+      onConfirm={() => {
+        const action = confirmation.action
+        setConfirmation(undefined)
+        action()
+      }}
+    />}
   </div>
 }
 

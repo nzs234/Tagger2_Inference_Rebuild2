@@ -48,11 +48,16 @@ export function Settings() {
     setNotice({ tone: 'success', text: '本次会话已启用访问令牌' })
   }
   const roots = rootsQuery.data?.items ?? []
+  const settingsReady = settingsQuery.isSuccess && rootsQuery.isSuccess
 
   return <div className="page page-settings">
     <div className="page-heading"><div><p className="eyebrow">RUNTIME CONTROL</p><h1>设置</h1><p className="page-subtitle">路径、网络边界和默认任务参数。</p></div><span className="settings-lock"><LockKeyhole size={15} />仅本机配置</span></div>
     {notice && <Notice tone={notice.tone}>{notice.text}<IconButton label="关闭" onClick={() => setNotice(null)}><X size={14} /></IconButton></Notice>}
-    <form onSubmit={form.handleSubmit((values) => saveMutation.mutate(values))}>
+    {settingsQuery.isError && <Notice tone="danger">无法读取运行设置。为避免覆盖现有配置，保存操作已停用。<Button type="button" size="sm" variant="secondary" onClick={() => settingsQuery.refetch()}>重试设置</Button></Notice>}
+    {rootsQuery.isError && <Notice tone="danger">无法读取允许目录。为避免清空路径选择，保存操作已停用。<Button type="button" size="sm" variant="secondary" onClick={() => rootsQuery.refetch()}>重试目录</Button></Notice>}
+    {!settingsReady && !settingsQuery.isError && !rootsQuery.isError && <Notice tone="info"><LoaderCircle className="spin" size={15} />正在读取本机配置…</Notice>}
+    <form aria-busy={!settingsReady} onSubmit={form.handleSubmit((values) => saveMutation.mutate(values))}>
+      <fieldset className="settings-form-fieldset" disabled={!settingsReady}>
       <Panel title="默认任务" eyebrow="01 / DEFAULTS">
         <div className="form-grid four-columns">
           <Field label="默认模式"><select {...form.register('default_mode')}><option value="online">在线模型</option><option value="local">本地模型</option></select></Field>
@@ -73,7 +78,8 @@ export function Settings() {
         </div>
         <div className="session-token"><Field label="本次会话访问令牌" hint="只保存在当前浏览器会话，不会写入配置文件"><input type="password" value={token} onChange={(event) => setToken(event.target.value)} autoComplete="off" placeholder="输入令牌后点击启用" /></Field><Button type="button" variant="secondary" icon={<KeyRound size={15} />} disabled={!token.trim()} onClick={storeToken}>启用令牌</Button></div>
       </Panel>
-      <div className="settings-actions"><span><Network size={15} />保存后新任务使用默认配置</span><Button type="submit" icon={saveMutation.isPending ? <LoaderCircle size={16} className="spin" /> : <Save size={16} />} disabled={saveMutation.isPending}>保存设置</Button></div>
+      <div className="settings-actions"><span><Network size={15} />保存后新任务使用默认配置</span><Button type="submit" icon={saveMutation.isPending ? <LoaderCircle size={16} className="spin" /> : <Save size={16} />} disabled={!settingsReady || saveMutation.isPending}>保存设置</Button></div>
+      </fieldset>
     </form>
   </div>
 }

@@ -400,6 +400,7 @@ const dialogFocusableSelector = [
   'textarea:not([disabled])',
   '[tabindex]:not([tabindex="-1"])',
 ].join(',')
+const dialogRoleSelector = '[role="dialog"], [role="alertdialog"]'
 
 export function DialogLayer({ children, onClose, className = 'drawer-backdrop', closeOnBackdrop = true }: DialogLayerProps) {
   const backdropRef = useRef<HTMLDivElement>(null)
@@ -416,7 +417,7 @@ export function DialogLayer({ children, onClose, className = 'drawer-backdrop', 
 
     const focusDialog = window.setTimeout(() => {
       const backdrop = backdropRef.current
-      const dialog = backdrop?.querySelector<HTMLElement>('[role="dialog"]')
+      const dialog = backdrop?.querySelector<HTMLElement>(dialogRoleSelector)
       const preferred = dialog?.querySelector<HTMLElement>('[data-autofocus]')
         ?? dialog?.querySelector<HTMLElement>('input:not([disabled]), select:not([disabled]), textarea:not([disabled])')
         ?? dialog?.querySelector<HTMLElement>(dialogFocusableSelector)
@@ -429,7 +430,7 @@ export function DialogLayer({ children, onClose, className = 'drawer-backdrop', 
 
     const onKeyDown = (event: KeyboardEvent) => {
       const backdrop = backdropRef.current
-      const dialog = backdrop?.querySelector<HTMLElement>('[role="dialog"]')
+      const dialog = backdrop?.querySelector<HTMLElement>(dialogRoleSelector)
       if (!dialog) return
       if (event.key === 'Escape') {
         event.preventDefault()
@@ -486,8 +487,40 @@ export function DialogLayer({ children, onClose, className = 'drawer-backdrop', 
   )
 }
 
-export function ConfirmButton({ label, onConfirm, children, ...props }: ButtonHTMLAttributes<HTMLButtonElement> & { label: string; onConfirm: () => void }) {
-  return <Button {...props} onClick={() => { if (window.confirm(label)) onConfirm() }}>{children}</Button>
+export function ConfirmDialog({
+  title,
+  detail,
+  confirmLabel = '确认',
+  cancelLabel = '取消',
+  tone = 'danger',
+  busy = false,
+  onConfirm,
+  onClose,
+}: {
+  title: string
+  detail: ReactNode
+  confirmLabel?: string
+  cancelLabel?: string
+  tone?: 'primary' | 'danger'
+  busy?: boolean
+  onConfirm: () => void
+  onClose: () => void
+}) {
+  const titleId = useId()
+  const detailId = useId()
+  return <DialogLayer onClose={() => { if (!busy) onClose() }} closeOnBackdrop={!busy}>
+    <div className="confirm-dialog" role="alertdialog" aria-modal="true" aria-labelledby={titleId} aria-describedby={detailId}>
+      <header>
+        <span className="confirm-dialog-icon"><AlertTriangle size={20} aria-hidden="true" /></span>
+        <div><p className="eyebrow">CONFIRM ACTION</p><h2 id={titleId}>{title}</h2></div>
+      </header>
+      <div className="confirm-dialog-body" id={detailId}>{detail}</div>
+      <footer>
+        <Button type="button" variant="secondary" data-autofocus disabled={busy} onClick={onClose}>{cancelLabel}</Button>
+        <Button type="button" variant={tone} disabled={busy} icon={busy ? <LoaderCircle className="spin" size={15} /> : undefined} onClick={onConfirm}>{confirmLabel}</Button>
+      </footer>
+    </div>
+  </DialogLayer>
 }
 
 export function CloseIcon() { return <X size={16} aria-hidden="true" /> }

@@ -86,6 +86,65 @@ def test_manual_path_preview_and_binding(workflow_client):
     assert again.json()["output"]["root_id"] == body["output"]["root_id"]
 
 
+def test_manual_in_place_binding_registers_a_writable_source(workflow_client):
+    client, root, _input_root = workflow_client
+    source = root / "input" / "in-place-dataset"
+    source.mkdir()
+
+    bound = client.post(
+        "/api/v1/workflows/path-bindings",
+        json={
+            "source_path": str(source),
+            "work_mode": "in_place",
+        },
+    )
+
+    assert bound.status_code == 200, bound.text
+    source_ref = bound.json()["source"]
+    registered = client.app.state.runtime.allowlist.get(source_ref["root_id"])
+    assert registered.kind == "input"
+    assert registered.writable is True
+    assert source_ref["relative_path"] == ""
+
+    repeated = client.post(
+        "/api/v1/roots",
+        json={"path": str(source), "name": "普通输入", "kind": "input"},
+    )
+    assert repeated.status_code == 200, repeated.text
+    assert repeated.json()["writable"] is True
+    assert repeated.json()["id"] == source_ref["root_id"]
+
+
+def test_manual_in_place_binding_persists_writable_source_without_upgrading_input_parent(workflow_client):
+    client, root, _input_root = workflow_client
+    from backend.tagger2.config import AppConfig
+    from backend.tagger2.main import create_app
+
+    ordinary = client.post(
+        "/api/v1/roots",
+        json={"path": str(root / "input"), "name": "普通输入", "kind": "input"},
+    )
+    assert ordinary.status_code == 200, ordinary.text
+    assert ordinary.json()["writable"] is False
+
+    source = root / "input" / "persistent-in-place"
+    source.mkdir()
+    bound = client.post(
+        "/api/v1/workflows/path-bindings",
+        json={"source_path": str(source), "work_mode": "in_place"},
+    )
+    assert bound.status_code == 200, bound.text
+    source_ref = bound.json()["source"]
+
+    with TestClient(create_app(AppConfig.from_env())) as restarted:
+        persisted_source = restarted.app.state.runtime.allowlist.get(source_ref["root_id"])
+        assert persisted_source.kind == "input"
+        assert persisted_source.writable is True
+        persisted_parent = restarted.app.state.runtime.allowlist.get(ordinary.json()["id"])
+        assert persisted_parent.kind == "input"
+        assert persisted_parent.writable is False
+
+
 def test_manual_path_binding_rejects_overlap(workflow_client):
     client, root, _input_root = workflow_client
     source = root / "input"

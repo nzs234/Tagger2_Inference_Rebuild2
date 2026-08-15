@@ -160,6 +160,24 @@ def test_danbooru_profile_alone_is_only_a_warning(tmp_path: Path):
     assert any("not bundled" in warning for warning in report["warnings"])
 
 
+def test_nl_provider_without_image_input_is_blocking(tmp_path: Path):
+    """API NL jobs must provide image context when a provider is selected."""
+    from tagger2.workflow.preflight import WorkflowPreflightError
+
+    service, _catalog = _service(tmp_path)
+    config = _config(
+        nl={
+            "enabled": True,
+            "provider_id": "provider-a",
+            "use_image": False,
+        }
+    )
+
+    with pytest.raises(WorkflowPreflightError) as excinfo:
+        service.validate_config(config)
+    assert any("requires image input" in error for error in excinfo.value.details["errors"])
+
+
 def test_unreadable_snapshot_is_blocking(tmp_path: Path):
     """A registered file that is not valid JSON must not be treated as usable."""
     from tagger2.workflow.preflight import WorkflowPreflightError

@@ -8,6 +8,7 @@ import { Button, DialogLayer, EmptyState, Field, IconButton, Notice, Panel, Prog
 import { useJobEvents } from '../hooks/useJobEvents'
 import { useOnlinePrompts } from '../hooks/useOnlinePrompts'
 import { api, ApiError } from '../lib/api'
+import { effectiveThresholds, thresholdKeys, thresholdMapsEqual, thresholdName, thresholdSummary } from '../lib/modelThresholds'
 import type { JobMode, JobSummary, ModelProfile, ScanItem } from '../types'
 
 type BatchMode = JobMode | 'hybrid'
@@ -225,7 +226,7 @@ export function BatchJobs() {
           {activeJob ? <div className="active-job">
             <div className="active-job-heading"><div><span className="mono">{activeJob.id.slice(0, 12)}</span><small>{formatDate(activeJob.created_at)}</small></div><StatusBadge state={activeJob.state} /></div>
             <ProgressBar value={progress} label={`任务进度 ${Math.round(progress)}%`} />
-            <div className="metrics-grid"><Metric icon={<CheckCircle2 />} label="成功" value={activeJob.succeeded} /><Metric icon={<AlertTriangle />} label="跳过" value={activeJob.skipped} /><Metric icon={<XCircle />} label="失败" value={activeJob.failed} /><Metric icon={<Timer />} label="速度" value={activeJob.rate ? `${activeJob.rate.toFixed(1)}/s` : '—'} /></div>
+            <div className="metrics-grid"><Metric tone="success" icon={<CheckCircle2 />} label="成功" value={activeJob.succeeded} /><Metric tone="warning" icon={<AlertTriangle />} label="跳过" value={activeJob.skipped} /><Metric tone="danger" icon={<XCircle />} label="失败" value={activeJob.failed} /><Metric tone="info" icon={<Timer />} label="速度" value={activeJob.rate ? `${activeJob.rate.toFixed(1)}/s` : '—'} /></div>
             {activeJob.current_item && <div className="current-item"><LoaderCircle size={14} className={activeJob.state === 'running' ? 'spin' : ''} /><span title={activeJob.current_item}>{activeJob.current_item}</span></div>}
             <JobControls state={activeJob.state} onAction={(action) => actionMutation.mutate({ id: activeJob.id, action })} />
             <div className="stream-line" aria-live="polite"><span className={`stream-dot stream-${stream.streamState}`} />{stream.streamState === 'connected' ? '实时连接' : stream.streamState === 'reconnecting' ? '正在恢复连接' : '事件流已停止'}</div>
@@ -246,8 +247,8 @@ export function BatchJobs() {
   </div>
 }
 
-function Metric({ icon, label, value }: { icon: React.ReactNode; label: string; value: string | number }) {
-  return <div className="metric"><span>{icon}</span><div><small>{label}</small><strong>{value}</strong></div></div>
+function Metric({ icon, label, value, tone }: { icon: React.ReactNode; label: string; value: string | number; tone: 'success' | 'warning' | 'danger' | 'info' }) {
+  return <div className={`metric metric-${tone}`}><span>{icon}</span><div><small>{label}</small><strong>{value}</strong></div></div>
 }
 function JobIcon({ state }: { state: string }) {
   if (state === 'succeeded') return <CheckCircle2 size={16} />
@@ -261,30 +262,3 @@ function formatDate(value?: string) {
   return Number.isNaN(date.getTime()) ? value : new Intl.DateTimeFormat('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }).format(date)
 }
 function formatBytes(value: number) { return value > 1024 * 1024 ? `${(value / 1024 / 1024).toFixed(1)} MB` : `${Math.max(1, Math.round(value / 1024))} KB` }
-
-function effectiveThresholds(model: ModelProfile): Record<string, number> {
-  return { default: model.threshold ?? 0.35, ...(model.thresholds ?? {}) }
-}
-
-function thresholdKeys(values: Record<string, number>) {
-  const order = ['default', 'general', 'character', 'species', 'rating', 'other']
-  return Object.keys(values).sort((left, right) => {
-    const leftIndex = order.indexOf(left)
-    const rightIndex = order.indexOf(right)
-    return (leftIndex < 0 ? 99 : leftIndex) - (rightIndex < 0 ? 99 : rightIndex) || left.localeCompare(right)
-  })
-}
-
-function thresholdName(key: string) {
-  return { default: '默认', general: '通用', character: '角色', species: '物种', rating: '分级', other: '其他' }[key] ?? key
-}
-
-function thresholdSummary(model: ModelProfile, override?: Record<string, number>) {
-  if (override) return `本次自定义 · ${Object.keys(override).length} 类`
-  return `${model.threshold_source === 'custom' ? '模型自定义' : '模型预设'} · 通用 ${(model.thresholds?.general ?? model.threshold ?? 0.35).toFixed(2)}`
-}
-
-function thresholdMapsEqual(left: Record<string, number>, right: Record<string, number>) {
-  const keys = new Set([...Object.keys(left), ...Object.keys(right)])
-  return [...keys].every((key) => left[key] === right[key])
-}

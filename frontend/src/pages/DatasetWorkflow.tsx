@@ -16,7 +16,7 @@ import {
   Upload,
   Wrench,
 } from 'lucide-react'
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { Button, DialogLayer, EmptyState, Field, HelpPopover, Notice, Panel, StatusBadge } from '../components/ui'
 import { api, ApiError } from '../lib/api'
 import { copyFor } from '../lib/workflowCopy'
@@ -136,6 +136,7 @@ export function DatasetWorkflow() {
   const [repair, setRepair] = useState<WorkflowRepairReport>()
   const [tokenError, setTokenError] = useState<string>()
   const [tokenDraft, setTokenDraft] = useState<Record<number, string>>({})
+  const captionSelectionSource = useRef<'auto' | 'user' | null>(null)
 
   const roots = useQuery({ queryKey: ['roots'], queryFn: api.roots, retry: false })
   const models = useQuery({ queryKey: ['models'], queryFn: api.models, retry: false })
@@ -251,19 +252,21 @@ export function DatasetWorkflow() {
   useEffect(() => {
     setDraft((current) => {
       if (loadedModels.length === 0) {
+        captionSelectionSource.current = null
         return current.captionModelId ? { ...current, captionModelId: undefined } : current
       }
       if (loadedModels.length === 1) {
-        const model = loadedModels[0]
-        return model && !current.captionModelId ? { ...current, captionModelId: model.id } : current
+        const model = loadedModels[0]!
+        if (current.captionModelId === model.id) return current
+        captionSelectionSource.current = 'auto'
+        return { ...current, captionModelId: model.id }
       }
       const hasValidSelection = loadedModels.some((model) => model.id === current.captionModelId)
-      // A one-model auto-selection must not silently become the choice when a
-      // second model is loaded; the user must explicitly choose in that case.
-      if (!hasValidSelection || current.captionModelId === loadedModels[0]?.id) {
-        return { ...current, captionModelId: '' }
-      }
-      return current
+      if (hasValidSelection && captionSelectionSource.current === 'user') return current
+      // A selection made automatically while only one model was loaded must not
+      // silently become the choice once the runtime exposes multiple models.
+      captionSelectionSource.current = null
+      return current.captionModelId ? { ...current, captionModelId: '' } : current
     })
   }, [loadedModels])
 
@@ -939,7 +942,10 @@ export function DatasetWorkflow() {
             ) : loadedModels.length > 1 ? (
               <select aria-label={text.captionModel}
                 value={draft.captionModelId ?? ''}
-                onChange={(event) => updateDraft({ captionModelId: event.target.value })}
+                onChange={(event) => {
+                  captionSelectionSource.current = 'user'
+                  updateDraft({ captionModelId: event.target.value })
+                }}
               >
                 <option value="">—</option>
                 {loadedModels.map((model) => <option key={model.id} value={model.id}>{model.name}</option>)}

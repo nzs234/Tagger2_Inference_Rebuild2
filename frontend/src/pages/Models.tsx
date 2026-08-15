@@ -3,6 +3,7 @@ import { AlertTriangle, Box, CheckCircle2, Cpu, Database, Download, Gauge, GitBr
 import { useEffect, useMemo, useState } from 'react'
 import { Button, DialogLayer, EmptyState, Field, IconButton, Notice, Panel, StatusBadge } from '../components/ui'
 import { api, ApiError } from '../lib/api'
+import { thresholdKeys, thresholdMapsEqual, thresholdName } from '../lib/modelThresholds'
 import type { ClassifierProfile, ModelDownload, ModelProfile } from '../types'
 
 export function Models() {
@@ -134,7 +135,7 @@ export function Models() {
       </div>}
     </Panel>
     <Panel title="模型注册表" eyebrow={`${models.length} MODELS`} actions={<div className="table-filters"><label className="search-box"><Search size={15} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="筛选模型" aria-label="筛选模型" /></label><select value={backend} onChange={(event) => setBackend(event.target.value)} aria-label="后端筛选"><option value="all">全部后端</option><option value="onnx">ONNX</option><option value="pytorch">PyTorch</option><option value="safetensors">safetensors</option></select><IconButton label="刷新模型" onClick={() => modelQuery.refetch()}><RefreshCw size={15} /></IconButton></div>}>
-      {modelQuery.isLoading ? <div className="loading-block"><LoaderCircle className="spin" />读取模型注册表…</div> : !models.length ? <EmptyState icon={<Box size={23} />} title="没有匹配的本地模型" /> : <div className="model-table">
+      {modelQuery.isLoading ? <div className="loading-block"><LoaderCircle className="spin" />读取模型注册表…</div> : modelQuery.isError ? <EmptyState icon={<AlertTriangle size={21} />} title="无法读取模型注册表" detail="当前显示的数据可能已经过期，请恢复服务连接后重试。" action={<Button variant="secondary" size="sm" onClick={() => modelQuery.refetch()}>重试</Button>} /> : !models.length ? <EmptyState icon={<Box size={23} />} title="没有匹配的本地模型" /> : <div className="model-table">
         <div className="model-table-head"><span>模型</span><span>推理配置</span><span>扩展</span><span>状态</span><span aria-label="操作" /></div>
         {models.map((model) => <div className="model-row" key={model.id}>
           <div className="model-identity"><span className={`model-logo backend-${model.backend}`}><ModelIcon backend={model.backend} /></span><div><strong>{model.name}</strong><small>{model.architecture ?? '架构未标注'} · ID {model.id.slice(0, 8)}</small></div></div>
@@ -196,21 +197,6 @@ function ModelIcon({ backend }: { backend: string }) {
 }
 function formatMemory(value: number) { return value >= 1024 ? `${(value / 1024).toFixed(1)} GB` : `${Math.round(value)} MB` }
 function formatInput(value?: number | number[]) { return Array.isArray(value) ? value.join(' × ') : value ? `${value} px` : '自适应尺寸' }
-function thresholdKeys(values: Record<string, number>) {
-  const order = ['default', 'general', 'character', 'species', 'rating', 'other']
-  return Object.keys(values).sort((left, right) => {
-    const leftIndex = order.indexOf(left)
-    const rightIndex = order.indexOf(right)
-    return (leftIndex < 0 ? 99 : leftIndex) - (rightIndex < 0 ? 99 : rightIndex) || left.localeCompare(right)
-  })
-}
-function thresholdName(key: string) {
-  return { default: '默认', general: '通用', character: '角色', species: '物种', rating: '分级', other: '其他' }[key] ?? key
-}
-function thresholdMapsEqual(left: Record<string, number>, right: Record<string, number>) {
-  const keys = new Set([...Object.keys(left), ...Object.keys(right)])
-  return [...keys].every((key) => left[key] === right[key])
-}
 function downloadStatusLabel(record: ModelDownload) {
   if (record.status === 'succeeded') return `已注册 ${record.model_ids.length} 个模型 · 自动加载 ${record.loaded_model_ids.length} 个`
   if (record.status === 'failed') return '下载未完成'

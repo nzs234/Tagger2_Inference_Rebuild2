@@ -381,15 +381,25 @@ def create_workflow_router(
             except ValueError:
                 return False
 
-    def _register_manual_root(path: Path, *, kind: Literal["input", "output"]) -> Any:
+    def _register_manual_root(
+        path: Path,
+        *,
+        kind: Literal["input", "output"],
+        writable: bool | None = None,
+    ) -> Any:
         registrar = root_registrar
         if registrar is not None:
-            return registrar(path, name="手动输入目录" if kind == "input" else "手动输出目录", kind=kind)
+            return registrar(
+                path,
+                name="手动输入目录" if kind == "input" else "手动输出目录",
+                kind=kind,
+                writable=writable,
+            )
         return allowlist.register(
             path,
             kind=kind,
             label="手动输入目录" if kind == "input" else "手动输出目录",
-            writable=kind == "output",
+            writable=kind == "output" if writable is None else writable,
         )
 
     def _bind_manual_path(
@@ -397,17 +407,18 @@ def create_workflow_router(
         *,
         kind: Literal["input", "output"],
         allow_register: bool,
+        writable: bool | None = None,
     ) -> tuple[Any | None, str]:
         match = allowlist.find_root_for_path(
             path,
             kind=kind,
-            writable=True if kind == "output" else None,
+            writable=True if kind == "output" or writable is True else None,
         )
         if match is not None:
             return match
         if not allow_register:
             return None, ""
-        root = _register_manual_root(path, kind=kind)
+        root = _register_manual_root(path, kind=kind, writable=writable)
         return root, ""
 
     def _preview_manual_paths(request: WorkflowPathBindingPreviewRequest) -> tuple[
@@ -417,7 +428,10 @@ def create_workflow_router(
         if not source.is_dir():
             raise ValueError("source_path does not exist")
         source_binding, _source_relative = _bind_manual_path(
-            source, kind="input", allow_register=False
+            source,
+            kind="input",
+            allow_register=False,
+            writable=request.work_mode == "in_place",
         )
         output: Path | None = None
         output_binding: Any | None = None
@@ -501,7 +515,10 @@ def create_workflow_router(
                     output.mkdir(parents=True, exist_ok=False)
                     created_output_path = output
                 source_root, source_relative = _bind_manual_path(
-                    source, kind="input", allow_register=True
+                    source,
+                    kind="input",
+                    allow_register=True,
+                    writable=request.work_mode == "in_place",
                 )
                 if source_root is None:
                     raise ValueError("source_path_binding_failed")

@@ -1,8 +1,8 @@
-# Ported verbatim from the e621-standard-caption-workflow project
+# Ported from the pinned e621-standard-caption-workflow baseline
 # (workers/nl/src/anima_nl_worker/validation.py). Strict NL response
 # validation: refusal detection, wrapper stripping and the structured
-# count/layout observation contract are security relevant, so the rules are
-# kept byte-identical rather than paraphrased.
+# count/layout observation contract stay aligned with the source. Tagger2 adds
+# an exact-only image sentinel rule at this adapter boundary.
 from __future__ import annotations
 
 import json
@@ -43,6 +43,9 @@ WRAPPERS = (('"', '"'), ("'", "'"), ("“", "”"), ("‘", "’"), ("**", "**")
 
 class NlValidationError(ValueError):
     pass
+
+
+NL_IMAGE_NOT_RECEIVED = "__NL_IMAGE_NOT_RECEIVED__"
 
 
 def normalize_endpoint(value: object) -> str:
@@ -105,7 +108,12 @@ def _completion_parts(body: bytes) -> tuple[str, str | None, dict[str, int]]:
 
 def validate_completion_response(body: bytes) -> tuple[str, str | None, dict[str, int]]:
     content, request_id, summary = _completion_parts(body)
-    return validate_nl(content), request_id, summary
+    if content == NL_IMAGE_NOT_RECEIVED:
+        return content, request_id, summary
+    if NL_IMAGE_NOT_RECEIVED in content:
+        raise NlValidationError("image-not-received sentinel must be exact")
+    nl = validate_nl(content)
+    return nl, request_id, summary
 
 
 def _strict_object(text: str) -> dict[str, object]:
@@ -135,7 +143,13 @@ def validate_completion_response_v2(
     content, request_id, summary = _completion_parts(body)
     value = _strict_object(content)
     # NL is independently valuable and is validated before the observation fields.
-    nl = validate_nl(value.get("nl"))
+    raw_nl = value.get("nl")
+    if raw_nl == NL_IMAGE_NOT_RECEIVED:
+        nl = NL_IMAGE_NOT_RECEIVED
+    else:
+        if isinstance(raw_nl, str) and NL_IMAGE_NOT_RECEIVED in raw_nl:
+            raise NlValidationError("image-not-received sentinel must be exact")
+        nl = validate_nl(raw_nl)
     raw_count = value.get("count")
     raw_layout = value.get("layout")
     raw_repeated = value.get("sameCharacterRepeated")

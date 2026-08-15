@@ -4,11 +4,25 @@ If a port genuinely needs to change, update the expected digest here in the same
 commit and record the reason in docs/workflow_compatibility_report.md.
 """
 
+import hashlib
+import json
+import os
+import subprocess
 from pathlib import Path
 
 import pytest
 
-SOURCE_ROOT = Path(r"E:\AI\e621-standard-capotion-workflow")
+SOURCE_ROOT = (
+    Path(os.environ["TAGGER2_UPSTREAM_SOURCE_ROOT"])
+    if os.environ.get("TAGGER2_UPSTREAM_SOURCE_ROOT")
+    else None
+)
+MANIFEST = json.loads(
+    (Path(__file__).parent / "fixtures" / "workflow_upstream_manifest.json").read_text(
+        encoding="utf-8"
+    )
+)
+SOURCE_COMMIT = str(MANIFEST["commit"])
 
 PORTS = {
     "backend/tagger2/workflow/caption_format/normalizer.py":
@@ -19,8 +33,6 @@ PORTS = {
         "workers/replace/src/anima_replace_worker/replacement.py",
     "backend/tagger2/workflow/raw_e621.py":
         "core/src/anima_core/raw_e621.py",
-    "backend/tagger2/workflow/stages/nl_validation.py":
-        "workers/nl/src/anima_nl_worker/validation.py",
     "backend/tagger2/workflow/stages/count_rules.py":
         "workers/classify/src/anima_classify_worker/count.py",
     "backend/tagger2/workflow/stages/policy.py":
@@ -32,6 +44,14 @@ PORTS = {
 ADAPTED_PORTS = {
     "backend/tagger2/workflow/stages/token_budget.py":
         "workers/token_budget/src/anima_token_budget_worker/budget.py",
+}
+
+# NL validation deliberately rejects a sentinel embedded in ordinary text in
+# addition to the upstream exact-sentinel handling; its expected digest is
+# recorded in the manifest rather than pretending it is byte-identical.
+POLICY_ADAPTED_PORTS = {
+    "backend/tagger2/workflow/stages/nl_validation.py":
+        "workers/nl/src/anima_nl_worker/validation.py",
 }
 
 
@@ -52,6 +72,10 @@ def _source_body(path: Path) -> bytes:
     return path.read_bytes().replace(b"\r\n", b"\n")
 
 
+def _sha256(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
 @pytest.mark.parametrize("local_path", sorted(PORTS))
 def test_ported_file_carries_provenance_banner(local_path: str):
     """Every ported file names its origin so the boundary stays obvious."""
@@ -63,6 +87,8 @@ def test_ported_file_carries_provenance_banner(local_path: str):
 @pytest.mark.parametrize("local_path,source_relative", sorted(PORTS.items()))
 def test_ported_file_matches_source_when_available(local_path: str, source_relative: str):
     """The port is byte-identical to the source file, ignoring the banner."""
+    if SOURCE_ROOT is None:
+        pytest.skip("TAGGER2_UPSTREAM_SOURCE_ROOT is not configured")
     source = SOURCE_ROOT / source_relative
     if not source.is_file():
         pytest.skip("source project is not available on this machine")
@@ -72,6 +98,8 @@ def test_ported_file_matches_source_when_available(local_path: str, source_relat
 @pytest.mark.parametrize("local_path,source_relative", sorted(ADAPTED_PORTS.items()))
 def test_adapted_port_differs_only_by_import_path(local_path: str, source_relative: str):
     """An adapted port must differ from its source only in its import lines."""
+    if SOURCE_ROOT is None:
+        pytest.skip("TAGGER2_UPSTREAM_SOURCE_ROOT is not configured")
     source = SOURCE_ROOT / source_relative
     if not source.is_file():
         pytest.skip("source project is not available on this machine")
@@ -96,6 +124,43 @@ def test_adapted_port_carries_provenance_banner(local_path: str):
     header = Path(local_path).read_text(encoding="utf-8").splitlines()[0]
     assert header.startswith("#")
     assert "e621-standard-caption-workflow" in header
+
+
+@pytest.mark.parametrize("local_path", sorted(POLICY_ADAPTED_PORTS))
+def test_policy_adapted_port_carries_provenance_banner(local_path: str):
+    header = Path(local_path).read_text(encoding="utf-8").splitlines()[0]
+    assert header.startswith("#")
+    assert "e621-standard-caption-workflow" in header
+
+
+@pytest.mark.parametrize("local_path,metadata", sorted(MANIFEST["files"].items()))
+def test_ported_file_matches_pinned_manifest(local_path: str, metadata: dict[str, str]):
+    """The local port is checked against the immutable upstream commit manifest."""
+    assert _sha256(_body(Path(local_path))) == metadata["local_body_sha256"]
+
+
+def test_configured_upstream_checkout_is_at_the_pinned_commit():
+    if SOURCE_ROOT is None or not (SOURCE_ROOT / ".git").exists():
+        pytest.skip("TAGGER2_UPSTREAM_SOURCE_ROOT is not configured")
+    result = subprocess.run(
+        ["git", "-C", str(SOURCE_ROOT), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert result.stdout.strip() == SOURCE_COMMIT
+
+
+@pytest.mark.parametrize("local_path,source_relative", sorted(POLICY_ADAPTED_PORTS.items()))
+def test_policy_adapted_port_matches_pinned_source_when_available(local_path: str, source_relative: str):
+    if SOURCE_ROOT is None:
+        pytest.skip("TAGGER2_UPSTREAM_SOURCE_ROOT is not configured")
+    source = SOURCE_ROOT / source_relative
+    if not source.is_file():
+        pytest.skip("source project is not available on this machine")
+    metadata = MANIFEST["files"][local_path]
+    assert _sha256(_source_body(source)) == metadata["source_sha256"]
+    assert _sha256(_body(Path(local_path))) == metadata["local_body_sha256"]
 
 
 def test_ported_modules_import_and_expose_their_api():

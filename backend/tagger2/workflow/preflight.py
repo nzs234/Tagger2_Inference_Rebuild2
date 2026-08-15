@@ -213,6 +213,10 @@ class WorkflowPreflightService:
                         f"Replace resource digest verification failed: {resource_id}"
                     )
 
+        nl_provider_id = str(config.nl.get("provider_id") or "")
+        if config.nl.get("enabled") and nl_provider_id and config.nl.get("use_image") is not True:
+            errors.append("NL API requires image input when a provider is selected")
+
         if config.ocr.get("enabled"):
             resource_id = config.ocr.get("resource_id")
             if resource_id:

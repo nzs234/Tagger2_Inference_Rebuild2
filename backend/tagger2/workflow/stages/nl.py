@@ -19,7 +19,7 @@ from pathlib import Path
 from collections.abc import Mapping, Sequence
 from typing import Any, Protocol, runtime_checkable
 
-from .nl_validation import NlValidationError, validate_nl
+from .nl_validation import NL_IMAGE_NOT_RECEIVED, NlValidationError, validate_nl
 
 PROMPT_DIR = Path(__file__).resolve().parent.parent / "prompts"
 PROMPT_VERSION = "nl-default-prompt-v4"
@@ -186,6 +186,26 @@ def run_nl_stage(
             )
             continue
 
+        image_path: Path | None = None
+        if use_image:
+            source_root_resolved = source_root.resolve(strict=False)
+            candidate = (source_root_resolved / relative).resolve(strict=False)
+            try:
+                candidate.relative_to(source_root_resolved)
+            except ValueError:
+                report.failed += 1
+                report.results.append(
+                    NlResult(relative_image_path=relative, error="nl_image_path_escape")
+                )
+                continue
+            if not candidate.is_file():
+                report.failed += 1
+                report.results.append(
+                    NlResult(relative_image_path=relative, error="nl_image_missing")
+                )
+                continue
+            image_path = candidate
+
         request = NlRequest(
             relative_image_path=relative,
             system_prompt=system_prompt,
@@ -199,12 +219,18 @@ def run_nl_stage(
                     else None
                 ),
             ),
-            image_path=(source_root / relative) if use_image else None,
+            image_path=image_path,
         )
 
         try:
             body = client.complete(request)
             nl, observation = _validate_response(body)
+            if nl == NL_IMAGE_NOT_RECEIVED:
+                report.failed += 1
+                report.results.append(
+                    NlResult(relative_image_path=relative, error="nl_image_not_received")
+                )
+                continue
         except (NlError, NlValidationError) as exc:
             report.failed += 1
             report.results.append(

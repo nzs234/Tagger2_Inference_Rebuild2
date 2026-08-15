@@ -5,7 +5,7 @@ import { useState } from 'react'
 import { useForm } from 'react-hook-form'
 import { z } from 'zod'
 import { PromptEditors } from '../components/PromptEditors'
-import { Button, DialogLayer, EmptyState, Field, IconButton, Notice, Panel, StatusBadge } from '../components/ui'
+import { Button, ConfirmDialog, DialogLayer, EmptyState, Field, IconButton, Notice, Panel, StatusBadge } from '../components/ui'
 import { useOnlinePrompts } from '../hooks/useOnlinePrompts'
 import { api, ApiError } from '../lib/api'
 import type { ProviderKind, ProviderProfile, ProviderProtocol } from '../types'
@@ -49,6 +49,7 @@ export function Providers() {
   const [showForm, setShowForm] = useState(false)
   const [editingId, setEditingId] = useState<string>()
   const [secretProvider, setSecretProvider] = useState<ProviderProfile>()
+  const [deleteTarget, setDeleteTarget] = useState<ProviderProfile>()
   const [keys, setKeys] = useState('')
   const [notice, setNotice] = useState<{ tone: 'success' | 'danger' | 'info'; text: string } | null>(null)
   const [testResults, setTestResults] = useState<Record<string, { ok: boolean; message: string; latency?: number }>>({})
@@ -101,6 +102,7 @@ export function Providers() {
   const deleteMutation = useMutation({
     mutationFn: (provider: ProviderProfile) => api.deleteProvider(provider.id).then(() => provider),
     onSuccess: (provider) => {
+      setDeleteTarget(undefined)
       setNotice({ tone: 'success', text: `${provider.name} 已删除` })
       setTestResults((current) => { const next = { ...current }; delete next[provider.id]; return next })
       setDiscovered((current) => { const next = { ...current }; delete next[provider.id]; return next })
@@ -175,7 +177,9 @@ export function Providers() {
     if (!form.getValues('name')) form.setValue('name', providerKindName(kind))
   }
   const requestDelete = (provider: ProviderProfile) => {
-    if (window.confirm(`确定删除“${provider.name}”吗？关联密钥也会从凭据存储中移除。`)) deleteMutation.mutate(provider)
+    // Avoid stacking focus traps when deletion starts inside the edit drawer.
+    setShowForm(false)
+    setDeleteTarget(provider)
   }
   const formBaseUrl = form.watch('base_url')
   const formApiKeys = form.watch('api_keys')
@@ -253,6 +257,15 @@ export function Providers() {
         <div className="drawer-actions">{editingId && <Button type="button" variant="danger" icon={<Trash2 size={15} />} disabled={deleteMutation.isPending} onClick={() => { const provider = providerQuery.data?.items.find((item) => item.id === editingId); if (provider) requestDelete(provider) }}>删除</Button>}<span className="drawer-actions-spacer" /><Button type="button" variant="secondary" onClick={() => setShowForm(false)}>取消</Button><Button type="submit" icon={saveMutation.isPending ? <LoaderCircle size={15} className="spin" /> : <Save size={15} />} disabled={saveMutation.isPending}>{editingId ? '保存修改' : '创建 Provider'}</Button></div>
       </form>
     </aside></DialogLayer>}
+
+    {deleteTarget && <ConfirmDialog
+      title={`删除 ${deleteTarget.name}？`}
+      detail={<>此操作会删除 Provider 配置，并从凭据存储中移除关联密钥。删除后无法撤销。</>}
+      confirmLabel="删除 Provider"
+      busy={deleteMutation.isPending}
+      onClose={() => setDeleteTarget(undefined)}
+      onConfirm={() => deleteMutation.mutate(deleteTarget)}
+    />}
 
     {secretProvider && <DialogLayer onClose={() => setSecretProvider(undefined)}><div className="secret-dialog" role="dialog" aria-modal="true" aria-labelledby="secret-title">
       <header><span className="dialog-icon"><KeyRound size={20} /></span><div><p className="eyebrow">CREDENTIAL VAULT</p><h2 id="secret-title">{secretProvider.name} 密钥池</h2></div><IconButton label="关闭" onClick={() => setSecretProvider(undefined)}><X size={17} /></IconButton></header>

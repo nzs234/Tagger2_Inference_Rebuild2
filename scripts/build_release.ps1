@@ -188,25 +188,46 @@ try {
   $zip = Join-Path $out "$name.zip"
   if (Test-Path -LiteralPath $zip) { Remove-Item -LiteralPath $zip -Force }
   Compress-Archive -Path (Join-Path $stage "*") -DestinationPath $zip -CompressionLevel Optimal
+  $checksumPath = "$zip.sha256.txt"
+  $checksum = (Get-FileHash -Algorithm SHA256 -LiteralPath $zip).Hash.ToUpperInvariant()
+  "$checksum  $([System.IO.Path]::GetFileName($zip))" |
+    Set-Content -LiteralPath $checksumPath -Encoding ascii
 
   if (-not $SkipSmokeTest) {
     Write-Host "Running release smoke test..."
     Expand-Archive -LiteralPath $zip -DestinationPath $smoke -Force
     $packagedPython = Join-Path $smoke "runtime\python.exe"
-    if (Test-Path -LiteralPath $packagedPython) {
+    if ($BaseRuntimeOnly) {
+      if (-not (Test-Path -LiteralPath $packagedPython)) {
+        throw "Base runtime smoke test could not find runtime/python.exe"
+      }
+      $sitePackages = Join-Path $smoke "runtime\Lib\site-packages"
+      if (Test-Path -LiteralPath $sitePackages) {
+        throw "Base runtime package unexpectedly contains site-packages"
+      }
+      & $packagedPython -c "import sys; assert sys.version_info[:2] == (3, 12), sys.version; print('release smoke: base Python', sys.version.split()[0])"
+      if ($LASTEXITCODE -ne 0) { throw "Packaged base Python smoke test failed with exit code $LASTEXITCODE" }
+      $python = Join-Path $root "runtime\python.exe"
+      if (-not (Test-Path -LiteralPath $python)) {
+        $python = Join-Path $root ".venv\Scripts\python.exe"
+      }
+      if (-not (Test-Path -LiteralPath $python)) {
+        $python = (Get-Command python -ErrorAction Stop).Source
+      }
+      $env:PYTHONPATH = Join-Path $smoke "backend"
+    } elseif (Test-Path -LiteralPath $packagedPython) {
       $python = $packagedPython
     } elseif (Test-Path -LiteralPath (Join-Path $root ".venv\Scripts\python.exe")) {
       $python = Join-Path $root ".venv\Scripts\python.exe"
     } else {
       $python = (Get-Command python -ErrorAction Stop).Source
     }
-    $packagedPython = Join-Path $smoke "runtime\python.exe"
     if (Test-Path -LiteralPath $packagedPython) {
       & $packagedPython (Join-Path $smoke "scripts\ensure_runtime_backend_path.py") `
         --pth (Join-Path $smoke "runtime\python312._pth") `
         --backend (Join-Path $smoke "backend")
       if ($LASTEXITCODE -ne 0) { throw "Could not prepare the extracted portable Python runtime" }
-    } else {
+    } elseif (-not $env:PYTHONPATH) {
       $env:PYTHONPATH = Join-Path $smoke "backend"
     }
     $env:TAGGER2_PROJECT_ROOT = $smoke
@@ -221,6 +242,7 @@ try {
     }
   }
   Write-Host "Release package: $zip"
+  Write-Host "Release checksum: $checksumPath"
 } finally {
   if (Test-Path -LiteralPath $stage) { Remove-Item -LiteralPath $stage -Recurse -Force }
   if (Test-Path -LiteralPath $smoke) { Remove-Item -LiteralPath $smoke -Recurse -Force }

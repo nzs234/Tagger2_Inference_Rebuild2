@@ -116,6 +116,27 @@ def test_replace_projection_applies_priority_dedup():
     assert summary.replaced == 3
 
 
+def test_upstream_anthro_random_rewrite_uses_injected_boundary_value():
+    from backend.tagger2.workflow.stages.replacement import replace_projection
+
+    payload = {
+        "quality": [],
+        "count": "solo",
+        "character": "",
+        "series": "",
+        "artist": "",
+        "appearance": [],
+        "tags": ["anthro"],
+        "environment": [],
+        "nl": "",
+    }
+
+    rewritten, _ = replace_projection(payload, {}, random_value=lambda: 0.49)
+    retained, _ = replace_projection(payload, {}, random_value=lambda: 0.5)
+    assert rewritten["tags"] == ["furry"]
+    assert retained["tags"] == ["anthro"]
+
+
 def test_nine_field_normalization_and_flat_txt():
     """Normalization emits exactly nine ordered fields; flat TXT is deterministic."""
     import json

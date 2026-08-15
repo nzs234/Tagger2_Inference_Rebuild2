@@ -12,6 +12,7 @@ import itertools
 import json
 import os
 import re
+import shutil
 import threading
 import time
 import uuid
@@ -583,7 +584,8 @@ class Runtime:
                 continue
             seen_ids.add(root_id)
             seen_paths.add(path_key)
-            writable = kind == "output"
+            writable_value = value.get("writable")
+            writable = kind == "output" or (kind == "input" and writable_value is True)
             existing = self._find_registered_root(path)
             if existing is not None:
                 if existing.kind != kind or existing.writable != writable:
@@ -602,26 +604,51 @@ class Runtime:
                     continue
             self._persistent_roots[root.root_id] = root
 
-    def register_persistent_root(self, path: Path, *, name: str, kind: str) -> PathRoot:
+    def register_persistent_root(
+        self,
+        path: Path,
+        *,
+        name: str,
+        kind: str,
+        writable: bool | None = None,
+    ) -> PathRoot:
         canonical = path.expanduser().resolve(strict=False)
         if not canonical.is_dir():
             raise PathNotAllowedError("root directory does not exist")
-        writable = kind == "output"
+        desired_writable = kind == "output" if writable is None else bool(writable)
+        if kind == "model" and desired_writable:
+            raise SecurityError("model roots cannot be writable")
         with self._settings_lock:
             existing = self._find_registered_root(canonical)
             added = existing is None
+            replaced: PathRoot | None = None
             if existing is not None:
-                if existing.kind != kind or existing.writable != writable:
+                if existing.kind != kind:
                     raise SecurityError(
                         "directory is already registered with a different kind"
                     )
-                root = existing
+                # Registration is monotonic: a general read-only registration
+                # request must not silently revoke a previously authorised
+                # writable binding for the same root.
+                if existing.writable and not desired_writable:
+                    desired_writable = True
+                if existing.writable != desired_writable:
+                    replaced = existing
+                    root = self.allowlist.register(
+                        canonical,
+                        root_id=existing.root_id,
+                        kind=kind,
+                        label=self._safe_root_label(name, kind),
+                        writable=desired_writable,
+                    )
+                else:
+                    root = existing
             else:
                 root = self.allowlist.register(
                     canonical,
                     kind=kind,
                     label=self._safe_root_label(name, kind),
-                    writable=writable,
+                    writable=desired_writable,
                 )
             previous = self._persistent_roots.get(root.root_id)
             self._persistent_roots[root.root_id] = root
@@ -634,6 +661,14 @@ class Runtime:
                     self._persistent_roots[root.root_id] = previous
                 if added:
                     self.allowlist.unregister(root.root_id)
+                elif replaced is not None:
+                    self.allowlist.register(
+                        replaced.path,
+                        root_id=replaced.root_id,
+                        kind=replaced.kind,
+                        label=replaced.label,
+                        writable=replaced.writable,
+                    )
                 raise
             return root
 
@@ -1884,34 +1919,44 @@ def create_app(settings: AppConfig | None = None) -> FastAPI:
         records: list[dict[str, Any]] = []
         artifact_names: set[str] = set()
         total = 0
-        for index, upload in enumerate(files):
-            data = await upload.read(runtime.settings.max_upload_bytes + 1)
-            total += len(data)
-            if total > runtime.settings.max_request_bytes:
-                raise _safe_error("请求体超过限制", "request_too_large")
-            validate_image_bytes(data, max_bytes=runtime.settings.max_upload_bytes, max_pixels=runtime.settings.max_image_pixels, max_edge=runtime.settings.max_image_edge)
-            filename = sanitize_filename(upload.filename or f"image-{index + 1}.png")
-            path = target_dir / f"{index:04d}_{filename}"
-            atomic_write_bytes(path, data)
-            image_id = uuid.uuid4().hex
-            artifact_name = filename
-            duplicate = 2
-            while artifact_name.casefold() in artifact_names:
-                original = Path(filename)
-                artifact_name = f"{original.stem} ({duplicate}){original.suffix}"
-                duplicate += 1
-            artifact_names.add(artifact_name.casefold())
-            records.append({
-                "id": image_id,
-                "name": filename,
-                "path": str(path),
-                "size": len(data),
-                "relative_path": filename,
-                "artifact_name": artifact_name,
-            })
-        with runtime._upload_lock:
-            runtime.upload_index[upload_id] = records
-            runtime._save_upload_index()
+        try:
+            for index, upload in enumerate(files):
+                data = await upload.read(runtime.settings.max_upload_bytes + 1)
+                total += len(data)
+                if total > runtime.settings.max_request_bytes:
+                    raise _safe_error("请求体超过限制", "request_too_large")
+                validate_image_bytes(data, max_bytes=runtime.settings.max_upload_bytes, max_pixels=runtime.settings.max_image_pixels, max_edge=runtime.settings.max_image_edge)
+                filename = sanitize_filename(upload.filename or f"image-{index + 1}.png")
+                path = target_dir / f"{index:04d}_{filename}"
+                atomic_write_bytes(path, data)
+                image_id = uuid.uuid4().hex
+                artifact_name = filename
+                duplicate = 2
+                while artifact_name.casefold() in artifact_names:
+                    original = Path(filename)
+                    artifact_name = f"{original.stem} ({duplicate}){original.suffix}"
+                    duplicate += 1
+                artifact_names.add(artifact_name.casefold())
+                records.append({
+                    "id": image_id,
+                    "name": filename,
+                    "path": str(path),
+                    "size": len(data),
+                    "relative_path": filename,
+                    "artifact_name": artifact_name,
+                })
+            with runtime._upload_lock:
+                runtime.upload_index[upload_id] = records
+                try:
+                    runtime._save_upload_index()
+                except Exception:
+                    runtime.upload_index.pop(upload_id, None)
+                    raise
+        except BaseException:
+            # The upload id owns a fresh directory, so a failed or cancelled
+            # multipart request can remove it without touching another batch.
+            await asyncio.to_thread(shutil.rmtree, target_dir, ignore_errors=True)
+            raise
         return {"upload_id": upload_id, "files": [{"id": x["id"], "name": x["name"], "size": x["size"]} for x in records]}
 
     @app.post("/api/v1/video-prompts/generate")
