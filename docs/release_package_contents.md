@@ -1,12 +1,14 @@
 # Tagger2 发布包说明
 
-这个压缩包用于分享和部署 Tagger2 Inference。解压后运行 `start.bat`，浏览器打开
-`http://127.0.0.1:20000`。首次运行会根据机器上的 NVIDIA/CUDA 情况选择 CUDA 或 CPU
-依赖；也可以在启动前设置 `TAGGER2_TORCH_VARIANT=cpu` 强制使用 CPU。
+这个压缩包用于分享和部署 Tagger2 Inference。当前 GitHub V1.01 Release 提供的是
+精简包：不内置 Python 运行时，解压后运行 `setup.bat`，脚本会下载 Python 3.12 并安装
+锁定依赖；之后运行 `start.bat`，浏览器打开 `http://127.0.0.1:20000`。也可以在启动前
+设置 `TAGGER2_TORCH_VARIANT=cpu` 强制使用 CPU。包含 `runtime/` 目录的本地完整包则可以
+直接跳过 Python 下载步骤。
 
 ## 已包含
 
-- Tagger2 后端、前端构建产物、启动脚本和锁定的 Python 运行时。
+- Tagger2 后端、前端构建产物、启动/安装脚本和锁定的依赖清单。
 - e621 分类快照：`classify-e621-20260812-v1`
   - fingerprint：`eccfdfacf3bcf1611a9ee3561f54bb81e946122f582f1f421c5e90689f2db49f`
 - e621 标签替换索引：
@@ -24,6 +26,7 @@
 
 - `models/` 和 `data_cache/`：模型文件体积较大，需要在本机单独准备。模型配置仍使用
   Tagger2 的本地模型页面导入/选择，任务会冻结明确的 `caption.model_id`。
+- 精简包不包含 `runtime/`；首次运行 `setup.bat` 会自动准备便携 Python 和依赖。
 - `runtime_ocr/`、PaddleOCR 模型缓存和 OCR 资源描述：这些文件体积较大，且描述中可能含
   原机器的绝对路径。需要 OCR 时，请按项目文档单独安装隔离 OCR 运行时并注册本机资源。
 
