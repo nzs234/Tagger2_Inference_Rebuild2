@@ -28,6 +28,18 @@ if ($SkipRuntime -and $BaseRuntimeOnly) {
   throw "SkipRuntime and BaseRuntimeOnly cannot be used together"
 }
 
+$sourceCommit = (& git -C $root rev-parse HEAD).Trim()
+if ($LASTEXITCODE -ne 0) {
+  throw "The release must be built from a Git checkout"
+}
+$sourceStatus = @(& git -C $root status --porcelain)
+if ($LASTEXITCODE -ne 0) {
+  throw "Could not inspect the release Git checkout"
+}
+if ($sourceStatus.Count -gt 0) {
+  throw "The release Git checkout has uncommitted changes"
+}
+
 $expectedUpstreamCommit = "ccc9d07497be637fc097c5da009d791f017144c9"
 $upstreamCommit = $expectedUpstreamCommit
 if (-not [string]::IsNullOrWhiteSpace($UpstreamSourceRoot)) {
@@ -104,11 +116,13 @@ try {
     "Tagger2 Inference",
     "Version: $releaseVersion",
     "Build timestamp: $stamp",
+    "Source commit: $sourceCommit",
     "Upstream commit: $upstreamCommit"
   ) | Set-Content -LiteralPath $versionFile -Encoding utf8
   @{
     version = $releaseVersion
     built_at = $stamp
+    source_commit = $sourceCommit
     upstream_commit = $upstreamCommit
     checks = @(
       "workflow_upstream_port",
@@ -151,6 +165,7 @@ try {
     ".gitignore",
     "start.bat",
     "setup.bat",
+    "update.bat",
     "USER_GUIDE_zh-CN.txt",
     "README.md",
     "docs/release_package_contents.md",

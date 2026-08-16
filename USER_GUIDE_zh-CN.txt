@@ -14,6 +14,15 @@ Tagger2 Inference Rebuild 中文使用说明
 
 依赖安装完成后双击 start.bat。setup.bat 也可重复运行；锁文件没有变化时不会重复安装全部依赖。
 
+【更新 Git 检出】
+
+从 Git 克隆的项目可双击 update.bat，同步 origin/main 的最新提交。更新器只执行 fast-forward；
+存在未提交的受跟踪修改、分叉历史或 detached HEAD 时会停止，不会重置或覆盖本地工作。
+更新成功后运行 start.bat，使依赖锁文件的变化生效。
+
+发行 ZIP 不包含 .git 元数据，不能用 update.bat 原地更新。请从 GitHub Releases 下载新版，
+确认 config、models、data_cache 和 data 等本地内容迁移完成后，再删除旧目录。
+
 【便携环境目录】
 
 runtime\python.exe             内置 Python

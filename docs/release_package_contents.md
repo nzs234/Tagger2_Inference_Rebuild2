@@ -8,6 +8,8 @@
 ## 已包含
 
 - Tagger2 后端、前端构建产物、启动/安装脚本和锁定的依赖清单。
+- `update.bat`：用于 Git 检出目录的安全 fast-forward；发行 ZIP 本身不包含 `.git`，
+  ZIP 用户应从 GitHub Releases 下载新版并迁移本地配置、模型、缓存和数据目录。
 - e621 分类快照：`classify-e621-20260812-v1`
   - fingerprint：`eccfdfacf3bcf1611a9ee3561f54bb81e946122f582f1f421c5e90689f2db49f`
 - e621 标签替换索引：
@@ -42,6 +44,9 @@ relative_path` 注入任务内稳定 seed，因此同一任务的审阅恢复不
 4. 默认 e621 任务使用 `replace-e621-pass-drop-v2`；旧作业或明确选择旧资源的任务不会被改写。
 
 发布包不包含用户数据、数据库、日志、访问令牌或密钥。
+
+`VERSION.txt` 和 `VALIDATION_REPORT.json` 会记录发行版本、源码提交、构建时间及固定上游提交；
+打包脚本拒绝存在未提交修改的工作树。
 
 V1.03 发布验收包含后端完整测试、前端单元测试、Playwright、Ruff、mypy、
 ESLint、TypeScript/Vite、固定上游端口校验和 workflow smoke；本地资源未准备时，

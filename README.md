@@ -42,6 +42,18 @@ available (override with `TAGGER2_TORCH_VARIANT=cpu` or `cuda`), installs the
 matching ML wheels before the web dependencies, and starts the API at
 `http://127.0.0.1:20000`.
 
+### Updating a Git checkout
+
+Run `update.bat` to fetch `origin/main` and fast-forward the current local
+branch. The updater refuses detached HEADs, divergent history, and uncommitted
+tracked changes; it never resets or overwrites local work. Run `start.bat`
+afterwards so dependency lock changes are applied.
+
+Release ZIPs do not contain `.git` metadata. For an extracted release, download
+the newest package from GitHub Releases instead of using `update.bat`; keep the
+old folder until local `config`, `models`, `data_cache`, and `data` have been
+migrated or verified.
+
 For a manual setup:
 
 ```powershell
