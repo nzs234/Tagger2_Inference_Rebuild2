@@ -1,6 +1,6 @@
 param(
   [string]$OutputDir = "dist",
-  [string]$Version = "V1.04",
+  [string]$Version = "V1.04.1",
   [string]$UpstreamSourceRoot = $env:TAGGER2_UPSTREAM_SOURCE_ROOT,
   [switch]$SkipRuntime,
   [switch]$BaseRuntimeOnly,
@@ -157,6 +157,7 @@ try {
       "frontend_lint",
       "frontend_build",
       "playwright",
+      "release_bootstrap_smoke",
       "release_health_smoke",
       "release_image_capability_smoke"
     )
@@ -198,6 +199,7 @@ try {
     "USER_GUIDE_zh-CN.txt",
     "README.md",
     "docs/V1.04_RELEASE_NOTES.md",
+    "docs/V1.04.1_RELEASE_NOTES.md",
     "docs/release_package_contents.md",
     "docs/workflow_manual_paths.md",
     "docs/workflow_compatibility_report.md"
@@ -217,6 +219,11 @@ try {
       if (Test-Path -LiteralPath $removePath) {
         Remove-Item -LiteralPath $removePath -Recurse -Force
       }
+    }
+    Get-ChildItem -LiteralPath $destinationRuntime -File -Filter ".tagger2-runtime-*" |
+      Remove-Item -Force
+    if (-not (Test-Path -LiteralPath (Join-Path $destinationRuntime "get-pip.py"))) {
+      throw "Base runtime requested but runtime/get-pip.py is missing"
     }
   } elseif ((-not $SkipRuntime) -and (Test-Path -LiteralPath (Join-Path $root "runtime/python.exe"))) {
     Copy-ReleaseItem "runtime"
@@ -316,6 +323,12 @@ try {
       $sitePackages = Join-Path $smoke "runtime\Lib\site-packages"
       if (Test-Path -LiteralPath $sitePackages) {
         throw "Base runtime package unexpectedly contains site-packages"
+      }
+      if (Get-ChildItem -LiteralPath (Join-Path $smoke "runtime") -File -Filter ".tagger2-runtime-*") {
+        throw "Base runtime package contains a stale dependency marker"
+      }
+      if (-not (Test-Path -LiteralPath (Join-Path $smoke "runtime\get-pip.py"))) {
+        throw "Base runtime package does not contain the pip bootstrap"
       }
       & $packagedPython -c "import sys; assert sys.version_info[:2] == (3, 12), sys.version; print('release smoke: base Python', sys.version.split()[0])"
       if ($LASTEXITCODE -ne 0) { throw "Packaged base Python smoke test failed with exit code $LASTEXITCODE" }

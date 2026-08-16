@@ -69,3 +69,15 @@ def test_startup_uses_versioned_hashed_locks_and_integrity_modules() -> None:
     assert "--module transformers" in script
     assert "--module peft" in script
     assert "--module lycoris" in script
+    assert '"%PYTHON%" -m pip --version' in script
+    assert "runtime\\get-pip.py" in script
+    assert '"pip==26.1.2"' in script
+
+
+def test_portable_setup_bootstraps_pip_by_installed_state() -> None:
+    script = (PROJECT_ROOT / "setup.bat").read_text(encoding="utf-8")
+
+    assert '"%PYTHON%" -m pip --version' in script
+    assert '"%PYTHON%" "%RUNTIME%\\get-pip.py"' in script
+    assert '"pip==26.1.2"' in script
+    assert script.index('"%PYTHON%" -m pip --version') < script.index(":pip_ready")

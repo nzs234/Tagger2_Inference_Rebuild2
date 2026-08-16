@@ -82,6 +82,19 @@ goto runtime_ready
 
 :install_runtime
 echo [INFO] Installing the locked !RUNTIME_VARIANT! runtime...
+"%PYTHON%" -m pip --version >nul 2>nul
+if not errorlevel 1 goto pip_ready
+set "GET_PIP=%PROJECT_DIR%runtime\get-pip.py"
+if not exist "!GET_PIP!" (
+  echo [ERROR] pip is unavailable and runtime\get-pip.py is missing.
+  echo [HINT] Run setup.bat once, then retry start.bat.
+  goto install_failed
+)
+echo [INFO] Preparing pip...
+"%PYTHON%" "!GET_PIP!" --disable-pip-version-check "pip==26.1.2"
+if errorlevel 1 goto install_failed
+
+:pip_ready
 "%PYTHON%" -m pip install --upgrade "pip==26.1.2"
 if errorlevel 1 goto install_failed
 

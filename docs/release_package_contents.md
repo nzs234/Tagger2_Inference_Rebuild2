@@ -1,6 +1,6 @@
 # Tagger2 发布包说明
 
-这个压缩包用于分享和部署 Tagger2 Inference。V1.04 基础 Python 包内置便携式 Python
+这个压缩包用于分享和部署 Tagger2 Inference。V1.04.1 基础 Python 包内置便携式 Python
 3.12，但不包含第三方 site-packages；解压后运行 `setup.bat`，脚本会在该 runtime 中安装
 锁定依赖，之后运行 `start.bat`，浏览器打开 `http://127.0.0.1:20000`。也可以在启动前
 设置 `TAGGER2_TORCH_VARIANT=cpu` 强制使用 CPU。
@@ -34,7 +34,7 @@
 - `runtime_ocr/`、PaddleOCR 模型缓存和 OCR 资源描述：这些文件体积较大，且描述中可能含
   原机器的绝对路径。需要 OCR 时，请按项目文档单独安装隔离 OCR 运行时并注册本机资源。
 
-V1.04 延续 V1.03 的上游固定基线 `ccc9d07497be637fc097c5da009d791f017144c9`。Replacement
+V1.04.1 延续 V1.03 的上游固定基线 `ccc9d07497be637fc097c5da009d791f017144c9`。Replacement
 保留上游的随机 `anthro` → `furry` 规则；调用方按 `job_id + sample_id +
 relative_path` 注入任务内稳定 seed，因此同一任务的审阅恢复不会改变已冻结的输出。
 
@@ -50,6 +50,9 @@ relative_path` 注入任务内稳定 seed，因此同一任务的审阅恢复不
 `VERSION.txt` 和 `VALIDATION_REPORT.json` 会记录发行版本、源码提交、构建时间及固定上游提交；
 打包脚本拒绝存在未提交修改的工作树。
 
-V1.04 发布验收包含后端完整测试、前端单元测试、Playwright、Ruff、mypy、
+V1.04.1 发布验收包含后端完整测试、前端单元测试、Playwright、Ruff、mypy、
 ESLint、TypeScript/Vite、固定上游端口校验和 workflow smoke；本地资源未准备时，
 资源 smoke 会明确报告 blocked_resource，而不会以 mock 或其他资源替代。
+
+基础 Python 发行包还会验证 `get-pip.py` 存在、第三方依赖目录未被误打包、旧运行时
+marker 已被清除。`setup.bat` 和 `start.bat` 都按 pip 的实际可用状态执行引导。

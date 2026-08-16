@@ -94,6 +94,8 @@ Tagger2 Inference Rebuild 将本地 Caption 模型、在线视觉模型、多供
 
 发行包内置基础 Python 3.12 运行时和已经构建的前端，不要求目标电脑预装 Python 或 Node.js。首次安装机器学习依赖需要联网，下载量可能达到数 GB。
 
+V1.04.1 起，`setup.bat` 会检查 pip 是否真正可用，并在基础运行时中自动执行随包附带的 pip 引导；`start.bat` 也提供相同兜底。首次部署不需要手动安装 pip。
+
 > [!TIP]
 > `start.bat` 会通过 `nvidia-smi` 自动选择 CUDA 或 CPU 依赖。需要强制使用 CPU 时，可先在命令提示符中执行：
 >
@@ -602,8 +604,9 @@ Tagger2_Inference_Rebuild2/
 - [Dataset Workflow 路径操作说明](docs/workflow_manual_paths.md)
 - [固定上游兼容性报告](docs/workflow_compatibility_report.md)
 - [发行包内容与资源指纹](docs/release_package_contents.md)
-- [V1.04 发行说明](docs/V1.04_RELEASE_NOTES.md)
-- [V1.04 Release](https://github.com/nzs234/Tagger2_Inference_Rebuild2/releases/tag/V1.04)
+- [V1.04.1 部署修复说明](docs/V1.04.1_RELEASE_NOTES.md)
+- [V1.04 图像生成功能说明](docs/V1.04_RELEASE_NOTES.md)
+- [最新 Release](https://github.com/nzs234/Tagger2_Inference_Rebuild2/releases/latest)
 - [提交问题](https://github.com/nzs234/Tagger2_Inference_Rebuild2/issues)
 
 问题报告请尽量附带版本、`VERSION.txt` 中的 source commit、复现步骤、稳定错误码和已脱敏日志。不要在 Issue 中上传 API Key、访问 Token、私人图片、绝对数据路径或完整任务数据库。

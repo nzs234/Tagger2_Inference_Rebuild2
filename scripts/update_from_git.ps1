@@ -62,7 +62,7 @@ $script:GitExecutable = $git.Source
 
 $workTree = Invoke-GitCommand -Arguments @("rev-parse", "--is-inside-work-tree")
 if ($workTree.ExitCode -ne 0 -or ($workTree.Output -join "").Trim() -ne "true") {
-  throw "This folder is not a Git checkout. Download the latest V1.04 package from GitHub Releases instead."
+  throw "This folder is not a Git checkout. Download the latest V1.04.1 package from GitHub Releases instead."
 }
 
 $remoteNames = Require-GitSuccess -Arguments @("remote") -FailureMessage "Could not read Git remotes."
