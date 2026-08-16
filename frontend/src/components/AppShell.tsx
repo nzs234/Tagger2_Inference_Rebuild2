@@ -1,5 +1,5 @@
 import { useQuery } from '@tanstack/react-query'
-import { Activity, Boxes, ChevronLeft, ChevronRight, Clapperboard, Cpu, Database, Menu, MonitorCog, Moon, Network, PanelLeftClose, Settings, Sun, Tags, Workflow, X } from 'lucide-react'
+import { Activity, Boxes, ChevronLeft, ChevronRight, Clapperboard, Cpu, Database, ImagePlus, Menu, MonitorCog, Moon, Network, PanelLeftClose, Settings, Sun, Tags, Workflow, X } from 'lucide-react'
 import { useEffect, useMemo, useRef } from 'react'
 import { api } from '../lib/api'
 import { usePreferences } from '../store/app'
@@ -13,6 +13,7 @@ const navGroups: Array<{ label: string; items: NavItem[] }> = [
     label: '创作与处理',
     items: [
       { id: 'workbench', label: '工作台', icon: Tags, hint: '单图与快速队列' },
+      { id: 'image-generation', label: '图像生成', icon: ImagePlus, hint: 'Grok、Nano Banana 与 GPT Image' },
       { id: 'video-prompts', label: '视频提示词', icon: Clapperboard, hint: '图生视频提示词工作区' },
       { id: 'batch', label: '批量任务', icon: Database, hint: '目录扫描与历史' },
       { id: 'dataset-workflow', label: '数据集工作流', icon: Workflow, hint: '事务化标注流水线' },

@@ -20,6 +20,7 @@ from ..security import SecurityError, validate_provider_url
 class ProviderKind(str, Enum):
     CUSTOM = "custom"
     GEMINI = "gemini"
+    XAI = "xai"
     OPENAI = "openai"
     CLAUDE = "claude"
     LM_STUDIO = "lm_studio"
@@ -127,6 +128,7 @@ class ProviderConfig:
                 ProviderKind.GEMINI: ProviderProtocol.GEMINI,
                 ProviderKind.ANTIGRAVITY: ProviderProtocol.GEMINI,
                 ProviderKind.CLAUDE: ProviderProtocol.CLAUDE,
+                ProviderKind.XAI: ProviderProtocol.OPENAI,
             }.get(self.kind, ProviderProtocol.OPENAI)
         self.base_url = validate_base_url(self.base_url, allow_local=self.allow_local)
         self.model = str(self.model).strip()

@@ -70,6 +70,7 @@ class ItemStatus(str, Enum):
 class ProviderKind(str, Enum):
     CUSTOM = "custom"
     GEMINI = "gemini"
+    XAI = "xai"
     OPENAI = "openai"
     CLAUDE = "claude"
     LM_STUDIO = "lm_studio"

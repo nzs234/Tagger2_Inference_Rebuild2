@@ -12,8 +12,8 @@
 
 ---
 
-Tagger2 Inference Rebuild 将本地 Caption 模型、在线视觉模型、单图工作台、批量任务、
-LSE14 美学评分、视频提示词和事务化数据集处理整合在一个 FastAPI + React 应用中。
+Tagger2 Inference Rebuild 将本地 Caption 模型、在线视觉模型、多供应商图像生成、单图工作台、
+批量任务、LSE14 美学评分、视频提示词和事务化数据集处理整合在一个 FastAPI + React 应用中。
 
 项目以“本地数据默认留在本机”为基础：只有显式启用在线 Provider 或 NL 阶段时，才会向配置的远程服务发送请求。数据集工作流在真正写入文件前执行预检、人工复核、资源指纹校验和备份，尽量让大规模标注任务可检查、可恢复、可复现。
 
@@ -29,6 +29,7 @@ LSE14 美学评分、视频提示词和事务化数据集处理整合在一个 F
 - [功能一览](#features)
 - [快速开始](#quick-start)
 - [模型与 Provider](#models-and-providers)
+- [图像生成](#image-generation)
 - [数据集工作流](#dataset-workflow)
 - [输出格式](#output-format)
 - [工作流资源](#workflow-resources)
@@ -48,6 +49,7 @@ LSE14 美学评分、视频提示词和事务化数据集处理整合在一个 F
 | --- | --- |
 | 本地优先 | 图片、模型、任务数据库和产物默认保存在本机；在线调用必须由用户显式配置。 |
 | 本地与在线并行 | 工作台和批量任务均支持本地、在线以及本地 + 在线混合模式。 |
+| 多供应商图像生成 | 在同一页面使用 Google Nano Banana、OpenAI GPT Image、xAI Grok Image 或兼容 API，并持久化任务与产物。 |
 | 事务化工作流 | 数据集先导入到任务工作区，完成校验和人工复核后才进入 Export 与 Commit。 |
 | 可复现审阅 | Caption、Classify、Replace、OCR、NL 只生成一次；审阅恢复读取带摘要的不可变 checkpoint。 |
 | 原地更新保护 | `in_place` 模式在首次写入前创建并验证 ZIP64 标注备份，支持幂等恢复。 |
@@ -65,6 +67,7 @@ LSE14 美学评分、视频提示词和事务化数据集处理整合在一个 F
 | 页面 | 主要用途 |
 | --- | --- |
 | 工作台 | 拖入单张或少量图片，独立启用本地和在线通道，查看标签、NL、JSON 与美学评分。 |
+| 图像生成 | 统一使用 Grok、Nano Banana 与 GPT Image 系列，设置模型专属参数，管理参考图、进度、结果与历史。 |
 | 视频提示词 | 根据图片和补充信息生成图生视频提示词，并管理提示词编辑结果。 |
 | 批量任务 | 扫描本机目录，创建持久化的本地、在线或混合打标任务，查看进度和历史。 |
 | 数据集工作流 | 执行 Caption、分类、标签替换、OCR、NL、人工复核、Policy、Token 检查与安全提交。 |
@@ -150,6 +153,7 @@ LSE14 输出包括 1-5 分总体评分与分桶、构图、色彩、敏感内容
 界面内置以下连接预设：
 
 - OpenAI 官方 API
+- xAI / Grok 官方 API
 - Gemini 官方 API
 - Claude 官方 API
 - OpenAI / NewAPI 兼容接口
@@ -161,6 +165,53 @@ API Key 不写入 TOML。Windows 默认通过 Credential Manager 对应的 keyri
 
 > [!WARNING]
 > 启用在线模型、NL 图片输入或远程兼容接口意味着图片或业务 JSON 可能被发送给相应 Provider。请先确认数据授权范围、服务条款和隐私要求。
+
+<a id="image-generation"></a>
+
+## 图像生成
+
+V1.04 将原先独立图像工具的核心工作流重建为 Tagger2 原生页面。它复用“在线模型”中的 Provider、密钥存储与模型发现能力，但使用独立的持久任务数据库和产物目录。旧工具中的明文配置、历史记录和临时文件不会被自动读取或迁移。
+
+### 支持的模型族与路由
+
+| 模型族 | 自动识别示例 | 可用请求风格 | 主要参数 |
+| --- | --- | --- | --- |
+| Google Gemini / Nano Banana | `gemini-3-pro-image`、`gemini-3.1-flash-image`、`gemini-3.1-flash-lite-image`、`gemini-2.5-flash-image` | Gemini native `generateContent`；OpenAI-compatible chat/images | 比例、图像尺寸、参考图、TEXT + IMAGE、System instruction、Temperature、Top P、Top K、并行或 Candidate count |
+| OpenAI GPT Image | 所有 `gpt-image*` 模型 ID | Images generations / edits；兼容 chat | 画布尺寸、质量、背景、输出格式、压缩、审核级别、输入保真度 |
+| xAI Grok Image | `grok-2-image-1212`；其他 Grok 图像模型可显式选择能力族 | Images generations / edits；兼容 chat | 通用数量/响应格式；兼容线路可按能力启用比例、尺寸和质量 |
+| 保守兼容模式 | 未登记的新模型或私有网关模型 | OpenAI images 或 chat | 默认只发送 `model`、`prompt`、`n` 和响应格式等通用字段 |
+
+模型实际是否可用、账户是否有访问权限以及服务端允许的数量仍由 Provider 决定。能力注册表有版本和核验日期；未知模型不会自动收到供应商专属参数。若兼容网关明确支持某一模型族，可在 Provider 设置中显式选择能力族与请求风格。
+
+Gemini 模型显式选择 OpenAI-compatible Chat/Images 风格时，会同时发送兼容工具常用的 `generation_config` 与 `extra_body.google` 图像扩展；native 风格只发送官方 `generationConfig.imageConfig`。这些扩展不会自动发送给未知模型或其他模型族。
+
+### 配置 Provider
+
+1. 打开“在线模型”，新建 OpenAI、xAI、Gemini 或“自定义 API” Provider。
+2. 填写文本/通用 Base URL 和主模型；图像服务使用不同域名时，单独填写“图像 Base URL”。
+3. 打开“启用图像生成”。自动识别不准确时，选择 Gemini / Nano Banana、GPT Image 或 Grok Image 能力族。
+4. 请求风格选择“自动”，或按网关文档指定 Gemini native、Images generation/edit、Chat completions。
+5. 保存后写入 API Key。密钥保存在系统 Credential Manager，不会进入任务 JSON、SQLite 公共字段或浏览器 URL。
+
+### 创建与管理任务
+
+1. 打开“图像生成”，选择 Provider 和模型；模型输入框会复用现有模型发现 API。
+2. 选择文生图或图像编辑，填写提示词；编辑模式至少需要一张参考图。
+3. 设置数量与当前模型公开的参数。高级区域只显示该能力族和请求风格支持的字段。
+4. 提交后可离开页面。任务、attempt、事件、参考图副本和结果均已持久化，刷新页面仍可继续查看。
+5. 失败、部分成功或取消的任务可重试；删除历史会同时删除对应参考图副本和生成产物，并要求二次确认。
+
+多图的“并行请求”会按 Provider 并发上限运行独立 attempt；Gemini 支持时也可使用单次请求的 Candidate count。应用退出时，正在执行的 attempt 会回到可恢复状态；已完整写入并通过 SHA-256 校验的产物不会再次调用 Provider。
+
+### 数据与安全边界
+
+- 独立数据库：`data/image_generation/image_generation.sqlite3`
+- 任务工作区：`data/image_generation/jobs/<job_id>/`
+- 每个任务冻结非敏感 Provider 快照、能力快照和配置 hash；执行前必须再次核对摘要。
+- 参考图和产物保存相对路径、尺寸、MIME 与 SHA-256；内容被修改后下载和恢复都会 fail closed。
+- Provider JSON 响应、Base64 图像和远程图片下载均有字节/像素/边长上限，不依赖 `Content-Length` 才生效。
+- Provider 与产物 URL 禁止自动重定向，并在配置和请求阶段执行 DNS/SSRF 检查。
+- 局域网模式下，图片预览和下载同样通过 Bearer Token 请求，不把令牌写入图片 URL。
 
 <a id="dataset-workflow"></a>
 
@@ -266,7 +317,7 @@ TXT 输出使用与固定上游兼容的 flat caption 规则：跨字段去重�
 
 ## 工作流资源
 
-V1.03 发行包包含默认 e621 工作流所需的非模型资源：
+V1.04 发行包包含默认 e621 工作流所需的非模型资源：
 
 | 类别 | Resource ID | SHA-256 / 状态 |
 | --- | --- | --- |
@@ -467,6 +518,7 @@ CI 会从固定提交检出上游项目，并执行完整后端、前端和 Play
 ```text
 Tagger2_Inference_Rebuild2/
 ├─ backend/tagger2/          FastAPI 服务、模型运行时、任务与安全模块
+│  ├─ image_generation/      多供应商图像请求、能力表、持久任务与产物校验
 │  └─ workflow/              数据集工作流、数据库、stage、review 与 commit
 ├─ backend/tests/            后端单元、集成、恢复、安全和规模测试
 ├─ frontend/src/             React 用户界面
@@ -485,6 +537,8 @@ Tagger2_Inference_Rebuild2/
 ```
 
 工作流使用独立数据库 `data/workflows/workflows.sqlite3`，不会迁移或改写主任务数据库。每个任务的配置、manifest、checkpoint、staging、issue、备份和 commit journal 都保存在独立 job workspace 中。
+
+图像生成同样使用独立数据库和 `data/image_generation/jobs`，不会读取旧图像工具的明文 Provider 配置或历史文件。
 
 <a id="troubleshooting"></a>
 
@@ -508,6 +562,13 @@ Tagger2_Inference_Rebuild2/
 <summary><strong>浏览器打不开页面</strong></summary>
 
 确认启动窗口仍在运行，并访问 `http://127.0.0.1:20000`。如果提示端口 20000 被占用，请关闭旧的 Tagger2 进程，或修改 `config/app.toml` 中的端口。
+
+</details>
+
+<details>
+<summary><strong>图像生成页面没有显示某个参数</strong></summary>
+
+页面按“模型能力族 + 请求风格”投影参数。先检查 Provider 的图像能力族、图像 Base URL 和请求风格；未知模型默认进入保守模式。只有确认兼容网关实现了对应字段后，才应显式选择完整能力族，避免上游因未知参数拒绝请求。
 
 </details>
 
@@ -541,7 +602,8 @@ Tagger2_Inference_Rebuild2/
 - [Dataset Workflow 路径操作说明](docs/workflow_manual_paths.md)
 - [固定上游兼容性报告](docs/workflow_compatibility_report.md)
 - [发行包内容与资源指纹](docs/release_package_contents.md)
-- [V1.03 Release](https://github.com/nzs234/Tagger2_Inference_Rebuild2/releases/tag/V1.03)
+- [V1.04 发行说明](docs/V1.04_RELEASE_NOTES.md)
+- [V1.04 Release](https://github.com/nzs234/Tagger2_Inference_Rebuild2/releases/tag/V1.04)
 - [提交问题](https://github.com/nzs234/Tagger2_Inference_Rebuild2/issues)
 
 问题报告请尽量附带版本、`VERSION.txt` 中的 source commit、复现步骤、稳定错误码和已脱敏日志。不要在 Issue 中上传 API Key、访问 Token、私人图片、绝对数据路径或完整任务数据库。

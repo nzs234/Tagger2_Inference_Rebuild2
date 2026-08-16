@@ -328,6 +328,7 @@ def validate_provider_url(
     *,
     allow_local: bool = False,
     resolve_dns: bool = False,
+    allow_query: bool = False,
 ) -> str:
     """Validate and canonicalise an HTTP provider URL.
 
@@ -342,7 +343,7 @@ def validate_provider_url(
         raise SecurityError("provider URL must use http or https")
     if parsed.username or parsed.password:
         raise SecurityError("provider URL must not contain credentials")
-    if parsed.query:
+    if parsed.query and not allow_query:
         # Credentials in query strings are routinely copied into browser,
         # proxy, and server logs.  Providers receive secrets through the
         # credential store and request headers instead.
@@ -396,18 +397,19 @@ def validate_provider_url(
                 ):
                     local = True
                     break
+    if parsed.query:
+        sensitive_query_keys = {
+            "key",
+            "api_key",
+            "apikey",
+            "access_token",
+            "token",
+            "authorization",
+        }
+        if any(key.casefold() in sensitive_query_keys for key, _ in parse_qsl(parsed.query)):
+            raise SecurityError("provider credentials must not be placed in the URL")
     if local and not allow_local:
         raise SecurityError("local provider URLs require explicit enablement")
-    sensitive_query_keys = {
-        "key",
-        "api_key",
-        "apikey",
-        "access_token",
-        "token",
-        "authorization",
-    }
-    if any(key.casefold() in sensitive_query_keys for key, _ in parse_qsl(parsed.query)):
-        raise SecurityError("provider credentials must not be placed in the URL")
     # Drop fragments (they are never sent to a server) and normalise whitespace
     # without changing path/query semantics used by provider APIs.
     return urlunsplit((parsed.scheme.casefold(), parsed.netloc, parsed.path or "/", parsed.query, ""))

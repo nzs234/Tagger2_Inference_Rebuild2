@@ -1,4 +1,4 @@
-export type AppPage = 'workbench' | 'video-prompts' | 'batch' | 'dataset-workflow' | 'providers' | 'models' | 'settings'
+export type AppPage = 'workbench' | 'image-generation' | 'video-prompts' | 'batch' | 'dataset-workflow' | 'providers' | 'models' | 'settings'
 export type ThemeMode = 'light' | 'dark' | 'system'
 export type JobMode = 'local' | 'online'
 export type JobState =
@@ -172,7 +172,7 @@ export interface ClassifierProfile {
   error?: ClassifierIssue | null
 }
 
-export type ProviderKind = 'custom' | 'gemini' | 'openai' | 'claude' | 'lmstudio' | 'antigravity'
+export type ProviderKind = 'custom' | 'gemini' | 'openai' | 'xai' | 'claude' | 'lmstudio' | 'antigravity'
 export type ProviderProtocol = 'openai' | 'gemini' | 'claude'
 
 export interface ProviderProfile {
@@ -193,6 +193,72 @@ export interface ProviderProfile {
   key_hint?: string | null
   enabled?: boolean
   last_test?: { ok: boolean; message: string; at: string } | null
+  image_enabled?: boolean
+  image_family?: 'auto' | 'google_gemini' | 'openai_gpt_image' | 'xai_grok_image' | 'unknown'
+  image_base_url?: string | null
+  image_api_style?: 'auto' | 'native' | 'openai_images' | 'openai_chat'
+}
+
+export type ImageGenerationFamily = 'google_gemini' | 'openai_gpt_image' | 'xai_grok_image' | 'unknown'
+export type ImageGenerationState = 'queued' | 'running' | 'cancelling' | 'cancelled' | 'succeeded' | 'partial' | 'failed' | 'interrupted' | 'deleting'
+
+export interface ImageGenerationCapability {
+  schema_version: string
+  verified_at: string
+  provider_id?: string
+  api_style?: 'native' | 'openai_images' | 'openai_chat'
+  model: string
+  family: ImageGenerationFamily
+  label: string
+  known: boolean
+  operations: Array<'generate' | 'edit'>
+  parameters: string[]
+  enums: Record<string, string[]>
+  defaults: Record<string, string | number | boolean>
+  max_references: number
+  max_outputs: number
+  source_url?: string
+  notes: string
+}
+
+export interface ImageGenerationArtifact {
+  id: string
+  ordinal: number
+  mime_type: string
+  width?: number | null
+  height?: number | null
+  size_bytes: number
+  sha256: string
+  source: string
+  download_url: string
+}
+
+export interface ImageGenerationJob {
+  id: string
+  state: ImageGenerationState
+  phase: string
+  provider_id: string
+  model: string
+  family: ImageGenerationFamily
+  operation: 'generate' | 'edit'
+  requested_count: number
+  completed_count: number
+  attempt_counts: Record<string, number>
+  config: Record<string, unknown>
+  config_hash: string
+  reference_count: number
+  artifacts: ImageGenerationArtifact[]
+  created_at: string
+  updated_at: string
+  started_at?: string | null
+  finished_at?: string | null
+  error_code?: string | null
+}
+
+export interface ImageGenerationListResponse {
+  items: ImageGenerationJob[]
+  total: number
+  next_cursor?: number | null
 }
 
 export interface RuntimeSettings {

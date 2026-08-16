@@ -12,7 +12,7 @@ import type { ProviderKind, ProviderProfile, ProviderProtocol } from '../types'
 
 const providerSchema = z.object({
   name: z.string().trim().min(1, '请输入名称').max(80),
-  kind: z.enum(['custom', 'openai', 'gemini', 'claude']),
+  kind: z.enum(['custom', 'openai', 'xai', 'gemini', 'claude']),
   protocol: z.enum(['openai', 'gemini', 'claude']),
   base_url: z.string().url('请输入完整的 http/https 地址').refine((value) => /^https?:\/\//i.test(value), '仅支持 http/https'),
   primary_model: z.string().trim().min(1, '请输入主模型'),
@@ -23,6 +23,10 @@ const providerSchema = z.object({
   max_tokens: z.number().int().min(64).max(65536),
   timeout_seconds: z.number().int().min(5).max(600),
   retries: z.number().int().min(0).max(12),
+  image_enabled: z.boolean(),
+  image_family: z.enum(['auto', 'google_gemini', 'openai_gpt_image', 'xai_grok_image', 'unknown']),
+  image_base_url: z.string().url('请输入完整的图像 API 地址').optional().or(z.literal('')),
+  image_api_style: z.enum(['auto', 'native', 'openai_images', 'openai_chat']),
   api_keys: z.string().max(20000, '密钥内容过长').optional(),
   enabled: z.boolean(),
 })
@@ -34,12 +38,13 @@ const presets: Record<ConfigurableProviderKind, Pick<ProviderValues, 'base_url' 
   custom: { base_url: '', primary_model: '' },
   gemini: { base_url: 'https://generativelanguage.googleapis.com/v1beta', primary_model: 'gemini-2.5-flash' },
   openai: { base_url: 'https://api.openai.com/v1', primary_model: 'gpt-4.1-mini' },
+  xai: { base_url: 'https://api.x.ai/v1', primary_model: 'grok-2-image-1212' },
   claude: { base_url: 'https://api.anthropic.com', primary_model: 'claude-sonnet-4-5' },
 }
 
 const defaults: ProviderValues = {
   name: '', kind: 'custom', protocol: 'openai', ...presets.custom, fallback_model: '', temperature: 0.2, top_p: 0.9, top_k: 40,
-  max_tokens: 4096, timeout_seconds: 90, retries: 3, api_keys: '', enabled: true,
+  max_tokens: 4096, timeout_seconds: 90, retries: 3, image_enabled: true, image_family: 'auto', image_base_url: '', image_api_style: 'auto', api_keys: '', enabled: true,
 }
 
 export function Providers() {
@@ -164,14 +169,14 @@ export function Providers() {
       name: provider.name, kind, protocol, base_url: provider.base_url, primary_model: provider.primary_model,
       fallback_model: provider.fallback_model ?? '', temperature: provider.temperature, top_p: provider.top_p,
       top_k: provider.top_k ?? undefined, max_tokens: provider.max_tokens, timeout_seconds: provider.timeout_seconds,
-      retries: provider.retries, api_keys: '', enabled: provider.enabled !== false,
+      retries: provider.retries, image_enabled: provider.image_enabled !== false, image_family: provider.image_family ?? 'auto', image_base_url: provider.image_base_url ?? '', image_api_style: provider.image_api_style ?? 'auto', api_keys: '', enabled: provider.enabled !== false,
     })
     setShowForm(true)
   }
 
   const applyPreset = (kind: ConfigurableProviderKind) => {
     form.setValue('kind', kind)
-    form.setValue('protocol', kind === 'custom' ? form.getValues('protocol') : kind)
+    form.setValue('protocol', kind === 'custom' ? form.getValues('protocol') : kind === 'gemini' ? 'gemini' : kind === 'claude' ? 'claude' : 'openai')
     form.setValue('base_url', presets[kind].base_url, { shouldValidate: false, shouldDirty: true })
     form.setValue('primary_model', presets[kind].primary_model, { shouldDirty: true })
     if (!form.getValues('name')) form.setValue('name', providerKindName(kind))
@@ -231,10 +236,10 @@ export function Providers() {
     {showForm && <DialogLayer onClose={() => setShowForm(false)}><aside className="drawer" role="dialog" aria-modal="true" aria-labelledby="provider-form-title">
       <header className="drawer-header"><div><p className="eyebrow">PROVIDER PROFILE</p><h2 id="provider-form-title">{editingId ? '编辑 Provider' : '添加 Provider'}</h2></div><IconButton label="关闭" onClick={() => setShowForm(false)}><X size={18} /></IconButton></header>
       <form className="drawer-body" onSubmit={form.handleSubmit((values) => saveMutation.mutate(values))}>
-        <div className="provider-preset-grid">{(['custom', 'openai', 'gemini', 'claude'] as ConfigurableProviderKind[]).map((kind) => <button type="button" key={kind} className={selectedKind === kind ? 'preset-active' : ''} onClick={() => applyPreset(kind)}><ProviderIcon kind={kind} /><span>{providerKindName(kind)}</span></button>)}</div>
+        <div className="provider-preset-grid">{(['custom', 'openai', 'xai', 'gemini', 'claude'] as ConfigurableProviderKind[]).map((kind) => <button type="button" key={kind} className={selectedKind === kind ? 'preset-active' : ''} onClick={() => applyPreset(kind)}><ProviderIcon kind={kind} /><span>{providerKindName(kind)}</span></button>)}</div>
         <div className="form-grid two-columns">
           <Field label="名称" error={form.formState.errors.name?.message}><input {...form.register('name')} placeholder="例如 Gemini 主账号" /></Field>
-          <Field label="连接类型"><select {...form.register('kind')} onChange={(event) => applyPreset(event.target.value as ConfigurableProviderKind)}><option value="custom">自定义 API</option><option value="openai">OpenAI 官方</option><option value="gemini">Gemini 官方</option><option value="claude">Claude 官方</option></select></Field>
+          <Field label="连接类型"><select {...form.register('kind')} onChange={(event) => applyPreset(event.target.value as ConfigurableProviderKind)}><option value="custom">自定义 API</option><option value="openai">OpenAI 官方</option><option value="xai">xAI / Grok 官方</option><option value="gemini">Gemini 官方</option><option value="claude">Claude 官方</option></select></Field>
           {selectedKind === 'custom' && <div className="field-span-2"><Field label="兼容协议" hint="选择网关实际兼容的请求格式"><select {...form.register('protocol')}><option value="openai">OpenAI / NewAPI 兼容</option><option value="gemini">Gemini generateContent 兼容</option><option value="claude">Claude Messages 兼容</option></select></Field></div>}
           <div className="field-span-2"><Field label="Base URL" error={form.formState.errors.base_url?.message}><input {...form.register('base_url')} spellCheck={false} /></Field></div>
           <div className="provider-primary-control"><Field label="主模型" error={form.formState.errors.primary_model?.message}><input {...form.register('primary_model')} /></Field><Button type="button" size="sm" variant="secondary" icon={editingDiscoveryPending ? <LoaderCircle className="spin" size={14} /> : <RefreshCw size={14} />} disabled={!formBaseUrl?.trim() || editingDiscoveryPending} title={formBaseUrl?.trim() ? '从 Provider 获取可用模型' : '请先填写 Base URL'} onClick={discoverFromForm}>获取可用模型</Button></div>
@@ -253,6 +258,13 @@ export function Providers() {
           <Field label="超时（秒）"><input type="number" {...form.register('timeout_seconds', { valueAsNumber: true })} /></Field>
           <Field label="重试次数"><input type="number" {...form.register('retries', { valueAsNumber: true })} /></Field>
           <Field label="启用"><label className="toggle standalone"><input type="checkbox" {...form.register('enabled')} /><span />接收新任务</label></Field>
+        </div>
+        <div className="form-divider"><span>图像生成</span></div>
+        <div className="form-grid two-columns">
+          <Field label="启用图像生成"><label className="toggle standalone"><input type="checkbox" {...form.register('image_enabled')} /><span />允许图像任务使用此 Provider</label></Field>
+          <Field label="图像能力族"><select {...form.register('image_family')}><option value="auto">自动识别</option><option value="google_gemini">Gemini / Nano Banana</option><option value="openai_gpt_image">GPT Image</option><option value="xai_grok_image">Grok Image</option><option value="unknown">保守兼容</option></select></Field>
+          <Field label="图像 Base URL" hint="留空则复用普通 Base URL"><input {...form.register('image_base_url')} spellCheck={false} placeholder="可选的图像端点地址" /></Field>
+          <Field label="图像请求风格"><select {...form.register('image_api_style')}><option value="auto">自动</option><option value="native">Gemini native</option><option value="openai_images">Images generation/edit</option><option value="openai_chat">Chat completions</option></select></Field>
         </div>
         <div className="drawer-actions">{editingId && <Button type="button" variant="danger" icon={<Trash2 size={15} />} disabled={deleteMutation.isPending} onClick={() => { const provider = providerQuery.data?.items.find((item) => item.id === editingId); if (provider) requestDelete(provider) }}>删除</Button>}<span className="drawer-actions-spacer" /><Button type="button" variant="secondary" onClick={() => setShowForm(false)}>取消</Button><Button type="submit" icon={saveMutation.isPending ? <LoaderCircle size={15} className="spin" /> : <Save size={15} />} disabled={saveMutation.isPending}>{editingId ? '保存修改' : '创建 Provider'}</Button></div>
       </form>
@@ -276,7 +288,7 @@ export function Providers() {
 }
 
 function providerKindName(kind: ProviderKind): string {
-  return { custom: '自定义 API', gemini: 'Gemini 官方', openai: 'OpenAI 官方', claude: 'Claude 官方', lmstudio: 'LM Studio（兼容）', antigravity: 'Antigravity（兼容）' }[kind]
+  return { custom: '自定义 API', gemini: 'Gemini 官方', openai: 'OpenAI 官方', xai: 'xAI / Grok', claude: 'Claude 官方', lmstudio: 'LM Studio（兼容）', antigravity: 'Antigravity（兼容）' }[kind]
 }
 function maskedUrl(url: string): string {
   try { const parsed = new URL(url); return `${parsed.protocol}//${parsed.host}` } catch { return '地址不可用' }
@@ -285,5 +297,5 @@ function parseApiKeys(value?: string): string[] {
   return Array.from(new Set((value ?? '').split(/\r?\n|,/).map((key) => key.trim()).filter(Boolean)))
 }
 function ProviderIcon({ kind }: { kind: ProviderKind }) {
-  return kind === 'custom' || kind === 'lmstudio' || kind === 'antigravity' ? <Braces size={17} /> : kind === 'gemini' ? <Sparkles size={17} /> : kind === 'openai' ? <Bot size={17} /> : <Cloud size={17} />
+  return kind === 'custom' || kind === 'lmstudio' || kind === 'antigravity' ? <Braces size={17} /> : kind === 'gemini' || kind === 'xai' ? <Sparkles size={17} /> : kind === 'openai' ? <Bot size={17} /> : <Cloud size={17} />
 }

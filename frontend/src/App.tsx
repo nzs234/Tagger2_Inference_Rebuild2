@@ -5,6 +5,7 @@ import { Button } from './components/ui'
 import { usePreferences } from './store/app'
 
 const Workbench = lazy(() => import('./pages/Workbench').then((module) => ({ default: module.Workbench })))
+const ImageGeneration = lazy(() => import('./pages/ImageGeneration').then((module) => ({ default: module.ImageGeneration })))
 const VideoPrompts = lazy(() => import('./pages/VideoPrompts').then((module) => ({ default: module.VideoPrompts })))
 const BatchJobs = lazy(() => import('./pages/BatchJobs').then((module) => ({ default: module.BatchJobs })))
 const DatasetWorkflow = lazy(() => import('./pages/DatasetWorkflow').then((module) => ({ default: module.DatasetWorkflow })))
@@ -16,6 +17,7 @@ export default function App() {
   const page = usePreferences((state) => state.page)
   return <ErrorBoundary><AppShell><Suspense fallback={<div className="page-loading"><LoaderCircle className="spin" size={23} /><span>正在打开工作区…</span></div>}>
     {page === 'workbench' && <Workbench />}
+    {page === 'image-generation' && <ImageGeneration />}
     {page === 'video-prompts' && <VideoPrompts />}
     {page === 'batch' && <BatchJobs />}
     {page === 'dataset-workflow' && <DatasetWorkflow />}

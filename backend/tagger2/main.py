@@ -74,6 +74,8 @@ from .tag_output import format_local_tags
 from .workflow.api import create_workflow_router
 from .workflow.db import WorkflowDatabase
 from .workflow.resources import WorkflowResourceCatalog
+from .image_generation import ImageGenerationService
+from .image_generation.api import create_image_generation_router
 from .video_prompts import (
     build_video_prompt_system_prompt,
     build_video_prompt_user_message,
@@ -176,6 +178,10 @@ class ProviderCreate(APIModel):
     max_tokens: int = Field(default=8192, ge=1, le=131072)
     timeout_seconds: float = Field(default=120, gt=0, le=900)
     retries: int = Field(default=2, ge=0, le=10)
+    image_enabled: bool = True
+    image_family: str = Field(default="auto", pattern=r"^(auto|google_gemini|openai_gpt_image|xai_grok_image|unknown)$")
+    image_base_url: str | None = Field(default=None, max_length=2048)
+    image_api_style: str = Field(default="auto", pattern=r"^(auto|native|openai_images|openai_chat)$")
     enabled: bool = True
 
 
@@ -192,6 +198,10 @@ class ProviderPatch(APIModel):
     max_tokens: int | None = Field(default=None, ge=1, le=131072)
     timeout_seconds: float | None = Field(default=None, gt=0, le=900)
     retries: int | None = Field(default=None, ge=0, le=10)
+    image_enabled: bool | None = None
+    image_family: str | None = Field(default=None, pattern=r"^(auto|google_gemini|openai_gpt_image|xai_grok_image|unknown)$")
+    image_base_url: str | None = Field(default=None, max_length=2048)
+    image_api_style: str | None = Field(default=None, pattern=r"^(auto|native|openai_images|openai_chat)$")
     enabled: bool | None = None
 
 
@@ -471,6 +481,11 @@ class Runtime:
         self._load_upload_index()
         self._load_provider_profiles()
         self._ensure_default_providers()
+        self.image_generation = ImageGenerationService(
+            settings,
+            provider_profiles=self.storage.get_provider_profile,
+            secrets=self.secrets,
+        )
         self.job_manager = JobManager(self.storage)
         self.job_manager.register_processor("local", self.local_processor)
         self.job_manager.register_batch_processor("local", self.local_batch_processor)
@@ -1678,6 +1693,10 @@ class Runtime:
             cfg.pop("concurrency", None)
             cfg["max_concurrency"] = cfg.get("max_concurrency", 3)
             cfg["max_retries"] = cfg.pop("retries", cfg.get("max_retries", 2))
+            # Image-generation routing is handled by its dedicated adapter;
+            # the text provider must not receive these profile-only fields.
+            for image_key in ("image_enabled", "image_family", "image_base_url", "image_api_style"):
+                cfg.pop(image_key, None)
             cfg["allow_local"] = bool(profile.get("kind") in {"lm_studio", "antigravity"} or self.settings.allow_local_providers)
             secret_ref = (
                 (stored_profile or {}).get("secret_ref")
@@ -1707,6 +1726,7 @@ class Runtime:
             await instance.aclose()
 
     async def close(self) -> None:
+        await self.image_generation.close()
         await self.job_manager.shutdown()
         await self.model_downloads.close()
         for provider in list(self.providers.values()):
@@ -1740,6 +1760,10 @@ def _provider_public(runtime: Runtime, profile: Mapping[str, Any]) -> dict[str, 
         "max_tokens": cfg.get("max_tokens", 8192),
         "timeout_seconds": cfg.get("timeout_seconds", 120),
         "retries": cfg.get("retries", 2),
+        "image_enabled": bool(cfg.get("image_enabled", True)),
+        "image_family": cfg.get("image_family", "auto"),
+        "image_base_url": cfg.get("image_base_url") or None,
+        "image_api_style": cfg.get("image_api_style", "auto"),
         "configured": bool(meta.get("configured")),
         "key_hint": meta.get("key_suffix"),
         "enabled": bool(profile.get("enabled", True)),
@@ -1781,6 +1805,7 @@ def create_app(settings: AppConfig | None = None) -> FastAPI:
         # operator can explicitly recover them; review/paused states remain
         # durable operator decisions.
         runtime.workflow_database.mark_interrupted_jobs()
+        await runtime.image_generation.start()
         yield
         await runtime.close()
 
@@ -2258,7 +2283,7 @@ def create_app(settings: AppConfig | None = None) -> FastAPI:
     @app.post("/api/v1/providers")
     async def create_provider_route(payload: ProviderCreate, _: None = Depends(authorize)):
         kind = payload.kind.replace("lmstudio", "lm_studio").strip().lower()
-        if kind not in {"custom", "openai", "gemini", "claude", "lm_studio", "antigravity"}:
+        if kind not in {"custom", "openai", "xai", "gemini", "claude", "lm_studio", "antigravity"}:
             raise _safe_error("不支持的 provider 类型", "invalid_provider_kind")
         protocol = (payload.protocol or "openai").strip().lower()
         if kind != "custom":
@@ -2274,10 +2299,21 @@ def create_app(settings: AppConfig | None = None) -> FastAPI:
             )
         except SecurityError as exc:
             raise _safe_error(str(exc), "invalid_provider_url")
+        image_base = payload.image_base_url
+        if image_base:
+            try:
+                image_base = validate_provider_url(
+                    image_base,
+                    allow_local=allow_local,
+                    resolve_dns=True,
+                )
+            except SecurityError as exc:
+                raise _safe_error(str(exc), "invalid_image_provider_url")
         pid = re.sub(r"[^a-z0-9_-]+", "-", payload.name.casefold()).strip("-") or uuid.uuid4().hex[:8]
         if pid in runtime.provider_configs:
             pid = f"{pid}-{uuid.uuid4().hex[:6]}"
         config = payload.model_dump(exclude={"name", "kind", "base_url", "enabled", "protocol"})
+        config["image_base_url"] = image_base
         config["protocol"] = protocol
         profile = runtime.storage.upsert_provider_profile(pid, name=payload.name, kind=kind, base_url=base, config=config, secret_ref=f"provider_{pid}", enabled=payload.enabled)
         runtime.provider_configs[pid] = profile
@@ -2291,7 +2327,7 @@ def create_app(settings: AppConfig | None = None) -> FastAPI:
         body = payload.model_dump(exclude_unset=True)
         requested_kind = body.pop("kind", None)
         kind = str(requested_kind or current.get("kind")).replace("lmstudio", "lm_studio").strip().lower()
-        if kind not in {"custom", "openai", "gemini", "claude", "lm_studio", "antigravity"}:
+        if kind not in {"custom", "openai", "xai", "gemini", "claude", "lm_studio", "antigravity"}:
             raise _safe_error("不支持的 provider 类型", "invalid_provider_kind")
         requested_protocol = body.pop("protocol", None)
         protocol = str(requested_protocol or (current.get("config") or {}).get("protocol") or "openai").strip().lower()
@@ -2314,7 +2350,24 @@ def create_app(settings: AppConfig | None = None) -> FastAPI:
         mapping = {"primary_model": "primary_model", "fallback_model": "fallback_model", "temperature": "temperature", "top_p": "top_p", "top_k": "top_k", "max_tokens": "max_tokens", "timeout_seconds": "timeout_seconds", "retries": "retries"}
         name = body.pop("name", current.get("name"))
         enabled = body.pop("enabled", current.get("enabled", True))
+        if "image_base_url" in body:
+            image_base = body.pop("image_base_url")
+            if image_base:
+                try:
+                    image_base = validate_provider_url(
+                        str(image_base),
+                        allow_local=kind in {"lm_studio", "antigravity"} or runtime.settings.allow_local_providers,
+                        resolve_dns=True,
+                    )
+                except SecurityError as exc:
+                    raise _safe_error(str(exc), "invalid_image_provider_url")
+                config["image_base_url"] = image_base
+            else:
+                config.pop("image_base_url", None)
         config.update({mapping[key]: value for key, value in body.items() if key in mapping})
+        for key in ("image_enabled", "image_family", "image_api_style"):
+            if key in body and body[key] is not None:
+                config[key] = body[key]
         profile = runtime.storage.upsert_provider_profile(provider_id, name=name, kind=kind, base_url=base, config=config, secret_ref=current.get("secret_ref"), enabled=enabled)
         runtime.provider_configs[provider_id] = profile
         await runtime.invalidate_provider(provider_id)
@@ -2389,7 +2442,7 @@ def create_app(settings: AppConfig | None = None) -> FastAPI:
         _: None = Depends(authorize),
     ):
         kind = payload.kind.replace("lmstudio", "lm_studio").strip().lower()
-        if kind not in {"custom", "openai", "gemini", "claude", "lm_studio", "antigravity"}:
+        if kind not in {"custom", "openai", "xai", "gemini", "claude", "lm_studio", "antigravity"}:
             raise _safe_error("不支持的 provider 类型", "invalid_provider_kind")
         protocol = (payload.protocol or "openai").strip().lower()
         if kind != "custom":
@@ -2751,6 +2804,10 @@ def create_app(settings: AppConfig | None = None) -> FastAPI:
             storage=runtime.storage,
             root_registrar=runtime.register_persistent_root,
         ),
+        dependencies=[Depends(authorize)],
+    )
+    app.include_router(
+        create_image_generation_router(runtime.image_generation),
         dependencies=[Depends(authorize)],
     )
 

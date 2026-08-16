@@ -83,10 +83,12 @@ export function StatusBadge({ state }: { state: JobState | QueueState | string }
     cancelling: '取消中',
     cancelled: '已取消',
     succeeded: '成功',
+    partial: '部分完成',
     failed: '失败',
     interrupted: '已中断',
+    deleting: '清理中',
   }
-  const icon = ['running', 'uploading', 'processing', 'queued', 'cancelling', 'committing', 'pausing', 'restoring'].includes(state)
+  const icon = ['running', 'uploading', 'processing', 'queued', 'cancelling', 'committing', 'pausing', 'restoring', 'deleting'].includes(state)
     ? <LoaderCircle size={13} className="spin" aria-hidden="true" />
     : ['done', 'succeeded', 'completed'].includes(state)
       ? <Check size={13} aria-hidden="true" />

@@ -34,6 +34,9 @@
   Fl2vaSingleImageRole,
   VideoPromptMode,
   VideoPromptPackage,
+  ImageGenerationCapability,
+  ImageGenerationJob,
+  ImageGenerationListResponse,
 } from '../types'
 
 export const API_BASE = (import.meta.env.VITE_API_BASE_URL || '/api/v1').replace(/\/$/, '')
@@ -97,6 +100,24 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
 
   if (response.status === 204) return undefined as T
   return (await response.json()) as T
+}
+
+async function requestBlob(path: string): Promise<Blob> {
+  const headers = new Headers(authHeaders())
+  const response = await fetch(`${API_BASE}${path}`, { headers })
+  if (!response.ok) {
+    let body: Record<string, unknown> = {}
+    try { body = await response.json() as Record<string, unknown> } catch { /* proxy error */ }
+    const detail = body.detail && typeof body.detail === 'object' ? body.detail as Record<string, unknown> : undefined
+    const message = typeof body.message === 'string'
+      ? body.message
+      : typeof detail?.message === 'string'
+        ? detail.message
+        : `请求失败 (${response.status})`
+    const code = typeof body.code === 'string' ? body.code : typeof detail?.code === 'string' ? detail.code : 'request_failed'
+    throw new ApiError(message, response.status, code, response.headers.get('x-request-id') ?? undefined)
+  }
+  return response.blob()
 }
 
 export const api = {
@@ -165,6 +186,32 @@ export const api = {
     }),
   providerModels: (id: string) =>
     request<{ items: Array<{ id: string; name?: string }> }>(`/providers/${encodeURIComponent(id)}/models`),
+  imageCapabilities: (providerId?: string, model?: string) => {
+    const query = new URLSearchParams()
+    if (providerId) query.set('provider_id', providerId)
+    if (model) query.set('model', model)
+    const suffix = query.toString() ? `?${query.toString()}` : ''
+    return request<ImageGenerationCapability | { schema_version: string; families: ImageGenerationCapability[] }>(`/image-generation/capabilities${suffix}`)
+  },
+  createImageGenerationJob: async (config: Record<string, unknown>, references: File[]) => {
+    const form = new FormData()
+    form.append('config', JSON.stringify(config))
+    references.forEach((file) => form.append('references', file, file.name))
+    return request<ImageGenerationJob>('/image-generation/jobs', { method: 'POST', body: form })
+  },
+  imageGenerationJobs: (params: { cursor?: number; limit?: number; q?: string; state?: string } = {}) => {
+    const query = new URLSearchParams()
+    query.set('limit', String(params.limit ?? 50))
+    if (params.cursor) query.set('cursor', String(params.cursor))
+    if (params.q) query.set('q', params.q)
+    if (params.state) query.set('state', params.state)
+    return request<ImageGenerationListResponse>(`/image-generation/jobs?${query.toString()}`)
+  },
+  imageGenerationJob: (id: string) => request<ImageGenerationJob>(`/image-generation/jobs/${encodeURIComponent(id)}`),
+  imageGenerationArtifact: (id: string) => requestBlob(`/image-generation/artifacts/${encodeURIComponent(id)}`),
+  cancelImageGenerationJob: (id: string) => request<ImageGenerationJob>(`/image-generation/jobs/${encodeURIComponent(id)}/cancel`, { method: 'POST', body: '{}' }),
+  retryImageGenerationJob: (id: string) => request<ImageGenerationJob>(`/image-generation/jobs/${encodeURIComponent(id)}/retry`, { method: 'POST', body: '{}' }),
+  deleteImageGenerationJob: (id: string) => request<void>(`/image-generation/jobs/${encodeURIComponent(id)}`, { method: 'DELETE' }),
   discoverProviderModels: (body: {
     kind: ProviderKind
     protocol: ProviderProtocol

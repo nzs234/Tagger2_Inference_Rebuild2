@@ -82,6 +82,22 @@ describe('API client', () => {
     expect(new Headers(init.headers).get('Authorization')).toBe('Bearer session-secret')
   })
 
+  it('downloads image artifacts with the same bearer-token policy', async () => {
+    sessionStorage.setItem('tagger2_access_token', 'artifact-secret')
+    const fetchMock = vi.fn().mockResolvedValue(new Response(
+      new Blob(['image-bytes'], { type: 'image/png' }),
+      { status: 200, headers: { 'content-type': 'image/png' } },
+    ))
+    vi.stubGlobal('fetch', fetchMock)
+
+    const result = await api.imageGenerationArtifact('artifact-1')
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit]
+    expect(url).toContain('/image-generation/artifacts/artifact-1')
+    expect(url).not.toContain('artifact-secret')
+    expect(new Headers(init.headers).get('Authorization')).toBe('Bearer artifact-secret')
+    expect(result.type).toBe('image/png')
+  })
+
   it('submits H3 Ref2VA generation as multipart data without an upload job', async () => {
     const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify(packageResult), { status: 200 }))
     vi.stubGlobal('fetch', fetchMock)

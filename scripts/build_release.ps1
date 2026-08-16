@@ -1,6 +1,6 @@
 param(
   [string]$OutputDir = "dist",
-  [string]$Version = "V1.03",
+  [string]$Version = "V1.04",
   [string]$UpstreamSourceRoot = $env:TAGGER2_UPSTREAM_SOURCE_ROOT,
   [switch]$SkipRuntime,
   [switch]$BaseRuntimeOnly,
@@ -80,15 +80,37 @@ foreach ($candidate in $gateCandidates) {
 if (-not $gatePython) {
   throw "No Python interpreter with pytest is available for the release gates"
 }
-Write-Host "Running fixed-source and workflow release gates..."
-& $gatePython -m pytest backend/tests/test_workflow_ports.py backend/tests/test_workflow_e2e.py backend/tests/test_workflow_review_checkpoint.py -q
-if ($LASTEXITCODE -ne 0) { throw "Workflow release gate failed with exit code $LASTEXITCODE" }
+$staticPython = $null
+foreach ($candidate in $gateCandidates) {
+  if (-not (Test-Path -LiteralPath $candidate -PathType Leaf)) {
+    continue
+  }
+  & $candidate -c "import mypy, ruff" *> $null
+  if ($LASTEXITCODE -eq 0) {
+    $staticPython = $candidate
+    break
+  }
+}
+if (-not $staticPython) {
+  throw "No Python interpreter with Ruff and mypy is available for the release gates"
+}
+Write-Host "Running complete backend release gates..."
+& $gatePython -m pytest backend/tests -q
+if ($LASTEXITCODE -ne 0) { throw "Backend test gate failed with exit code $LASTEXITCODE" }
+& $staticPython -m ruff check backend scripts
+if ($LASTEXITCODE -ne 0) { throw "Ruff gate failed with exit code $LASTEXITCODE" }
+& $staticPython -m mypy backend scripts
+if ($LASTEXITCODE -ne 0) { throw "mypy gate failed with exit code $LASTEXITCODE" }
 Push-Location (Join-Path $root "frontend")
 try {
+  npm test
+  if ($LASTEXITCODE -ne 0) { throw "Frontend unit-test gate failed with exit code $LASTEXITCODE" }
   npm run lint
   if ($LASTEXITCODE -ne 0) { throw "Frontend lint gate failed with exit code $LASTEXITCODE" }
   npm run build
   if ($LASTEXITCODE -ne 0) { throw "Frontend build gate failed with exit code $LASTEXITCODE" }
+  npm run test:e2e
+  if ($LASTEXITCODE -ne 0) { throw "Playwright gate failed with exit code $LASTEXITCODE" }
 } finally {
   Pop-Location
 }
@@ -125,11 +147,18 @@ try {
     source_commit = $sourceCommit
     upstream_commit = $upstreamCommit
     checks = @(
+      "backend_tests",
+      "ruff",
+      "mypy",
       "workflow_upstream_port",
       "workflow_e2e",
       "workflow_review_checkpoint",
+      "frontend_tests",
       "frontend_lint",
-      "frontend_build"
+      "frontend_build",
+      "playwright",
+      "release_health_smoke",
+      "release_image_capability_smoke"
     )
   } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $stage "VALIDATION_REPORT.json") -Encoding utf8
 
@@ -168,6 +197,7 @@ try {
     "update.bat",
     "USER_GUIDE_zh-CN.txt",
     "README.md",
+    "docs/V1.04_RELEASE_NOTES.md",
     "docs/release_package_contents.md",
     "docs/workflow_manual_paths.md",
     "docs/workflow_compatibility_report.md"
@@ -315,7 +345,7 @@ try {
     $env:TAGGER2_PROJECT_ROOT = $smoke
     Push-Location $smoke
     try {
-      & $python -c "from fastapi.testclient import TestClient; from tagger2.main import app; c=TestClient(app); r=c.get('/api/v1/health'); assert r.status_code == 200, (r.status_code, r.text); print('release smoke: health 200')"
+      & $python -c "from fastapi.testclient import TestClient; from tagger2.main import app; c=TestClient(app); r=c.get('/api/v1/health'); assert r.status_code == 200, (r.status_code, r.text); image=c.get('/api/v1/image-generation/capabilities'); assert image.status_code == 200, (image.status_code, image.text); assert image.json().get('schema_version') == 'image-capabilities-v1'; print('release smoke: health and image capabilities 200')"
       if ($LASTEXITCODE -ne 0) { throw "Release smoke test failed with exit code $LASTEXITCODE" }
     } finally {
       Pop-Location

@@ -1,7 +1,7 @@
 import { expect, test, type Page } from '@playwright/test'
 import path from 'node:path'
 
-const pages = ['工作台', '视频提示词', '批量任务', '数据集工作流', '在线模型', '本地模型', '设置'] as const
+const pages = ['工作台', '图像生成', '视频提示词', '批量任务', '数据集工作流', '在线模型', '本地模型', '设置'] as const
 
 test.beforeEach(async ({ page }) => {
   await mockApi(page)
@@ -119,6 +119,26 @@ test('video prompt desk generates, restores, and clears in-memory revisions', as
   await expect(page.getByText('integrated_multimodal_description', { exact: true })).toBeVisible()
   expect(payloads.at(-1)).toContain('fl2va')
   expect(payloads.at(-1)?.match(/name="images"/g)).toHaveLength(2)
+  await expectNoHorizontalOverflow(page)
+})
+
+test('image generation desk creates and follows a durable job', async ({ page }) => {
+  await page.goto('/')
+  await navigate(page, '图像生成')
+  await expect(page.getByRole('combobox', { name: 'Provider' })).not.toHaveValue('')
+  const ratio = page.getByRole('combobox', { name: '比例' })
+  await ratio.selectOption('16:9')
+  await expect(ratio).toHaveValue('16:9')
+  await page.getByRole('textbox', { name: '提示词' }).fill('A clean studio product photograph on a neutral background')
+  await page.getByRole('button', { name: '提交生成任务' }).click()
+
+  await expect(page.getByText('图像任务已排队。')).toBeVisible()
+  await expect(page.getByText('任务未生成可用图像')).toBeVisible()
+  await page.getByRole('button', { name: '删除当前历史' }).click()
+  const confirmation = page.getByRole('alertdialog', { name: '删除这条图像历史？' })
+  await expect(confirmation).toBeVisible()
+  await confirmation.getByRole('button', { name: '取消' }).click()
+  await expect(confirmation).toBeHidden()
   await expectNoHorizontalOverflow(page)
 })
 
@@ -348,7 +368,7 @@ test('new provider can discover models before it is saved', async ({ page }, tes
   const dialog = page.getByRole('dialog', { name: '添加 Provider' })
   await dialog.getByRole('button', { name: '自定义 API', exact: true }).click()
   await dialog.getByRole('textbox', { name: '名称' }).fill('Unsaved gateway')
-  await dialog.getByRole('textbox', { name: 'Base URL' }).fill('https://gateway.example.test/v1')
+  await dialog.getByRole('textbox', { name: 'Base URL', exact: true }).fill('https://gateway.example.test/v1')
   await dialog.getByRole('textbox', { name: 'API Key / 密钥池' }).fill('temporary-key')
   const discover = dialog.getByRole('button', { name: '获取可用模型' })
   await expect(discover).toBeEnabled()
@@ -410,7 +430,7 @@ test('provider types can be created, reconfigured, and deleted', async ({ page }
     await dialog.getByRole('textbox', { name: '名称' }).fill(choice.name)
     if (choice.protocol) {
       await dialog.getByRole('combobox', { name: '兼容协议' }).selectOption(choice.protocol)
-      await dialog.getByRole('textbox', { name: 'Base URL' }).fill(choice.base!)
+      await dialog.getByRole('textbox', { name: 'Base URL', exact: true }).fill(choice.base!)
       await dialog.getByRole('textbox', { name: '主模型' }).fill(choice.model!)
     }
     const secretRequest = choice.type === '自定义 API'
@@ -426,7 +446,7 @@ test('provider types can be created, reconfigured, and deleted', async ({ page }
   await row.getByRole('button', { name: '编辑配置' }).click()
   const editor = page.getByRole('dialog', { name: '编辑 Provider' })
   await editor.getByRole('combobox', { name: '连接类型' }).selectOption('openai')
-  await expect(editor.getByRole('textbox', { name: 'Base URL' })).toHaveValue('https://api.openai.com/v1')
+  await expect(editor.getByRole('textbox', { name: 'Base URL', exact: true })).toHaveValue('https://api.openai.com/v1')
   await editor.getByRole('button', { name: '保存修改' }).click()
 
   await row.getByRole('button', { name: '删除 Provider' }).click()
@@ -969,6 +989,29 @@ async function mockApi(page: Page) {
       { id: 'gemini-2.5-flash', name: 'Gemini 2.5 Flash' },
       { id: 'gemini-2.5-pro', name: 'Gemini 2.5 Pro' },
     ] })
+    if (pathname.endsWith('/image-generation/capabilities')) return json({
+      schema_version: 'image-capabilities-v1',
+      verified_at: '2026-08-17',
+      provider_id: 'gemini-main',
+      model: 'gemini-2.5-flash',
+      family: 'google_gemini',
+      label: 'Google Gemini / Nano Banana',
+      known: true,
+      operations: ['generate', 'edit'],
+      parameters: ['aspect_ratio', 'image_size', 'multi_image_strategy'],
+      enums: { aspect_ratio: ['1:1', '16:9'], image_size: ['1K'], multi_image_strategy: ['parallel', 'candidate_count'] },
+      defaults: { aspect_ratio: '1:1', image_size: '1K', multi_image_strategy: 'parallel' },
+      max_references: 3,
+      max_outputs: 4,
+      notes: 'Mock image capability.',
+    })
+    if (pathname.endsWith('/image-generation/jobs') && route.request().method() === 'POST') {
+      return route.fulfill({ status: 202, contentType: 'application/json', body: JSON.stringify(imageJob('queued')) })
+    }
+    if (pathname.endsWith('/image-generation/jobs') && route.request().method() === 'GET') {
+      return json({ items: [], total: 0, next_cursor: null })
+    }
+    if (pathname.endsWith('/image-generation/jobs/image-e2e')) return json(imageJob('succeeded'))
     if (pathname.endsWith('/providers/discover-models') && route.request().method() === 'POST') return json({ items: [
       { id: 'gateway-vision', name: 'Gateway Vision' },
       { id: 'gateway-caption', name: 'Gateway Caption' },
@@ -1046,8 +1089,21 @@ function jobSummary(state: string) {
   }
 }
 
+function imageJob(state: string) {
+  return {
+    id: 'image-e2e', state, phase: state, provider_id: 'gemini-main', model: 'gemini-2.5-flash',
+    family: 'google_gemini', operation: 'generate', requested_count: 1,
+    completed_count: 0, attempt_counts: { succeeded: state === 'succeeded' ? 1 : 0 },
+    config: { prompt: 'A clean studio product photograph on a neutral background' },
+    config_hash: 'image-config-hash', reference_count: 0, artifacts: [],
+    created_at: new Date(0).toISOString(), updated_at: new Date().toISOString(),
+    finished_at: state === 'succeeded' ? new Date().toISOString() : null,
+    error_code: state === 'succeeded' ? 'image_generation_no_output' : null,
+  }
+}
+
 function routeSlug(name: typeof pages[number]) {
-  return ({ 工作台: 'workbench', 视频提示词: 'video-prompts', 批量任务: 'batch', 数据集工作流: 'dataset-workflow', 在线模型: 'providers', 本地模型: 'models', 设置: 'settings' })[name]
+  return ({ 工作台: 'workbench', 图像生成: 'image-generation', 视频提示词: 'video-prompts', 批量任务: 'batch', 数据集工作流: 'dataset-workflow', 在线模型: 'providers', 本地模型: 'models', 设置: 'settings' })[name]
 }
 
 function fl2vaPromptPackage() {

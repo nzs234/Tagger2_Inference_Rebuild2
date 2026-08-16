@@ -8,7 +8,7 @@ verified. Local resources listed below are provisioned outside Git under
 `data/workflows/resources`; a fresh checkout must import them before enabling
 the corresponding stage.
 
-The source compatibility baseline for V1.03 is pinned to
+The source compatibility baseline introduced in V1.03 and retained by V1.04 is pinned to
 `lse14/e621-standard-capotion-workflow@ccc9d07497be637fc097c5da009d791f017144c9`.
 The port manifest and SHA-256 checks are in
 `backend/tests/fixtures/workflow_upstream_manifest.json`; an optional source
@@ -70,7 +70,7 @@ candidate containing `anthro` to `furry` with a 50% random decision. The strict
 port remains byte-identical; the pipeline caller injects a stable value derived
 from `job_id + sample_id + relative_path`, so a review continuation cannot
 change a frozen projection while a separately created job remains independently
-seeded. This is the V1.03 deterministic orchestration contract.
+seeded. This deterministic orchestration contract was introduced in V1.03 and remains in V1.04.
 
 NL validation is source-compatible except for one stricter safety rule: the
 `__NL_IMAGE_NOT_RECEIVED__` sentinel is accepted only when it is the complete
@@ -255,7 +255,7 @@ npm run lint
 npm run build
 ```
 
-V1.03 verification is emitted by the release gate rather than copied into this
+V1.04 verification is emitted by the release gate rather than copied into this
 document. The gate runs backend/frontend tests, Playwright, Ruff, mypy,
 ESLint, TypeScript/Vite, the pinned-source port check, and a deterministic
 workflow smoke. Resource-specific smoke remains explicit because model and OCR
