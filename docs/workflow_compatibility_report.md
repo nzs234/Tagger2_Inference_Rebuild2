@@ -9,7 +9,7 @@ verified. Local resources listed below are provisioned outside Git under
 the corresponding stage.
 
 The source compatibility baseline for V1.03 is pinned to
-`lse14/e621-standard-caption-workflow@ccc9d07497be637fc097c5da009d791f017144c9`.
+`lse14/e621-standard-capotion-workflow@ccc9d07497be637fc097c5da009d791f017144c9`.
 The port manifest and SHA-256 checks are in
 `backend/tests/fixtures/workflow_upstream_manifest.json`; an optional source
 checkout is accepted only when its HEAD matches this commit.

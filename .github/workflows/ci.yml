@@ -15,7 +15,7 @@ jobs:
       - name: Checkout fixed workflow source
         uses: actions/checkout@v4
         with:
-          repository: lse14/e621-standard-caption-workflow
+          repository: lse14/e621-standard-capotion-workflow
           ref: ccc9d07497be637fc097c5da009d791f017144c9
           path: upstream
       - uses: actions/setup-python@v5
