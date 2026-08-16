@@ -11,17 +11,17 @@ jobs:
       PYTHONPATH: backend
       TAGGER2_UPSTREAM_SOURCE_ROOT: ${{ github.workspace }}/upstream
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Checkout fixed workflow source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: lse14/e621-standard-capotion-workflow
           ref: ccc9d07497be637fc097c5da009d791f017144c9
           path: upstream
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: '22'
           cache: npm
