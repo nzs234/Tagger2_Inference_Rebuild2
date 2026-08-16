@@ -278,10 +278,13 @@ export const api = {
       `/workflows/jobs/${encodeURIComponent(id)}/${action}`,
       { method: 'POST', body: '{}' },
     ),
-  workflowRestoreJob: (id: string) =>
-    request<{ job_id: string; restored_files: number; root_id?: string }>(
+  workflowRestoreJob: (id: string, operationId?: string) =>
+    request<{ job_id: string; restored_files: number; root_id?: string; replayed?: boolean }>(
       `/workflows/jobs/${encodeURIComponent(id)}/restore`,
-      { method: 'POST', body: '{}' },
+      {
+        method: 'POST',
+        body: JSON.stringify(operationId ? { operation_id: operationId } : {}),
+      },
     ),
   workflowDiscardJob: (id: string) =>
     request<{ job_id: string; discarded: boolean }>(

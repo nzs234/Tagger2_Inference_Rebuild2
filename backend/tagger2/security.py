@@ -368,7 +368,11 @@ def validate_provider_url(
             or address.is_unspecified
         )
     except ValueError:
-        if host.replace(".", "").isdigit():
+        if (
+            host.replace(".", "").isdigit()
+            or re.fullmatch(r"0x[0-9a-f]+", host, re.IGNORECASE)
+            or re.fullmatch(r"[0-9a-f]+h", host, re.IGNORECASE)
+        ):
             raise SecurityError("ambiguous numeric provider hostname is not accepted")
         if resolve_dns:
             try:
@@ -383,7 +387,13 @@ def validate_provider_url(
                     address = ipaddress.ip_address(value)
                 except ValueError:
                     continue
-                if address.is_private or address.is_loopback or address.is_link_local:
+                if (
+                    address.is_private
+                    or address.is_loopback
+                    or address.is_link_local
+                    or address.is_reserved
+                    or address.is_unspecified
+                ):
                     local = True
                     break
     if local and not allow_local:

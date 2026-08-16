@@ -48,6 +48,10 @@ class VisionProvider(ProviderHTTPMixin):
             follow_redirects=False,
         )
         self._owns_client = client is None
+        # Injected transports are used by tests and trusted embedding hosts.
+        # Production-owned clients re-resolve and validate every destination
+        # immediately before the connection attempt.
+        self.validate_destination = client is None
 
     @property
     def kind(self) -> ProviderKind:

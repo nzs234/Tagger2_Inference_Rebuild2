@@ -1,6 +1,7 @@
 param(
   [string]$OutputDir = "dist",
-  [string]$Version = "",
+  [string]$Version = "V1.03",
+  [string]$UpstreamSourceRoot = $env:TAGGER2_UPSTREAM_SOURCE_ROOT,
   [switch]$SkipRuntime,
   [switch]$BaseRuntimeOnly,
   [switch]$SkipSmokeTest
@@ -27,6 +28,59 @@ if ($SkipRuntime -and $BaseRuntimeOnly) {
   throw "SkipRuntime and BaseRuntimeOnly cannot be used together"
 }
 
+$expectedUpstreamCommit = "ccc9d07497be637fc097c5da009d791f017144c9"
+$upstreamCommit = $expectedUpstreamCommit
+if (-not [string]::IsNullOrWhiteSpace($UpstreamSourceRoot)) {
+  if (-not (Test-Path -LiteralPath (Join-Path $UpstreamSourceRoot ".git"))) {
+    throw "UpstreamSourceRoot does not contain a git checkout: $UpstreamSourceRoot"
+  }
+  $env:TAGGER2_UPSTREAM_SOURCE_ROOT = (Resolve-Path -LiteralPath $UpstreamSourceRoot).Path
+  $upstreamCommit = (& git -C $env:TAGGER2_UPSTREAM_SOURCE_ROOT rev-parse HEAD).Trim()
+  if ($upstreamCommit -ne $expectedUpstreamCommit) {
+    throw "UpstreamSourceRoot is not pinned to ccc9d074: $upstreamCommit"
+  }
+} else {
+  Write-Warning "No upstream checkout supplied; validating the committed port manifest only. CI supplies TAGGER2_UPSTREAM_SOURCE_ROOT."
+}
+
+$gatePython = $null
+$gateCandidates = @(
+  (Join-Path $root ".venv-dev\Scripts\python.exe"),
+  (Join-Path $root "runtime\python.exe"),
+  (Get-Command python -ErrorAction Stop).Source
+)
+foreach ($candidate in $gateCandidates) {
+  if (-not (Test-Path -LiteralPath $candidate -PathType Leaf)) {
+    continue
+  }
+  $probeExitCode = 1
+  try {
+    & $candidate -c "import pytest" *> $null
+    $probeExitCode = $LASTEXITCODE
+  } catch {
+    $probeExitCode = 1
+  }
+  if ($probeExitCode -eq 0) {
+    $gatePython = $candidate
+    break
+  }
+}
+if (-not $gatePython) {
+  throw "No Python interpreter with pytest is available for the release gates"
+}
+Write-Host "Running fixed-source and workflow release gates..."
+& $gatePython -m pytest backend/tests/test_workflow_ports.py backend/tests/test_workflow_e2e.py backend/tests/test_workflow_review_checkpoint.py -q
+if ($LASTEXITCODE -ne 0) { throw "Workflow release gate failed with exit code $LASTEXITCODE" }
+Push-Location (Join-Path $root "frontend")
+try {
+  npm run lint
+  if ($LASTEXITCODE -ne 0) { throw "Frontend lint gate failed with exit code $LASTEXITCODE" }
+  npm run build
+  if ($LASTEXITCODE -ne 0) { throw "Frontend build gate failed with exit code $LASTEXITCODE" }
+} finally {
+  Pop-Location
+}
+
 function Copy-ReleaseItem([string]$RelativePath) {
   $source = Join-Path $root $RelativePath
   if (-not (Test-Path -LiteralPath $source)) {
@@ -49,8 +103,21 @@ try {
   @(
     "Tagger2 Inference",
     "Version: $releaseVersion",
-    "Build timestamp: $stamp"
+    "Build timestamp: $stamp",
+    "Upstream commit: $upstreamCommit"
   ) | Set-Content -LiteralPath $versionFile -Encoding utf8
+  @{
+    version = $releaseVersion
+    built_at = $stamp
+    upstream_commit = $upstreamCommit
+    checks = @(
+      "workflow_upstream_port",
+      "workflow_e2e",
+      "workflow_review_checkpoint",
+      "frontend_lint",
+      "frontend_build"
+    )
+  } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $stage "VALIDATION_REPORT.json") -Encoding utf8
 
   # Models and caches are provisioned separately because they are large.  The
   # placeholders keep the expected directory layout without copying secrets.

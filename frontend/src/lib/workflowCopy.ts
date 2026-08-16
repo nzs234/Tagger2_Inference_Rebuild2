@@ -75,7 +75,27 @@ export interface WorkflowCopy {
   enableTokenBudget: string
   tokenizerResource: string
   tokenMaxTokens: string
+  enableNl: string
+  nlProvider: string
+  nlModel: string
+  nlReuseOriginal: string
+  nlUseImage: string
+  nlUseFullJson: string
+  nlPreset: string
+  nlLength: string
+  enablePolicy: string
+  policySeed: string
+  policyAdvanced: string
+  policyArtistDropout: string
+  policyQualityDropout: string
+  policySoloDropNl: string
+  policySoloDropAppearance: string
+  policyNonSoloDropNl: string
+  policyNonSoloDropAppearance: string
+  policyHint: string
   captionRuntimeHint: string
+  stageNl: string
+  stagePolicy: string
   ocrTitle: string
   ocrProcessed: string
   ocrFailed: string
@@ -267,7 +287,27 @@ export const workflowCopy: Record<WorkflowLanguage, WorkflowCopy> = {
     enableTokenBudget: '启用 Token 预算',
     tokenizerResource: 'Tokenizer 资源',
     tokenMaxTokens: 'Token 预算上限',
+    enableNl: '启用 NL 描述',
+    nlProvider: 'NL Provider',
+    nlModel: 'NL 模型',
+    nlReuseOriginal: '复用已有 NL',
+    nlUseImage: '发送图片给 Provider',
+    nlUseFullJson: '发送完整九字段 JSON',
+    nlPreset: '提示词预设',
+    nlLength: '描述长度',
+    enablePolicy: '启用 Policy',
+    policySeed: 'Policy Seed',
+    policyAdvanced: '高级 Policy 参数',
+    policyArtistDropout: 'Artist 丢弃概率',
+    policyQualityDropout: 'Quality 丢弃概率',
+    policySoloDropNl: 'Solo 丢弃 NL 概率',
+    policySoloDropAppearance: 'Solo 丢弃外观概率',
+    policyNonSoloDropNl: '非 Solo 丢弃 NL 概率',
+    policyNonSoloDropAppearance: '非 Solo 丢弃外观概率',
+    policyHint: '默认关闭；启用后会在数量复核之后应用确定性标签策略。',
     captionRuntimeHint: 'Caption 使用 Models/Workbench 中当前已加载的本地模型；创建时会冻结该模型 ID。',
+    stageNl: 'NL 描述',
+    stagePolicy: 'Policy',
     captionModelDetails: '后端 / 阈值来源',
     ocrTitle: 'OCR 结果',
     ocrProcessed: '已识别',
@@ -482,7 +522,27 @@ export const workflowCopy: Record<WorkflowLanguage, WorkflowCopy> = {
     enableTokenBudget: 'Enable token budget',
     tokenizerResource: 'Tokenizer resource',
     tokenMaxTokens: 'Token budget limit',
+    enableNl: 'Enable NL description',
+    nlProvider: 'NL provider',
+    nlModel: 'NL model',
+    nlReuseOriginal: 'Reuse existing NL',
+    nlUseImage: 'Send image to provider',
+    nlUseFullJson: 'Send full nine-field JSON',
+    nlPreset: 'Prompt preset',
+    nlLength: 'Description length',
+    enablePolicy: 'Enable Policy',
+    policySeed: 'Policy seed',
+    policyAdvanced: 'Advanced Policy parameters',
+    policyArtistDropout: 'Artist dropout probability',
+    policyQualityDropout: 'Quality dropout probability',
+    policySoloDropNl: 'Solo NL dropout probability',
+    policySoloDropAppearance: 'Solo appearance dropout probability',
+    policyNonSoloDropNl: 'Non-solo NL dropout probability',
+    policyNonSoloDropAppearance: 'Non-solo appearance dropout probability',
+    policyHint: 'Disabled by default; when enabled it applies deterministic tag policy after count review.',
     captionRuntimeHint: 'Caption uses the local model currently loaded in Models/Workbench; its model ID is frozen when the job is created.',
+    stageNl: 'NL description',
+    stagePolicy: 'Policy',
     captionModelDetails: 'Backend / threshold source',
     ocrTitle: 'OCR results',
     ocrProcessed: 'Recognized',

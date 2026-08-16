@@ -741,7 +741,11 @@ class Runtime:
             if pid in self.provider_configs:
                 continue
             try:
-                validate_provider_url(base, allow_local=kind in {"lm_studio", "antigravity"} or self.settings.allow_local_providers)
+                validate_provider_url(
+                    base,
+                    allow_local=kind in {"lm_studio", "antigravity"}
+                    or self.settings.allow_local_providers,
+                )
             except SecurityError:
                 continue
             profile = self.storage.upsert_provider_profile(
@@ -2263,7 +2267,11 @@ def create_app(settings: AppConfig | None = None) -> FastAPI:
             raise _safe_error("不支持的 API 协议", "invalid_provider_protocol")
         allow_local = kind in {"lm_studio", "antigravity"} or runtime.settings.allow_local_providers
         try:
-            base = validate_provider_url(payload.base_url, allow_local=allow_local)
+            base = validate_provider_url(
+                payload.base_url,
+                allow_local=allow_local,
+                resolve_dns=True,
+            )
         except SecurityError as exc:
             raise _safe_error(str(exc), "invalid_provider_url")
         pid = re.sub(r"[^a-z0-9_-]+", "-", payload.name.casefold()).strip("-") or uuid.uuid4().hex[:8]
@@ -2293,7 +2301,12 @@ def create_app(settings: AppConfig | None = None) -> FastAPI:
             raise _safe_error("不支持的 API 协议", "invalid_provider_protocol")
         base = body.pop("base_url", current.get("base_url"))
         try:
-            base = validate_provider_url(str(base), allow_local=kind in {"lm_studio", "antigravity"} or runtime.settings.allow_local_providers)
+            base = validate_provider_url(
+                str(base),
+                allow_local=kind in {"lm_studio", "antigravity"}
+                or runtime.settings.allow_local_providers,
+                resolve_dns=True,
+            )
         except SecurityError as exc:
             raise _safe_error(str(exc), "invalid_provider_url")
         config = dict(current.get("config") or {})
@@ -2385,7 +2398,11 @@ def create_app(settings: AppConfig | None = None) -> FastAPI:
             raise _safe_error("不支持的 API 协议", "invalid_provider_protocol")
         allow_local = kind in {"lm_studio", "antigravity"} or runtime.settings.allow_local_providers
         try:
-            base_url = validate_provider_url(payload.base_url, allow_local=allow_local)
+            base_url = validate_provider_url(
+                payload.base_url,
+                allow_local=allow_local,
+                resolve_dns=True,
+            )
             keys = tuple(dict.fromkeys(key.strip() for key in payload.api_keys if key.strip()))
             provider = create_provider({
                 "id": "unsaved-discovery",

@@ -79,7 +79,7 @@ def test_allowlist_rejects_symlink_escape_and_atomic_write(tmp_path: Path) -> No
     assert not list(root_path.glob("*.tmp"))
 
 
-def test_provider_url_requires_explicit_local_enablement() -> None:
+def test_provider_url_requires_explicit_local_enablement(monkeypatch) -> None:
     with pytest.raises(SecurityError):
         validate_provider_url("http://127.0.0.1:1234/v1")
     assert validate_provider_url(
@@ -91,6 +91,20 @@ def test_provider_url_requires_explicit_local_enablement() -> None:
         validate_provider_url("http://localhost.:1234/v1")
     with pytest.raises(SecurityError):
         validate_provider_url("https://example.com/v1?api_key=do-not-store")
+    with pytest.raises(SecurityError):
+        validate_provider_url("http://0x7f000001/v1")
+
+    monkeypatch.setattr(
+        "tagger2.security.socket.getaddrinfo",
+        lambda *_args, **_kwargs: [(2, 1, 6, "", ("127.0.0.1", 443))],
+    )
+    with pytest.raises(SecurityError):
+        validate_provider_url("https://provider.example/v1", resolve_dns=True)
+    assert validate_provider_url(
+        "https://provider.example/v1",
+        allow_local=True,
+        resolve_dns=True,
+    ) == "https://provider.example/v1"
 
 
 def test_environment_secret_metadata_never_returns_secret() -> None:

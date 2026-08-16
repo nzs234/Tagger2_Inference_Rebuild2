@@ -959,6 +959,9 @@ small { font-size: 12px; }
 .workflow-advanced-resources > summary::-webkit-details-marker { display: none; }
 .workflow-advanced-resources > summary strong, .workflow-advanced-resources > summary small { display: block; }
 .workflow-advanced-resources > summary small { margin-top: 4px; color: var(--subtle); }
+.workflow-policy-advanced { grid-column: 1 / -1; margin: 4px 18px 18px; border-top: 1px solid var(--line); }
+.workflow-policy-advanced > summary { padding: 13px 0; color: var(--muted); font-size: 12px; font-weight: 700; cursor: pointer; }
+.workflow-policy-advanced > .form-grid { padding: 2px 0 4px; }
 .workflow-summary-card { display: grid; gap: 7px; padding: 14px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface-2); font-size: 12px; }
 .field-label-row { display: flex; align-items: center; justify-content: space-between; gap: 6px; }
 .field-help-button { display: inline-grid; place-items: center; width: 21px; height: 21px; padding: 0; border: 1px solid var(--line-strong); border-radius: 50%; background: var(--surface); color: var(--teal); cursor: help; }

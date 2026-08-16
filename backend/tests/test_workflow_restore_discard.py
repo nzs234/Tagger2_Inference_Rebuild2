@@ -113,6 +113,51 @@ def test_restore_targets_source_root_for_in_place(env):
     assert (env["source"] / "a.json").read_bytes() == ORIGINAL
 
 
+def test_restore_retry_returns_prior_result_without_overwriting_new_changes(env):
+    """HTTP retries are idempotent; an already restored dataset is not touched again."""
+
+    job_id, workspace = _job(env, work_mode="in_place")
+    _seed_backup(env["source"], workspace)
+    _finish(env["database"], job_id)
+
+    first = env["client"].post(f"/api/v1/workflows/jobs/{job_id}/restore")
+    assert first.status_code == 200
+    assert first.json()["replayed"] is False
+    changed_after_restore = b'{"tags": ["edited-after-restore"]}'
+    (env["source"] / "a.json").write_bytes(changed_after_restore)
+
+    replay = env["client"].post(f"/api/v1/workflows/jobs/{job_id}/restore")
+    assert replay.status_code == 200
+    assert replay.json()["replayed"] is True
+    assert (env["source"] / "a.json").read_bytes() == changed_after_restore
+    assert env["database"].get_job(job_id)["restored_at"] is not None
+
+
+def test_restore_again_requires_an_explicit_operation_id(env):
+    job_id, workspace = _job(env, work_mode="in_place")
+    _seed_backup(env["source"], workspace)
+    _finish(env["database"], job_id)
+
+    first = env["client"].post(f"/api/v1/workflows/jobs/{job_id}/restore")
+    assert first.status_code == 200
+    (env["source"] / "a.json").write_bytes(b'{"tags": ["changed-again"]}')
+
+    second = env["client"].post(
+        f"/api/v1/workflows/jobs/{job_id}/restore",
+        json={"operation_id": "operator-restore-2"},
+    )
+    assert second.status_code == 200
+    assert second.json()["replayed"] is False
+    assert (env["source"] / "a.json").read_bytes() == ORIGINAL
+    with env["database"].connection() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) AS total FROM workflow_operations"
+            " WHERE job_id = ? AND operation_type = 'restore' AND status = 'completed'",
+            (job_id,),
+        ).fetchone()
+    assert int(row["total"]) == 2
+
+
 def test_restore_failure_is_retryable_and_releases_dataset_lock(env, monkeypatch):
     """A failed restore parks the job for recovery without retaining its lock."""
 
@@ -172,7 +217,9 @@ def test_discard_removes_workspace(env):
     assert response.json()["discarded"] is True
     assert not workspace.exists()
     # The job row survives for audit purposes.
-    assert env["database"].get_job(job_id) is not None
+    job = env["database"].get_job(job_id)
+    assert job is not None
+    assert job["discarded_at"] is not None
 
 
 def test_discard_rejects_active_job(env):
@@ -196,6 +243,67 @@ def test_discard_is_idempotent(env):
     assert first.json()["discarded"] is True
     assert second.status_code == 200
     assert second.json()["discarded"] is False
+
+
+def test_discard_releases_lock_from_interrupted_job(env):
+    job_id, _workspace = _job(env)
+    assert env["database"].start_job(job_id, expected_status="pending") is True
+    env["database"].update_job_status(job_id, "running", expected_status="queued")
+    env["database"].update_job_status(job_id, "interrupted", expected_status="running")
+
+    response = env["client"].post(f"/api/v1/workflows/jobs/{job_id}/discard")
+
+    assert response.status_code == 200
+    with env["database"].connection() as conn:
+        row = conn.execute(
+            "SELECT released_at FROM workflow_dataset_locks WHERE job_id = ?",
+            (job_id,),
+        ).fetchone()
+    assert row is not None and row["released_at"] is not None
+
+
+def test_discard_error_does_not_expose_server_path(env, monkeypatch):
+    import shutil
+
+    job_id, _workspace = _job(env)
+    _finish(env["database"], job_id)
+
+    def fail_remove(path):
+        raise OSError(f"cannot remove {path}")
+
+    monkeypatch.setattr(shutil, "rmtree", fail_remove)
+    response = env["client"].post(f"/api/v1/workflows/jobs/{job_id}/discard")
+
+    assert response.status_code == 500
+    assert response.json()["detail"]["code"] == "discard_failed"
+    assert str(env["tmp_path"]) not in response.text
+
+
+def test_discard_retries_cleanup_after_marker_was_persisted(env, monkeypatch):
+    import shutil
+
+    job_id, workspace = _job(env)
+    _finish(env["database"], job_id)
+    real_remove = shutil.rmtree
+    attempts = 0
+
+    def interrupt_once(path):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise OSError("simulated power loss")
+        real_remove(path)
+
+    monkeypatch.setattr(shutil, "rmtree", interrupt_once)
+    first = env["client"].post(f"/api/v1/workflows/jobs/{job_id}/discard")
+    assert first.status_code == 500
+    assert env["database"].get_job(job_id)["discarded_at"] is not None
+    assert workspace.exists()
+
+    second = env["client"].post(f"/api/v1/workflows/jobs/{job_id}/discard")
+    assert second.status_code == 200
+    assert second.json()["discarded"] is True
+    assert not workspace.exists()
 
 
 def _preflight_config():

@@ -1,6 +1,6 @@
 # Tagger2 发布包说明
 
-这个压缩包用于分享和部署 Tagger2 Inference。V1.02 基础 Python 包内置便携式 Python
+这个压缩包用于分享和部署 Tagger2 Inference。V1.03 基础 Python 包内置便携式 Python
 3.12，但不包含第三方 site-packages；解压后运行 `setup.bat`，脚本会在该 runtime 中安装
 锁定依赖，之后运行 `start.bat`，浏览器打开 `http://127.0.0.1:20000`。也可以在启动前
 设置 `TAGGER2_TORCH_VARIANT=cpu` 强制使用 CPU。
@@ -30,9 +30,9 @@
 - `runtime_ocr/`、PaddleOCR 模型缓存和 OCR 资源描述：这些文件体积较大，且描述中可能含
   原机器的绝对路径。需要 OCR 时，请按项目文档单独安装隔离 OCR 运行时并注册本机资源。
 
-V1.02 同步上游固定基线 `ccc9d07497be637fc097c5da009d791f017144c9`。Replacement
-保留上游的随机 `anthro` → `furry` 规则；同一输入重复运行可能产生不同结果，需固定
-输出时请关闭该阶段或使用单独的确定性规则资源。
+V1.03 同步上游固定基线 `ccc9d07497be637fc097c5da009d791f017144c9`。Replacement
+保留上游的随机 `anthro` → `furry` 规则；调用方按 `job_id + sample_id +
+relative_path` 注入任务内稳定 seed，因此同一任务的审阅恢复不会改变已冻结的输出。
 
 ## 第一次使用
 
@@ -43,6 +43,6 @@ V1.02 同步上游固定基线 `ccc9d07497be637fc097c5da009d791f017144c9`。Repl
 
 发布包不包含用户数据、数据库、日志、访问令牌或密钥。
 
-V1.02 发布验收：后端 `433 passed / 1 skipped`、前端 `69 passed`、Playwright
-`49 passed / 1 skipped`；从 `E:\琥珀训练集预备` 随机抽取 20 组图片完成 full-copy，
-源数据未修改，输出 60 个文件，分类/替换/Tokenizer/OCR 资源指纹均已冻结。
+V1.03 发布验收包含后端完整测试、前端单元测试、Playwright、Ruff、mypy、
+ESLint、TypeScript/Vite、固定上游端口校验和 workflow smoke；本地资源未准备时，
+资源 smoke 会明确报告 blocked_resource，而不会以 mock 或其他资源替代。

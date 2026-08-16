@@ -1,6 +1,6 @@
 """Tagger2 Inference backend core package."""
 
-__version__ = "2.0.0"
+__version__ = "1.3.0"
 
 from .config import AppConfig, Settings, get_settings
 from .local_inference import (

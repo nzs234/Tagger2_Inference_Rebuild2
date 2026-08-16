@@ -15,6 +15,7 @@ function page(jobId: string, events: WorkflowJobEvent[], hasMore = false) {
 
 afterEach(() => {
   vi.restoreAllMocks()
+  vi.unstubAllGlobals()
 })
 
 describe('useWorkflowEvents', () => {
@@ -110,5 +111,31 @@ describe('useWorkflowEvents', () => {
     expect(result.current.cursor).toBe(3)
     expect(request).toHaveBeenNthCalledWith(1, 'job-1', 0, 100, expect.any(AbortSignal))
     expect(request).toHaveBeenNthCalledWith(2, 'job-1', 2, 100, expect.any(AbortSignal))
+  })
+
+  it('prefers SSE and advances the durable Last-Event-ID cursor', async () => {
+    const encoder = new TextEncoder()
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode(
+          'id: 7\nevent: workflow\ndata: {"job_id":"job-1","event_id":7,"to_status":"completed"}\n\n',
+        ))
+        controller.close()
+      },
+    })
+    const fetchMock = vi.fn().mockResolvedValue(new Response(stream, { status: 200 }))
+    vi.stubGlobal('fetch', fetchMock)
+    const polling = vi.spyOn(api, 'workflowJobEvents')
+
+    const { result } = renderHook(() => useWorkflowEvents('job-1'))
+
+    await waitFor(() => expect(result.current.cursor).toBe(7))
+    await waitFor(() => expect(result.current.state).toBe('closed'))
+    expect(result.current.events).toEqual([
+      expect.objectContaining({ job_id: 'job-1', event_id: 7, to_status: 'completed' }),
+    ])
+    expect(polling).not.toHaveBeenCalled()
+    const init = fetchMock.mock.calls[0]?.[1] as RequestInit
+    expect(new Headers(init.headers).get('Last-Event-ID')).toBe('0')
   })
 })

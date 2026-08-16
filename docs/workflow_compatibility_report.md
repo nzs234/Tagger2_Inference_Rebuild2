@@ -8,8 +8,8 @@ verified. Local resources listed below are provisioned outside Git under
 `data/workflows/resources`; a fresh checkout must import them before enabling
 the corresponding stage.
 
-The source compatibility baseline for V1.02 is pinned to
-`lse14/e621-standard-capotion-workflow@ccc9d07497be637fc097c5da009d791f017144c9`.
+The source compatibility baseline for V1.03 is pinned to
+`lse14/e621-standard-caption-workflow@ccc9d07497be637fc097c5da009d791f017144c9`.
 The port manifest and SHA-256 checks are in
 `backend/tests/fixtures/workflow_upstream_manifest.json`; an optional source
 checkout is accepted only when its HEAD matches this commit.
@@ -66,10 +66,11 @@ Consequences that are therefore guaranteed, not approximated:
   left empty for raw e621 input, matching source behaviour.
 
 The replacement port now includes the pinned upstream rule that changes a
-candidate containing `anthro` to `furry` with a 50% random decision. The
-decision is injectable in tests, but production uses the upstream default
-random source. This is intentional V1.02 behaviour and means repeated runs
-are not byte-identical when that rule is reached.
+candidate containing `anthro` to `furry` with a 50% random decision. The strict
+port remains byte-identical; the pipeline caller injects a stable value derived
+from `job_id + sample_id + relative_path`, so a review continuation cannot
+change a frozen projection while a separately created job remains independently
+seeded. This is the V1.03 deterministic orchestration contract.
 
 NL validation is source-compatible except for one stricter safety rule: the
 `__NL_IMAGE_NOT_RECEIVED__` sentinel is accepted only when it is the complete
@@ -214,8 +215,10 @@ local replacement index (`replace-e621-pass-drop-v2`), Qwen tokenizer
 
 ### Still not built
 
-- Long-lived SSE event streaming for workflow jobs (the UI currently uses the
-  replayable JSON event cursor, with reconnect and generation guards).
+- Large-scale pressure/chaos acceptance on 5k/100k samples, including disk-full,
+  worker-hang and power-loss fault injection. The production path now has
+  bounded leases, durable projection/staged-file checkpoints and long-lived
+  SSE; these tests remain release-environment dependent.
 - Automated download of the official snapshots. Import is a local, explicit
   step; nothing is fetched over the network on the project's behalf.
 - Danbooru-specific replacement and count resources. The profile is selectable
@@ -252,18 +255,11 @@ npm run lint
 npm run build
 ```
 
-Current V1.02 verification (2026-08-16): backend `433 passed / 1 skipped`,
-frontend `69 passed`, and Playwright `49 passed / 1 skipped`; mypy, Ruff,
-ESLint, TypeScript and Vite are clean. The fixed-source port gate passes 26
-tests. A 20-image run from `E:\琥珀训练集预备` completed with 20/20 exported,
-60 committed files, 20 OCR results, 20 tokenizer checks, no issues, unchanged
-source hashes, and frozen fingerprints for classification, replacement,
-Tokenizer and CPU OCR. The API manual-path full-copy run also completed 20/20
-with 60 output files and an unchanged source.
-Ruff clean; frontend lint and `tsc -b` clean. The real local-model/resource
-smoke completed a one-image Caption + Classify + Replace + OCR + Tokenizer run
-and a separate 20-image offline/API run without blocking issues. Stress and
-GPU-specific gates are intentionally not claimed here.
+V1.03 verification is emitted by the release gate rather than copied into this
+document. The gate runs backend/frontend tests, Playwright, Ruff, mypy,
+ESLint, TypeScript/Vite, the pinned-source port check, and a deterministic
+workflow smoke. Resource-specific smoke remains explicit because model and OCR
+assets are intentionally outside the repository.
 
 Note on running the backend suite: use the project runtime
 (`.\runtime\python.exe`). It puts only `backend` on `sys.path`, so test modules

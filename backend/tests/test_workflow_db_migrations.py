@@ -87,7 +87,15 @@ def test_v2_to_v3_preserves_parent_and_all_child_rows(tmp_path: Path):
         versions = connection.execute(
             "SELECT version, checksum FROM schema_migrations ORDER BY version"
         ).fetchall()
-        assert versions == [(2, "workflow-schema-v2-leases"), (3, "workflow-schema-v3-job-states")]
+        assert versions == [
+            (2, "workflow-schema-v2-leases"),
+            (3, "workflow-schema-v3-job-states"),
+            (4, "workflow-schema-v4-restore-discard-state"),
+        ]
+        job_columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(workflow_jobs)")
+        }
+        assert {"restored_at", "discarded_at"} <= job_columns
     finally:
         connection.close()
 

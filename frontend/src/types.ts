@@ -444,6 +444,8 @@ export interface WorkflowJobSummary {
   created_at: string
   started_at: string | null
   finished_at: string | null
+  restored_at?: string | null
+  discarded_at?: string | null
   /** Stable public code, never an exception message or traceback. */
   error_code: string | null
   pinned?: boolean

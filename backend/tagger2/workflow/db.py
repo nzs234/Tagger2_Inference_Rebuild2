@@ -375,6 +375,60 @@ class WorkflowDatabase:
                     )
         return operation_id
 
+    def get_operation(
+        self,
+        job_id: str,
+        operation_type: str,
+        idempotency_key: str,
+    ) -> dict[str, Any] | None:
+        """Return one scoped control-plane operation, decoding its payload."""
+
+        with self.connection() as conn:
+            row = conn.execute(
+                "SELECT operation_id, job_id, operation_type, status, idempotency_key, "
+                "payload_json, created_at, finished_at FROM workflow_operations "
+                "WHERE job_id = ? AND operation_type = ? AND idempotency_key = ?",
+                (job_id, operation_type, idempotency_key),
+            ).fetchone()
+        if row is None:
+            return None
+        result = dict(row)
+        try:
+            payload = json.loads(str(result.pop("payload_json")))
+        except json.JSONDecodeError:
+            payload = {}
+        result["payload"] = payload if isinstance(payload, dict) else {}
+        return result
+
+    def mark_job_restored(self, job_id: str) -> None:
+        """Record the successful restore timestamp without changing job history."""
+
+        with self.connection() as conn:
+            conn.execute(
+                "UPDATE workflow_jobs SET restored_at = ? WHERE job_id = ?",
+                (utc_now(), job_id),
+            )
+
+    def mark_job_discarded(self, job_id: str, *, expected_status: str) -> bool:
+        """CAS the durable discard marker and release any remaining locks."""
+
+        now = utc_now()
+        with self._write_lock:
+            with self.connection() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                cursor = conn.execute(
+                    "UPDATE workflow_jobs SET discarded_at = ? "
+                    "WHERE job_id = ? AND status = ? AND discarded_at IS NULL",
+                    (now, job_id, expected_status),
+                )
+                if cursor.rowcount == 1:
+                    conn.execute(
+                        "UPDATE workflow_dataset_locks SET released_at = ? "
+                        "WHERE job_id = ? AND released_at IS NULL",
+                        (now, job_id),
+                    )
+                return cursor.rowcount == 1
+
     def record_stage_run(
         self,
         job_id: str,
@@ -499,6 +553,27 @@ class WorkflowDatabase:
                 (artifact_id, job_id, kind, relative_path, sha256, int(size_bytes), utc_now()),
             )
         return artifact_id
+
+    def list_artifacts(
+        self,
+        job_id: str,
+        *,
+        kind: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """List durable per-file artifacts in stable path order."""
+
+        query = (
+            "SELECT artifact_id, kind, relative_path, sha256, size_bytes, created_at"
+            " FROM workflow_artifacts WHERE job_id = ?"
+        )
+        params: list[Any] = [job_id]
+        if kind is not None:
+            query += " AND kind = ?"
+            params.append(kind)
+        query += " ORDER BY relative_path, created_at"
+        with self.connection() as conn:
+            rows = conn.execute(query, tuple(params)).fetchall()
+        return [dict(row) for row in rows]
 
     def create_sample(
         self,

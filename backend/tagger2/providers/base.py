@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import email.utils
-import ipaddress
 import random
 import threading
 import time
@@ -12,9 +11,10 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Mapping
-from urllib.parse import urlsplit, urlunsplit
 
 import httpx
+
+from ..security import SecurityError, validate_provider_url
 
 
 class ProviderKind(str, Enum):
@@ -70,30 +70,15 @@ def _coerce_kind(value: ProviderKind | str) -> ProviderKind:
 
 
 def validate_base_url(value: str, *, allow_local: bool = False) -> str:
-    if not isinstance(value, str) or not value.strip():
-        raise ValueError("provider URL is required")
-    value = value.strip()
-    parts = urlsplit(value)
-    if parts.scheme not in {"http", "https"} or not parts.hostname:
-        raise ValueError("provider URL must use http or https")
-    if parts.username or parts.password:
-        raise ValueError("provider URL must not contain credentials")
-    if parts.query:
-        raise ValueError("provider URL query parameters are not allowed")
-    host = parts.hostname.casefold().rstrip(".")
-    is_local = host in {"localhost", "localhost.localdomain"}
     try:
-        address = ipaddress.ip_address(host)
-        is_local = is_local or address.is_private or address.is_loopback or address.is_link_local or address.is_reserved
-    except ValueError:
-        # ``*.local`` is generally a local network endpoint.  Keep it behind
-        # the explicit switch too.
-        is_local = is_local or host.endswith(".local")
-    if is_local and not allow_local:
-        raise ValueError("local provider URLs require allow_local=True")
-    # Drop fragments; preserve query only when callers explicitly need it (API
-    # keys are sent in headers, so normal configs should not contain one).
-    return urlunsplit((parts.scheme, parts.netloc, parts.path.rstrip("/"), parts.query, ""))
+        normalized = validate_provider_url(
+            value,
+            allow_local=allow_local,
+            resolve_dns=False,
+        )
+    except SecurityError as exc:
+        raise ValueError(str(exc)) from exc
+    return normalized.rstrip("/")
 
 
 @dataclass(slots=True)
@@ -353,6 +338,7 @@ class ProviderHTTPMixin:
     key_pool: APIKeyPool
     client: httpx.AsyncClient
     semaphore: asyncio.Semaphore
+    validate_destination: bool
 
     async def _request(self, method: str, url: str, *, headers: Mapping[str, str] | None = None, json: Any = None) -> httpx.Response:
         request_headers = dict(self.config.headers)
@@ -364,7 +350,19 @@ class ProviderHTTPMixin:
                 call_headers = dict(request_headers)
                 self._inject_key(call_headers, key)
                 try:
+                    if self.validate_destination:
+                        validate_provider_url(
+                            url,
+                            allow_local=self.config.allow_local,
+                            resolve_dns=True,
+                        )
                     response = await self.client.request(method, url, headers=call_headers, json=json)
+                except SecurityError as exc:
+                    raise ProviderError(
+                        "provider destination is not allowed",
+                        retryable=False,
+                        code="provider_destination_blocked",
+                    ) from exc
                 except httpx.TimeoutException:
                     last = ProviderError("provider request timed out", retryable=True, code="provider_timeout")
                 except httpx.RequestError:

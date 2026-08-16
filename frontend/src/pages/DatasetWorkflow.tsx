@@ -62,6 +62,22 @@ interface JobDraft {
   ocrEnabled: boolean
   ocrResourceId: string
   ocrMinConfidence: number
+  nlEnabled: boolean
+  nlProviderId: string
+  nlModel: string
+  nlReuseOriginal: boolean
+  nlUseImage: boolean
+  nlUseFullJson: boolean
+  nlPromptPreset: 'general' | 'style' | 'character'
+  nlLength: 'short' | 'medium' | 'long'
+  policyEnabled: boolean
+  policySeed: string
+  policyArtistDropout: number
+  policyQualityDropout: number
+  policySoloDropNl: number
+  policySoloDropAppearance: number
+  policyNonSoloDropNl: number
+  policyNonSoloDropAppearance: number
   tokenBudgetEnabled: boolean
   tokenizerResourceId: string
   tokenMaxTokens: number
@@ -85,6 +101,22 @@ const emptyDraft: JobDraft = {
   ocrEnabled: false,
   ocrResourceId: DEFAULT_OCR_RESOURCE_ID,
   ocrMinConfidence: 0.5,
+  nlEnabled: false,
+  nlProviderId: '',
+  nlModel: '',
+  nlReuseOriginal: true,
+  nlUseImage: true,
+  nlUseFullJson: false,
+  nlPromptPreset: 'general',
+  nlLength: 'medium',
+  policyEnabled: false,
+  policySeed: 'workflow-default-v1',
+  policyArtistDropout: 0,
+  policyQualityDropout: 0,
+  policySoloDropNl: 0.7,
+  policySoloDropAppearance: 0.05,
+  policyNonSoloDropNl: 0.05,
+  policyNonSoloDropAppearance: 0.7,
   tokenBudgetEnabled: false,
   tokenizerResourceId: DEFAULT_TOKENIZER_RESOURCE_ID,
   tokenMaxTokens: 512,
@@ -96,7 +128,7 @@ const EMPTY_WORKFLOW_RESOURCES: WorkflowResource[] = []
 const REVIEW_PAGE_SIZE = 50
 const TERMINAL_WORKFLOW_STATUSES = new Set(['completed', 'failed', 'cancelled', 'interrupted', 'rollback_required'])
 
-type WorkflowStageId = 'dataset' | 'caption' | 'classify' | 'replace' | 'ocr' | 'count' | 'token' | 'export'
+type WorkflowStageId = 'dataset' | 'caption' | 'classify' | 'replace' | 'ocr' | 'nl' | 'count' | 'policy' | 'token' | 'export'
 
 const WORKFLOW_STAGE_IDS: WorkflowStageId[] = [
   'dataset',
@@ -104,7 +136,9 @@ const WORKFLOW_STAGE_IDS: WorkflowStageId[] = [
   'classify',
   'replace',
   'ocr',
+  'nl',
   'count',
+  'policy',
   'token',
   'export',
 ]
@@ -140,6 +174,13 @@ export function DatasetWorkflow() {
 
   const roots = useQuery({ queryKey: ['roots'], queryFn: api.roots, retry: false })
   const models = useQuery({ queryKey: ['models'], queryFn: api.models, retry: false })
+  const providers = useQuery({ queryKey: ['providers'], queryFn: api.providers, retry: false })
+  const providerModels = useQuery({
+    queryKey: ['provider-models', draft.nlProviderId],
+    queryFn: () => api.providerModels(draft.nlProviderId),
+    enabled: Boolean(draft.nlEnabled && draft.nlProviderId),
+    retry: false,
+  })
   const capabilities = useQuery({
     queryKey: ['workflow', 'capabilities'],
     queryFn: api.workflowCapabilities,
@@ -220,8 +261,24 @@ export function DatasetWorkflow() {
     () => workflowResources.filter((resource) => resource.category === 'tokenizer'),
     [workflowResources],
   )
+  const enabledProviders = useMemo(
+    () => (providers.data?.items ?? []).filter((provider) => provider.enabled !== false),
+    [providers.data?.items],
+  )
 
   const legacyReplacementResource = workflowResources.find((resource) => resource.category === 'replacement_index')
+
+  const updateDraft = (patch: Partial<JobDraft>) => {
+    setPreflight(undefined)
+    setPreflightError(undefined)
+    setCreateNotice(undefined)
+    if ('sourcePath' in patch || 'outputPath' in patch || 'workMode' in patch) {
+      setPathBinding(undefined)
+      setPathBindingPreview(undefined)
+      setPathBindingError(undefined)
+    }
+    setDraft((current) => ({ ...current, ...patch }))
+  }
 
   useEffect(() => {
     if (!resources.data) return
@@ -246,8 +303,21 @@ export function DatasetWorkflow() {
         tokenizerResources.some((resource) => resource.resource_id === current.tokenizerResourceId)
           ? current.tokenizerResourceId
           : tokenizerResources[0]?.resource_id ?? '',
+      nlProviderId:
+        enabledProviders.some((provider) => provider.id === current.nlProviderId)
+          ? current.nlProviderId
+          : enabledProviders[0]?.id ?? '',
     }))
-  }, [resources.data, classifyResources, replacementResources, ocrResources, tokenizerResources, legacyReplacementResource])
+  }, [resources.data, classifyResources, replacementResources, ocrResources, tokenizerResources, legacyReplacementResource, enabledProviders])
+
+  useEffect(() => {
+    if (!draft.nlProviderId || !providerModels.data) return
+    const available = providerModels.data.items
+    if (!available.some((model) => model.id === draft.nlModel)) {
+      const provider = enabledProviders.find((item) => item.id === draft.nlProviderId)
+      updateDraft({ nlModel: available[0]?.id ?? provider?.primary_model ?? '' })
+    }
+  }, [draft.nlProviderId, draft.nlModel, providerModels.data, enabledProviders])
 
   useEffect(() => {
     setDraft((current) => {
@@ -269,18 +339,6 @@ export function DatasetWorkflow() {
       return current.captionModelId ? { ...current, captionModelId: '' } : current
     })
   }, [loadedModels])
-
-  const updateDraft = (patch: Partial<JobDraft>) => {
-    setPreflight(undefined)
-    setPreflightError(undefined)
-    setCreateNotice(undefined)
-    if ('sourcePath' in patch || 'outputPath' in patch || 'workMode' in patch) {
-      setPathBinding(undefined)
-      setPathBindingPreview(undefined)
-      setPathBindingError(undefined)
-    }
-    setDraft((current) => ({ ...current, ...patch }))
-  }
 
   const bindPathsMutation = useMutation({
     mutationFn: (createOutput: boolean) => api.workflowBindPaths({
@@ -337,10 +395,35 @@ export function DatasetWorkflow() {
             min_confidence: draft.ocrMinConfidence,
           }
         : { enabled: false },
-      nl: { enabled: false },
+      nl: draft.nlEnabled
+        ? {
+            enabled: true,
+            api_enabled: true,
+            ...(draft.nlProviderId ? { provider_id: draft.nlProviderId } : {}),
+            ...(draft.nlModel ? { model: draft.nlModel } : {}),
+            reuse_original_nl: draft.nlReuseOriginal,
+            use_image: draft.nlUseImage,
+            use_full_json: draft.nlUseFullJson,
+            prompt_preset: draft.nlPromptPreset,
+            length: draft.nlLength,
+          }
+        : { enabled: false },
       // Production UI jobs always stop at the explicit Count Review gate.
       // Legacy/API callers may opt out for deterministic compatibility tests.
       count_review: { enabled: true },
+      policy: draft.policyEnabled
+        ? {
+            enabled: true,
+            seed: draft.policySeed.trim() || 'workflow-default-v1',
+            directory_to_artist: true,
+            artist_dropout: draft.policyArtistDropout,
+            quality_dropout: draft.policyQualityDropout,
+            appearance_nl_solo_drop_nl: draft.policySoloDropNl,
+            appearance_nl_solo_drop_appearance: draft.policySoloDropAppearance,
+            appearance_nl_non_solo_drop_nl: draft.policyNonSoloDropNl,
+            appearance_nl_non_solo_drop_appearance: draft.policyNonSoloDropAppearance,
+          }
+        : { enabled: false },
       token_budget: draft.tokenBudgetEnabled
         ? {
             enabled: true,
@@ -625,6 +708,8 @@ export function DatasetWorkflow() {
       selectedResourcesAvailable &&
       draft.sourcePath.trim() &&
       draft.captionModelId &&
+      (!draft.nlEnabled || (draft.nlProviderId && draft.nlModel)) &&
+      (!draft.policyEnabled || draft.policySeed.trim()) &&
       (draft.workMode === 'in_place' || draft.outputPath.trim()),
   )
 
@@ -634,7 +719,9 @@ export function DatasetWorkflow() {
     classify: text.stageClassify,
     replace: text.stageReplace,
     ocr: text.stageOcr,
+    nl: text.stageNl,
     count: text.stageCount,
+    policy: text.stagePolicy,
     token: text.stageToken,
     export: text.stageExport,
   }
@@ -644,7 +731,9 @@ export function DatasetWorkflow() {
     classify: text.stageClassifyHint,
     replace: text.stageReplaceHint,
     ocr: text.stageOcrHint,
+    nl: text.enableNl,
     count: text.stageCountHint,
+    policy: text.policyHint,
     token: text.stageTokenHint,
     export: text.stageExportHint,
   }
@@ -654,7 +743,9 @@ export function DatasetWorkflow() {
     draft.classifyEnabled && text.stageClassify,
     draft.replaceEnabled && text.stageReplace,
     draft.ocrEnabled && text.stageOcr,
+    draft.nlEnabled && text.stageNl,
     text.stageCount,
+    draft.policyEnabled && text.stagePolicy,
     draft.tokenBudgetEnabled && text.stageToken,
   ].filter(Boolean).join(' · ')
   const selectedResourceIds = [
@@ -1073,6 +1164,145 @@ export function DatasetWorkflow() {
           </div>
           </Panel>
 
+          <Panel id="workflow-stage-nl" title={text.stageNl} className="workflow-stage-panel">
+          <div className="form-grid">
+          <Field label={text.enableNl}>
+            <select aria-label={text.enableNl}
+              value={draft.nlEnabled ? 'yes' : 'no'}
+              onChange={(event) => updateDraft({ nlEnabled: event.target.value === 'yes' })}
+            >
+              <option value="no">{text.no}</option>
+              <option value="yes">{text.yes}</option>
+            </select>
+          </Field>
+          {draft.nlEnabled && enabledProviders.length === 0 && (
+            <Notice tone="warning">
+              <div>{text.nlProvider}: —</div>
+              <Button type="button" size="sm" variant="secondary" icon={<ArrowRight size={14} />} onClick={() => setPage('providers')}>
+                {text.nlProvider}
+              </Button>
+            </Notice>
+          )}
+          {draft.nlEnabled && enabledProviders.length > 0 && (
+            <>
+              <Field label={text.nlProvider}>
+                <select aria-label={text.nlProvider}
+                  value={draft.nlProviderId}
+                  onChange={(event) => updateDraft({ nlProviderId: event.target.value, nlModel: '' })}
+                >
+                  <option value="">—</option>
+                  {enabledProviders.map((provider) => (
+                    <option key={provider.id} value={provider.id}>{provider.name}</option>
+                  ))}
+                </select>
+              </Field>
+              <Field label={text.nlModel}>
+                <select aria-label={text.nlModel}
+                  value={draft.nlModel}
+                  onChange={(event) => updateDraft({ nlModel: event.target.value })}
+                >
+                  <option value="">—</option>
+                  {(providerModels.data?.items ?? []).map((model) => (
+                    <option key={model.id} value={model.id}>{model.name ?? model.id}</option>
+                  ))}
+                  {draft.nlModel && !(providerModels.data?.items ?? []).some((model) => model.id === draft.nlModel) && (
+                    <option value={draft.nlModel}>{draft.nlModel}</option>
+                  )}
+                </select>
+              </Field>
+              <Field label={text.nlPreset}>
+                <select aria-label={text.nlPreset} value={draft.nlPromptPreset}
+                  onChange={(event) => updateDraft({ nlPromptPreset: event.target.value as JobDraft['nlPromptPreset'] })}
+                >
+                  <option value="general">general</option>
+                  <option value="style">style</option>
+                  <option value="character">character</option>
+                </select>
+              </Field>
+              <Field label={text.nlLength}>
+                <select aria-label={text.nlLength} value={draft.nlLength}
+                  onChange={(event) => updateDraft({ nlLength: event.target.value as JobDraft['nlLength'] })}
+                >
+                  <option value="short">short</option>
+                  <option value="medium">medium</option>
+                  <option value="long">long</option>
+                </select>
+              </Field>
+              <Field label={text.nlReuseOriginal}>
+                <select aria-label={text.nlReuseOriginal} value={draft.nlReuseOriginal ? 'yes' : 'no'}
+                  onChange={(event) => updateDraft({ nlReuseOriginal: event.target.value === 'yes' })}
+                >
+                  <option value="yes">{text.yes}</option>
+                  <option value="no">{text.no}</option>
+                </select>
+              </Field>
+              <Field label={text.nlUseImage}>
+                <select aria-label={text.nlUseImage} value={draft.nlUseImage ? 'yes' : 'no'}
+                  onChange={(event) => updateDraft({ nlUseImage: event.target.value === 'yes' })}
+                >
+                  <option value="yes">{text.yes}</option>
+                  <option value="no">{text.no}</option>
+                </select>
+              </Field>
+              <Field label={text.nlUseFullJson}>
+                <select aria-label={text.nlUseFullJson} value={draft.nlUseFullJson ? 'yes' : 'no'}
+                  onChange={(event) => updateDraft({ nlUseFullJson: event.target.value === 'yes' })}
+                >
+                  <option value="no">{text.no}</option>
+                  <option value="yes">{text.yes}</option>
+                </select>
+              </Field>
+            </>
+          )}
+          </div>
+          </Panel>
+
+          <Panel id="workflow-stage-policy" title={text.stagePolicy} className="workflow-stage-panel">
+          <div className="form-grid">
+            <Field label={text.enablePolicy}>
+              <select aria-label={text.enablePolicy}
+                value={draft.policyEnabled ? 'yes' : 'no'}
+                onChange={(event) => updateDraft({ policyEnabled: event.target.value === 'yes' })}
+              >
+                <option value="no">{text.no}</option>
+                <option value="yes">{text.yes}</option>
+              </select>
+            </Field>
+            {draft.policyEnabled && (
+              <Field label={text.policySeed}>
+                <input aria-label={text.policySeed} value={draft.policySeed}
+                  onChange={(event) => updateDraft({ policySeed: event.target.value })}
+                />
+              </Field>
+            )}
+          </div>
+          {draft.policyEnabled && (
+            <>
+              <Notice tone="info">{text.policyHint}</Notice>
+              <details className="workflow-policy-advanced">
+                <summary>{text.policyAdvanced}</summary>
+                <div className="form-grid">
+                  {([
+                    ['policyArtistDropout', text.policyArtistDropout],
+                    ['policyQualityDropout', text.policyQualityDropout],
+                    ['policySoloDropNl', text.policySoloDropNl],
+                    ['policySoloDropAppearance', text.policySoloDropAppearance],
+                    ['policyNonSoloDropNl', text.policyNonSoloDropNl],
+                    ['policyNonSoloDropAppearance', text.policyNonSoloDropAppearance],
+                  ] as const).map(([key, label]) => (
+                    <Field key={key} label={label}>
+                      <input aria-label={label} type="number" min={0} max={1} step={0.05}
+                        value={draft[key]}
+                        onChange={(event) => updateDraft({ [key]: Number(event.target.value) })}
+                      />
+                    </Field>
+                  ))}
+                </div>
+              </details>
+            </>
+          )}
+          </Panel>
+
           <Panel id="workflow-stage-token" title={text.stageToken} className="workflow-stage-panel">
           <div className="form-grid">
           <Field label={text.enableTokenBudget} help={fieldHelp('tokenBudgetEnabled')} helpLabels={text.helpLabels}>
@@ -1338,7 +1568,8 @@ export function DatasetWorkflow() {
                 {text.cancelJob}
               </Button>
             )}
-            {['interrupted', 'failed', 'rollback_required'].includes(selectedJob.status) && (
+            {!selectedJob.discarded_at &&
+              ['interrupted', 'failed', 'rollback_required'].includes(selectedJob.status) && (
               <Button
                 variant="secondary"
                 onClick={() => jobAction.mutate('recover')}
@@ -1348,7 +1579,8 @@ export function DatasetWorkflow() {
                 {text.recoverJob}
               </Button>
             )}
-            {selectedJob.work_mode === 'in_place' &&
+            {!selectedJob.discarded_at &&
+              selectedJob.work_mode === 'in_place' &&
               ['completed', 'failed', 'cancelled', 'interrupted', 'rollback_required'].includes(selectedJob.status) && (
                 <Button
                   variant="outline"
@@ -1359,7 +1591,8 @@ export function DatasetWorkflow() {
                   {text.restoreJob}
                 </Button>
               )}
-            {['completed', 'failed', 'cancelled', 'interrupted', 'rollback_required'].includes(selectedJob.status) && (
+            {!selectedJob.discarded_at &&
+              ['completed', 'failed', 'cancelled', 'interrupted', 'rollback_required'].includes(selectedJob.status) && (
               <Button
                 variant="quiet"
                 onClick={() => discardJob.mutate(selectedJob.job_id)}
@@ -1370,14 +1603,16 @@ export function DatasetWorkflow() {
                 {text.discardJob}
               </Button>
             )}
-            <Button
-              variant="quiet"
-              onClick={() => repairJob.mutate()}
-              disabled={repairJob.isPending}
-            >
-              <Wrench size={15} aria-hidden="true" />
-              {text.repairJob}
-            </Button>
+            {!selectedJob.discarded_at && (
+              <Button
+                variant="quiet"
+                onClick={() => repairJob.mutate()}
+                disabled={repairJob.isPending}
+              >
+                <Wrench size={15} aria-hidden="true" />
+                {text.repairJob}
+              </Button>
+            )}
           </div>
           {selectedJob.pinned && (
             <Notice tone="info">

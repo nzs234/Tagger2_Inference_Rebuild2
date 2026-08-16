@@ -1,6 +1,6 @@
 # Tagger2 Inference Rebuild
 
-**V1.01 · Windows 本地优先的图像打标与数据集工作流工作台**
+**V1.03 · Windows 本地优先的图像打标与数据集工作流工作台**
 
 Tagger2 Inference Rebuild 将本地 Caption 模型推理、单图/批量任务、e621 标签整理、确定性标签替换、可选 OCR、数量复核、Token 检查和 JSON/TXT 导出统一到一个可复现的 FastAPI + React 应用中。原项目仓库保持不变，本仓库是独立重建版本。
 

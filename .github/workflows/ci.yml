@@ -1,0 +1,49 @@
+name: validation
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    env:
+      PYTHONPATH: backend
+      TAGGER2_UPSTREAM_SOURCE_ROOT: ${{ github.workspace }}/upstream
+    steps:
+      - uses: actions/checkout@v4
+      - name: Checkout fixed workflow source
+        uses: actions/checkout@v4
+        with:
+          repository: lse14/e621-standard-caption-workflow
+          ref: ccc9d07497be637fc097c5da009d791f017144c9
+          path: upstream
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install backend dependencies
+        run: python -m pip install -r requirements-dev.txt
+      - name: Backend tests and static analysis
+        run: |
+          python -m pytest backend/tests -q
+          python -m ruff check backend scripts
+          python -m mypy backend scripts
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+      - name: Frontend tests and build
+        working-directory: frontend
+        run: |
+          npm test
+          npm run lint
+          npm run build
+      - name: Browser tests
+        working-directory: frontend
+        run: |
+          npx playwright install --with-deps chromium
+          npm run test:e2e

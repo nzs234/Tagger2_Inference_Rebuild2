@@ -32,7 +32,7 @@ def test_schema_v2_adds_lease_columns():
     """Lease bookkeeping exists so an interrupted sample is detectable."""
     from backend.tagger2.workflow.db_schema import SCHEMA_VERSION
 
-    assert SCHEMA_VERSION == 3
+    assert SCHEMA_VERSION == 4
 
     with tempfile.TemporaryDirectory() as tmpdir:
         database, _job_id, _workspace, _lifecycle = _setup(tmpdir)
@@ -142,6 +142,45 @@ def test_lease_prevents_two_workers_claiming_one_sample():
         assert lifecycle.claim_sample(0, owner="worker-b") is False
         # The holder can refresh its own lease.
         assert lifecycle.claim_sample(0, owner="worker-a") is True
+
+
+def test_batch_lease_claim_heartbeat_and_release_are_bounded():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        database, job_id, _workspace, lifecycle = _setup(tmpdir, sample_count=3)
+
+        claimed = lifecycle.claim_batch([0, 1, 2], owner="batch-worker")
+        assert claimed == [0, 1, 2]
+        assert lifecycle.heartbeat_samples(claimed, owner="batch-worker") == 3
+        assert lifecycle.release_batch(
+            {0: "completed", 1: "failed", 2: "skipped"},
+            owner="batch-worker",
+        ) == 3
+        with database.connection() as conn:
+            rows = conn.execute(
+                "SELECT sample_id, status, lease_owner, lease_expires_at"
+                " FROM workflow_samples WHERE job_id = ? ORDER BY sample_id",
+                (job_id,),
+            ).fetchall()
+        assert [(row["sample_id"], row["status"]) for row in rows] == [
+            (0, "completed"),
+            (1, "failed"),
+            (2, "skipped"),
+        ]
+        assert all(row["lease_owner"] is None and row["lease_expires_at"] is None for row in rows)
+
+
+def test_concurrent_batch_claims_survive_sqlite_lock_contention():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        _database, _job_id, _workspace, lifecycle = _setup(tmpdir, sample_count=20)
+
+        def claim(index: int):
+            return lifecycle.claim_batch(range(20), owner=f"worker-{index}")
+
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            results = list(executor.map(claim, range(8)))
+
+        winners = [result for result in results if result]
+        assert winners == [list(range(20))]
 
 
 def test_expired_lease_is_reclaimable():

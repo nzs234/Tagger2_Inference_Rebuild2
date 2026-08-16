@@ -9,6 +9,9 @@ same workspace and commit contract.
 from __future__ import annotations
 
 import json
+import hashlib
+from random import Random
+import uuid
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -30,6 +33,7 @@ from .commit import (
     ExportStaging,
     StagedFile,
     commit_staged_files,
+    sha256_file,
     verify_annotation_backup_baseline,
     write_annotation_backup,
 )
@@ -41,6 +45,11 @@ from .contracts import (
 )
 from .dataset_import import ImportedSample, ImportResult, import_dataset
 from .ocr import OCREngine, run_ocr_stage
+from .projection_checkpoint import (
+    ProjectionCheckpointError,
+    load_projection_checkpoint,
+    write_projection_checkpoint,
+)
 from .replacement_index import load_replacement_rules
 from .stages.caption import (
     CaptionStageReport,
@@ -133,6 +142,46 @@ class PipelineReport:
             "backup_path": self.backup_path,
             "resource_fingerprints": dict(self.resource_fingerprints),
         }
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> PipelineReport:
+        """Rehydrate the private report stored beside a projection checkpoint."""
+
+        report = cls(
+            total_samples=int(value.get("total_samples", 0)),
+            exported_samples=int(value.get("exported_samples", 0)),
+            failed_samples=int(value.get("failed_samples", 0)),
+            skipped_samples=int(value.get("skipped_samples", 0)),
+            committed_files=int(value.get("committed_files", 0)),
+            replacement=dict(value.get("replacement") or {}),
+            caption=dict(value.get("caption") or {}),
+            ocr=dict(value.get("ocr") or {}),
+            nl=dict(value.get("nl") or {}),
+            policy=dict(value.get("policy") or {}),
+            token_budget=dict(value.get("token_budget") or {}),
+            token_overflows=[dict(item) for item in value.get("token_overflows") or []],
+            backup_path=(str(value["backup_path"]) if value.get("backup_path") else None),
+            resource_fingerprints=dict(value.get("resource_fingerprints") or {}),
+        )
+        for item in value.get("issues") or []:
+            if not isinstance(item, Mapping):
+                raise ProjectionCheckpointError("checkpoint report contains an invalid issue")
+            report.issues.append(
+                StageIssue(
+                    sample_id=(None if item.get("sample_id") is None else int(item["sample_id"])),
+                    relative_image_path=(
+                        None
+                        if item.get("relative_image_path") is None
+                        else str(item["relative_image_path"])
+                    ),
+                    module_id=str(item.get("module_id", "pipeline")),
+                    code=str(item.get("code", "checkpoint_issue")),
+                    message=str(item.get("message", "")),
+                    severity=str(item.get("severity", "error")),
+                    blocking=bool(item.get("blocking", True)),
+                )
+            )
+        return report
 
 
 class _StageRunTracker:
@@ -254,6 +303,23 @@ def build_projection(sample: ImportedSample) -> PartialNineFieldAnnotation:
         "nl": sample.nl,
     }
     return projection
+
+
+def _replacement_random_value(
+    job_id: str | None,
+    sample: ImportedSample,
+) -> Callable[[], float] | None:
+    """Return a stable per-job/sample RNG without changing the upstream port."""
+
+    if not job_id:
+        return None
+    seed_material = (
+        f"tagger2-replacement-v1\0{job_id}\0{sample.sample_id}\0"
+        f"{sample.relative_image_path}"
+    ).encode("utf-8")
+    seed = int.from_bytes(hashlib.sha256(seed_material).digest(), "big")
+    rng = Random(seed)
+    return rng.random
 
 
 def _parse_policy_config(config_arg: dict[str, Any] | PolicyConfig) -> PolicyConfig:
@@ -417,27 +483,74 @@ def _run_offline_pipeline_impl(
         )
         report.failed_samples += 1
 
+    checkpoint: dict[str, Any] | None = None
+    resume_cursor: str | None = None
+    resume_projections: dict[str, dict[str, Any]] = {}
+    resume_completed_ids: set[int] = set()
+    if database is not None and job_id is not None:
+        checkpoint = load_projection_checkpoint(
+            workspace,
+            job_id=job_id,
+            config_hash=config.config_hash(),
+            resource_fingerprints=resource_fingerprints or {},
+            samples=imported.samples,
+        )
+        if checkpoint is not None:
+            resume_cursor = str(checkpoint["stage_cursor"])
+            resume_projections = {
+                str(sample_id): dict(projection)
+                for sample_id, projection in dict(checkpoint["projections"]).items()
+            }
+            report = PipelineReport.from_dict(dict(checkpoint["report"]))
+            report.total_samples = len(imported.samples)
+            report.exported_samples = 0
+            report.committed_files = 0
+            if resume_cursor == "count_review":
+                report.policy = {}
+                report.token_budget = {}
+                report.token_overflows = []
+            elif resume_cursor == "token_review":
+                overflow_issues = [
+                    issue for issue in report.issues if issue.code == "token_budget_overflow"
+                ]
+                report.failed_samples = max(0, report.failed_samples - len(overflow_issues))
+                report.issues = [
+                    issue for issue in report.issues if issue.code != "token_budget_overflow"
+                ]
+                report.token_budget = {}
+                report.token_overflows = []
+            elif resume_cursor == "projection":
+                with database.connection() as conn:
+                    rows = conn.execute(
+                        "SELECT sample_id FROM workflow_samples"
+                        " WHERE job_id = ? AND status = 'completed'",
+                        (job_id,),
+                    ).fetchall()
+                resume_completed_ids = {int(row["sample_id"]) for row in rows}
+                report.exported_samples = len(resume_completed_ids)
+
     # Freeze the input manifest before anything is written.
     manifest_path = workspace / "input_manifest.jsonl"
-    with manifest_path.open("w", encoding="utf-8") as stream:
-        for sample in imported.samples:
-            stream.write(
-                canonical_json(
-                    {
-                        "sample_id": sample.sample_id,
-                        "relative_image_path": sample.relative_image_path,
-                        "annotation_key": sample.annotation_key,
-                        "image_format": sample.image_format,
-                        "annotation_kind": sample.annotation_kind,
-                        "skip_caption": sample.skip_caption,
-                    }
+    if checkpoint is None:
+        with manifest_path.open("w", encoding="utf-8") as stream:
+            for sample in imported.samples:
+                stream.write(
+                    canonical_json(
+                        {
+                            "sample_id": sample.sample_id,
+                            "relative_image_path": sample.relative_image_path,
+                            "annotation_key": sample.annotation_key,
+                            "image_format": sample.image_format,
+                            "annotation_kind": sample.annotation_kind,
+                            "skip_caption": sample.skip_caption,
+                        }
+                    )
+                    + "\n"
                 )
-                + "\n"
-            )
-    (workspace / "config_snapshot.json").write_text(
-        json.dumps(config.to_dict(), ensure_ascii=False, indent=2, sort_keys=True, default=str),
-        encoding="utf-8",
-    )
+        (workspace / "config_snapshot.json").write_text(
+            json.dumps(config.to_dict(), ensure_ascii=False, indent=2, sort_keys=True, default=str),
+            encoding="utf-8",
+        )
     resource_snapshot = {
         resource_id: {
             "fingerprint": fingerprint,
@@ -445,10 +558,11 @@ def _run_offline_pipeline_impl(
         }
         for resource_id, fingerprint in (resource_fingerprints or {}).items()
     }
-    (workspace / "resource_snapshot.json").write_text(
-        json.dumps(resource_snapshot, ensure_ascii=False, indent=2, sort_keys=True),
-        encoding="utf-8",
-    )
+    if checkpoint is None:
+        (workspace / "resource_snapshot.json").write_text(
+            json.dumps(resource_snapshot, ensure_ascii=False, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
     if database is not None and job_id is not None:
         with database.connection() as conn:
             for resource_id, fingerprint in (resource_fingerprints or {}).items():
@@ -472,10 +586,10 @@ def _run_offline_pipeline_impl(
             total=report.total_samples,
             checkpoint={"checkpoint": "starting"},
         )
-        if config.caption.get("enabled")
+        if config.caption.get("enabled") and checkpoint is None
         else None
     )
-    if config.caption.get("enabled"):
+    if config.caption.get("enabled") and checkpoint is None:
         if tag_predictor is None:
             raise PipelineError("caption stage is enabled but no tag predictor was provided")
         caption_report: CaptionStageReport = run_caption_stage(
@@ -532,10 +646,10 @@ def _run_offline_pipeline_impl(
             total=report.total_samples,
             checkpoint={"checkpoint": "starting"},
         )
-        if config.ocr.get("enabled")
+        if config.ocr.get("enabled") and checkpoint is None
         else None
     )
-    if config.ocr.get("enabled"):
+    if config.ocr.get("enabled") and checkpoint is None:
         ocr_results, ocr_issues = run_ocr_stage(
             workspace,
             {
@@ -587,10 +701,10 @@ def _run_offline_pipeline_impl(
             total=report.total_samples,
             checkpoint={"checkpoint": "starting"},
         )
-        if config.classify.get("enabled")
+        if config.classify.get("enabled") and checkpoint is None
         else None
     )
-    if classification_rules is not None:
+    if classification_rules is not None and checkpoint is None:
         # Build a combined tags source: prefer caption_tags, fallback to imported tags
         tags_to_classify: dict[str, tuple[str, ...]] = {}
         
@@ -635,7 +749,7 @@ def _run_offline_pipeline_impl(
 
     rules = {}
     replace_stage_run = None
-    if config.replace.get("enabled"):
+    if config.replace.get("enabled") and checkpoint is None:
         if replacement_index_path is None:
             raise PipelineError("replace stage is enabled but no replacement index was provided")
         rules = load_replacement_rules(Path(replacement_index_path))
@@ -670,13 +784,59 @@ def _run_offline_pipeline_impl(
         job_id=job_id,
     )
     staged: list[StagedFile] = []
-    exported_sample_ids: set[int] = set()
+    if database is not None and job_id is not None and hasattr(database, "list_artifacts"):
+        for artifact in database.list_artifacts(job_id, kind="staged_export"):
+            relative_path = str(artifact["relative_path"])
+            staged_path = staging.staged_path(relative_path)
+            expected_size = int(artifact["size_bytes"])
+            expected_digest = str(artifact["sha256"])
+            if (
+                not staged_path.is_file()
+                or staged_path.stat().st_size != expected_size
+                or sha256_file(staged_path) != expected_digest
+            ):
+                raise PipelineError("persisted staged artifact failed integrity verification")
+            staged.append(
+                StagedFile(
+                    relative_path=relative_path,
+                    sha256=expected_digest,
+                    size=expected_size,
+                )
+            )
+
+    def append_staged(item: StagedFile) -> None:
+        staged.append(item)
+        if database is not None and job_id is not None and hasattr(database, "record_artifact"):
+            database.record_artifact(
+                job_id,
+                kind="staged_export",
+                relative_path=item.relative_path,
+                sha256=item.sha256,
+                size_bytes=item.size,
+            )
+
+    exported_sample_ids: set[int] = set(resume_completed_ids)
     # Persist complete projections independently of staging.  Review actions
     # use this immutable workspace overlay to rebuild JSON/TXT bytes without
     # re-running model stages or touching the target dataset.
     review_projections: dict[str, dict[str, Any]] = {}
-    totals = ReplacementSummary(0, 0, 0, 0)
-    policy_counts: dict[str, int] = {"artist_dropped": 0, "quality_dropped": 0}
+    totals = ReplacementSummary(
+        int(report.replacement.get("replaced", 0)),
+        int(report.replacement.get("dropped", 0)),
+        int(report.replacement.get("passthrough", 0)),
+        int(report.replacement.get("keep_rewritten", 0)),
+    )
+    building_count_checkpoint = bool(
+        resume_cursor in {None, "projection"}
+        and database is not None
+        and job_id is not None
+        and config.count_review.get("enabled")
+    )
+    policy_counts: dict[str, int] = (
+        dict(report.policy)
+        if resume_cursor == "token_review"
+        else {"artist_dropped": 0, "quality_dropped": 0}
+    )
     budget_counts: dict[str, int] = {}
     policy_stage_run = (
         stage_tracker.begin(
@@ -685,6 +845,8 @@ def _run_offline_pipeline_impl(
             checkpoint={"checkpoint": "starting"},
         )
         if policy_config is not None
+        and not building_count_checkpoint
+        and resume_cursor != "token_review"
         else None
     )
     token_stage_run = (
@@ -693,7 +855,9 @@ def _run_offline_pipeline_impl(
             total=report.total_samples,
             checkpoint={"checkpoint": "starting"},
         )
-        if config.token_budget.get("enabled") and token_counter is not None
+        if config.token_budget.get("enabled")
+        and token_counter is not None
+        and not building_count_checkpoint
         else None
     )
     # Public API keeps the stable ``txt`` spelling; the normalizer uses the
@@ -721,12 +885,18 @@ def _run_offline_pipeline_impl(
             total=report.total_samples,
             checkpoint={"checkpoint": "starting"},
         )
-        if config.nl.get("enabled")
+        if checkpoint is None
+        and config.nl.get("enabled")
         and config.nl.get("api_enabled")
         and nl_client is not None
         else None
     )
-    if config.nl.get('enabled') and config.nl.get('api_enabled') and nl_client is not None:
+    if (
+        checkpoint is None
+        and config.nl.get('enabled')
+        and config.nl.get('api_enabled')
+        and nl_client is not None
+    ):
         # Build projections dict for NL stage (needs full nine-field structure)
         temp_projections: dict[str, dict[str, Any]] = {}
         for sample in imported.samples:
@@ -803,81 +973,223 @@ def _run_offline_pipeline_impl(
                 },
             )
 
-    export_stage_run = stage_tracker.begin(
-        "export",
-        total=report.total_samples,
-        checkpoint={"checkpoint": "staging"},
+    # Freeze the complete post-Caption/Classify/Replace/OCR/NL projection even
+    # when no human review is configured.  A process restart can then resume
+    # deterministic Policy/Token/Export work without invoking a model or
+    # remote provider again.
+    upstream_projections: dict[str, dict[str, Any]] = {}
+    if checkpoint is not None:
+        upstream_projections = {
+            str(sample_id): dict(projection)
+            for sample_id, projection in resume_projections.items()
+        }
+    else:
+        for sample in imported.samples:
+            try:
+                if sample.annotation_kind == "standard_json":
+                    document = json.loads(
+                        (source_root / Path(sample.annotation_key + ".json"))
+                        .read_bytes()
+                        .decode("utf-8-sig")
+                    )
+                    projection = {
+                        field_name: document.get(field_name) for field_name in NINE_FIELDS
+                    }
+                    projection = {
+                        key: (
+                            []
+                            if value is None
+                            and key in {"quality", "appearance", "tags", "environment"}
+                            else value
+                        )
+                        for key, value in projection.items()
+                    }
+                    if not projection["tags"]:
+                        projection["tags"] = list(sample.tags)
+                    projection = {
+                        key: ("" if value is None else value)
+                        for key, value in projection.items()
+                    }
+                else:
+                    projection = dict(build_projection(sample))
+                    classified = classified_projections.get(sample.relative_image_path)
+                    if classified:
+                        projection["quality"] = classified.get("quality", [])
+                        if sample.annotation_kind == "raw_e621_json":
+                            projection["tags"] = [
+                                tag
+                                for tag in classified.get("tags", [])
+                                if tag != projection["character"]
+                            ]
+                        else:
+                            projection["character"] = ", ".join(
+                                classified.get("character", [])
+                            )
+                            projection["tags"] = classified.get("tags", [])
+                            projection["artist"] = merge_artists(
+                                str(projection["artist"]),
+                                ", ".join(classified.get("artist", [])),
+                            )
+                        projection["appearance"] = classified.get("appearance", [])
+                        projection["environment"] = classified.get("environment", [])
+                    elif caption_tags.get(sample.relative_image_path):
+                        projection["tags"] = list(caption_tags[sample.relative_image_path])
+                    elif config.caption.get("enabled") and not sample.skip_caption:
+                        continue
+
+                if rules:
+                    random_value = _replacement_random_value(job_id, sample)
+                    if random_value is None:
+                        projection, summary = replace_projection(projection, rules)
+                    else:
+                        projection, summary = replace_projection(
+                            projection,
+                            rules,
+                            random_value=random_value,
+                        )
+                    totals = totals.merge(summary)
+
+                if nl_projections and sample.relative_image_path in nl_projections:
+                    projection["nl"] = nl_projections[sample.relative_image_path].nl
+                upstream_projections[str(sample.sample_id)] = dict(projection)
+            except (ReplacementError, ValueError, OSError) as exc:
+                report.issues.append(
+                    StageIssue(
+                        sample_id=sample.sample_id,
+                        relative_image_path=sample.relative_image_path,
+                        module_id="export",
+                        code="sample_failed",
+                        message=str(exc),
+                    )
+                )
+                report.failed_samples += 1
+
+        report.replacement = {
+            "replaced": totals.replaced,
+            "dropped": totals.dropped,
+            "passthrough": totals.passthrough,
+            "keep_rewritten": totals.keep_rewritten,
+        }
+        if database is not None and job_id is not None and upstream_projections:
+            checkpoint_path, checkpoint_digest, checkpoint_size = (
+                write_projection_checkpoint(
+                    workspace,
+                    stage_cursor="projection",
+                    job_id=job_id,
+                    config_hash=config.config_hash(),
+                    resource_fingerprints=resource_fingerprints or {},
+                    samples=imported.samples,
+                    projections=upstream_projections,
+                    report=report.as_dict(),
+                )
+            )
+            if hasattr(database, "record_artifact"):
+                database.record_artifact(
+                    job_id,
+                    kind="projection_checkpoint",
+                    relative_path=checkpoint_path.relative_to(workspace).as_posix(),
+                    sha256=checkpoint_digest,
+                    size_bytes=checkpoint_size,
+                )
+
+    lease_lifecycle = None
+    lease_owner = ""
+    lease_outcomes: dict[int, str] = {}
+    previously_failed_sample_ids = {
+        int(issue.sample_id)
+        for issue in report.issues
+        if issue.sample_id is not None and issue.severity == "error"
+    }
+    if database is not None and job_id is not None and resume_cursor in {None, "projection"}:
+        from .lifecycle import JobLifecycle
+
+        lease_lifecycle = JobLifecycle(database, job_id)
+        lease_owner = f"pipeline-{job_id}-{uuid.uuid4().hex}"
+
+    def leased_samples() -> Any:
+        if lease_lifecycle is None:
+            yield from imported.samples
+            return
+        for offset in range(0, len(imported.samples), 500):
+            batch = imported.samples[offset : offset + 500]
+            claimed = lease_lifecycle.claim_batch(
+                [sample.sample_id for sample in batch],
+                owner=lease_owner,
+            )
+            if not claimed:
+                continue
+            claimed_set = set(claimed)
+            lease_lifecycle.heartbeat_samples(claimed, owner=lease_owner)
+            try:
+                for index, sample in enumerate(batch):
+                    if sample.sample_id not in claimed_set:
+                        continue
+                    yield sample
+                    if (index + 1) % 50 == 0:
+                        remaining = [
+                            item.sample_id
+                            for item in batch[index + 1 :]
+                            if item.sample_id in claimed_set
+                        ]
+                        if remaining:
+                            lease_lifecycle.heartbeat_samples(
+                                remaining,
+                                owner=lease_owner,
+                            )
+            finally:
+                lease_lifecycle.release_batch(
+                    {
+                        sample_id: lease_outcomes.pop(sample_id, "pending")
+                        for sample_id in claimed
+                    },
+                    owner=lease_owner,
+                )
+
+    export_stage_run = (
+        stage_tracker.begin(
+            "export",
+            total=report.total_samples,
+            checkpoint={"checkpoint": "staging"},
+        )
+        if not building_count_checkpoint
+        else None
     )
-    for sample in imported.samples:
+    for sample in leased_samples():
         if control_state() in {"pausing", "paused", "cancelling", "cancelled", "interrupted"}:
             break
+        failures_before = report.failed_samples
         try:
-            if sample.annotation_kind == "standard_json":
-                document = json.loads(
-                    (source_root / Path(sample.annotation_key + ".json")).read_bytes().decode("utf-8-sig")
+            stored_projection = upstream_projections.get(str(sample.sample_id))
+            if stored_projection is None:
+                continue
+            projection = dict(stored_projection)
+
+            if building_count_checkpoint:
+                review_projections[str(sample.sample_id)] = dict(projection)
+                report.exported_samples += 1
+                exported_sample_ids.add(sample.sample_id)
+                continue
+
+            # Count review is upstream of Policy.  Refuse a partial overlay:
+            # every checkpointed sample must carry an explicit reviewed value.
+            if resume_cursor == "count_review" and sample.sample_id not in confirmed_counts:
+                raise ProjectionCheckpointError(
+                    f"count review overlay is missing sample {sample.sample_id}"
                 )
-                projection = {field_name: document.get(field_name) for field_name in NINE_FIELDS}
-                projection = {
-                    key: ([] if value is None and key in {"quality", "appearance", "tags", "environment"} else value)
-                    for key, value in projection.items()
-                }
-                if not projection["tags"]:
-                    projection["tags"] = list(sample.tags)
-                projection = {
-                    key: ("" if value is None else value) for key, value in projection.items()
-                }
-            else:
-                projection = dict(build_projection(sample))
-                
-                # Use classified projection if available, otherwise fall back to raw tags
-                classified = classified_projections.get(sample.relative_image_path)
-                if classified:
-                    # Merge classified fields into projection
-                    projection["quality"] = classified.get("quality", [])
-                    # For raw_e621_json, preserve original character/artist from import
-                    if sample.annotation_kind == "raw_e621_json":
-                        # Remove character from tags to avoid collision
-                        projection["tags"] = [
-                            tag
-                            for tag in classified.get("tags", [])
-                            if tag != projection["character"]
-                        ]
-                    else:
-                        projection["character"] = ", ".join(classified.get("character", []))
-                        projection["tags"] = classified.get("tags", [])
-                        # Classified artist tags would otherwise be dropped
-                        # entirely; merge them into the `artist` string field
-                        # without overwriting an artist supplied by the input.
-                        projection["artist"] = merge_artists(
-                            str(projection["artist"]),
-                            ", ".join(classified.get("artist", [])),
-                        )
-                    projection["appearance"] = classified.get("appearance", [])
-                    projection["environment"] = classified.get("environment", [])
-                elif caption_tags.get(sample.relative_image_path):
-                    # No classification rules, use raw caption tags
-                    projection["tags"] = list(caption_tags[sample.relative_image_path])
-                elif config.caption.get("enabled") and not sample.skip_caption:
-                    # Caption was requested but produced nothing usable for this
-                    # sample; its failure is already recorded as an issue.
-                    continue
+            if sample.sample_id in confirmed_counts:
+                projection["count"] = confirmed_counts[sample.sample_id]
 
-            if rules:
-                projection, summary = replace_projection(projection, rules)
-                totals = totals.merge(summary)
-
-            # Convert dict to PolicyConfig dataclass
-            if policy_config is not None:
+            parsed_policy_config = None
+            if policy_config is not None and resume_cursor != "token_review":
                 parsed_policy_config = _parse_policy_config(policy_config)
-                policy_config = parsed_policy_config
 
-            if policy_config is not None:
+            if parsed_policy_config is not None:
                 try:
                     projection, decision = apply_policy(
                         projection,
                         annotation_key=sample.annotation_key,
                         relative_image_path=sample.relative_image_path,
-                        config=policy_config,
+                        config=parsed_policy_config,
                         aesthetic_score=None,
                     )
                 except PolicyError as exc:
@@ -898,15 +1210,9 @@ def _run_offline_pipeline_impl(
                     policy_counts.get(decision.appearanceNlAction, 0) + 1
                 )
 
-            # Merge NL result if available
-            if nl_projections and sample.relative_image_path in nl_projections:
-                projection["nl"] = nl_projections[sample.relative_image_path].nl
-
-            # Human decisions are applied as an overlay.  They are deliberately
-            # evaluated before policy/token/export so every downstream stage
-            # sees the reviewed values.
-            if sample.sample_id in confirmed_counts:
-                projection["count"] = confirmed_counts[sample.sample_id]
+            # Token review is downstream of Policy.  The token checkpoint
+            # therefore stores post-policy/pre-budget data and applies only the
+            # reviewed NL text when it resumes.
             if sample.sample_id in applied_token_texts:
                 projection["nl"] = applied_token_texts[sample.sample_id]
 
@@ -1004,8 +1310,6 @@ def _run_offline_pipeline_impl(
                     continue
                 projection = dict(budget.annotation)
 
-            review_projections[str(sample.sample_id)] = dict(projection)
-
             normalization_format = "both" if export_format == "both" else (
                 "json" if export_format == "json" else "flat_txt"
             )
@@ -1036,11 +1340,11 @@ def _run_offline_pipeline_impl(
                 continue
 
             if export_format in {"json", "both"}:
-                staged.append(
+                append_staged(
                     staging.stage(sample.annotation_key + ".json", normalized.json_bytes)
                 )
             if export_format in {"flat_txt", "both"}:
-                staged.append(
+                append_staged(
                     staging.stage(
                         sample.annotation_key + ".txt",
                         serialize_flat_txt(normalized.payload, policy),
@@ -1054,7 +1358,9 @@ def _run_offline_pipeline_impl(
             if config.work_mode == "full_copy":
                 source_image = source_root / sample.relative_image_path
                 if source_image.is_file():
-                    staged.append(staging.stage_file(sample.relative_image_path, source_image))
+                    append_staged(
+                        staging.stage_file(sample.relative_image_path, source_image)
+                    )
 
             report.exported_samples += 1
             exported_sample_ids.add(sample.sample_id)
@@ -1070,6 +1376,17 @@ def _run_offline_pipeline_impl(
                 )
             )
             report.failed_samples += 1
+        finally:
+            if lease_lifecycle is not None:
+                if sample.sample_id in exported_sample_ids:
+                    lease_outcomes[sample.sample_id] = "completed"
+                elif (
+                    sample.sample_id in previously_failed_sample_ids
+                    or report.failed_samples > failures_before
+                ):
+                    lease_outcomes[sample.sample_id] = "failed"
+                else:
+                    lease_outcomes[sample.sample_id] = "skipped"
 
     if export_stage_run is not None:
         export_control_state = control_state()
@@ -1153,17 +1470,29 @@ def _run_offline_pipeline_impl(
         }
         with database.connection() as conn:
             now = utc_now()
-            for sample in imported.samples:
-                if sample.sample_id in exported_sample_ids:
-                    sample_status = "completed"
-                elif sample.sample_id in issue_sample_ids:
-                    sample_status = "failed"
-                else:
-                    sample_status = "skipped"
-                conn.execute(
-                    "UPDATE workflow_samples SET status = ?, updated_at = ? WHERE job_id = ? AND sample_id = ?",
-                    (sample_status, now, job_id, sample.sample_id),
-                )
+            if lease_lifecycle is None:
+                for sample in imported.samples:
+                    if sample.sample_id in exported_sample_ids:
+                        sample_status = "completed"
+                    elif sample.sample_id in issue_sample_ids:
+                        sample_status = "failed"
+                    else:
+                        sample_status = "skipped"
+                    conn.execute(
+                        "UPDATE workflow_samples SET status = ?, updated_at = ? WHERE job_id = ? AND sample_id = ?",
+                        (sample_status, now, job_id, sample.sample_id),
+                    )
+            status_rows = conn.execute(
+                "SELECT status, COUNT(*) AS total FROM workflow_samples"
+                " WHERE job_id = ? GROUP BY status",
+                (job_id,),
+            ).fetchall()
+            status_totals = {
+                str(row["status"]): int(row["total"]) for row in status_rows
+            }
+            completed_total = status_totals.get("completed", 0)
+            failed_total = status_totals.get("failed", 0)
+            skipped_total = status_totals.get("skipped", 0)
             conn.execute(
                 """
                 UPDATE workflow_jobs
@@ -1172,10 +1501,10 @@ def _run_offline_pipeline_impl(
                  WHERE job_id = ?
                 """,
                 (
-                    report.exported_samples + report.failed_samples + report.skipped_samples,
-                    report.exported_samples,
-                    report.failed_samples,
-                    report.skipped_samples,
+                    completed_total + failed_total + skipped_total,
+                    completed_total,
+                    failed_total,
+                    skipped_total,
                     job_id,
                 ),
             )
@@ -1196,7 +1525,7 @@ def _run_offline_pipeline_impl(
         # bundled wiki snapshot is optional; an empty catalog makes the rules
         # preserve the original value and exposes the uncertainty to the
         # reviewer instead of fabricating a count.
-        if config.count_review.get("enabled") and imported.samples:
+        if building_count_checkpoint and imported.samples:
             from .count_review import (
                 CountReviewStore,
                 create_wiki_catalog,
@@ -1233,12 +1562,53 @@ def _run_offline_pipeline_impl(
             )
             CountReviewStore(database, job_id).initialize(evidence)
 
+            checkpoint_path, checkpoint_digest, checkpoint_size = (
+                write_projection_checkpoint(
+                    workspace,
+                    stage_cursor="count_review",
+                    job_id=job_id,
+                    config_hash=config.config_hash(),
+                    resource_fingerprints=resource_fingerprints or {},
+                    samples=imported.samples,
+                    projections=review_projections,
+                    report=report.as_dict(),
+                )
+            )
+            if hasattr(database, "record_artifact"):
+                database.record_artifact(
+                    job_id,
+                    kind="projection_checkpoint_count",
+                    relative_path=checkpoint_path.relative_to(workspace).as_posix(),
+                    sha256=checkpoint_digest,
+                    size_bytes=checkpoint_size,
+                )
+
         # Token rows are initialized here as well as by the API for backward
         # compatibility.  ``INSERT OR IGNORE`` makes the two paths harmless.
         if report.token_overflows:
             from .token_budget_review import TokenBudgetReviewStore
 
             TokenBudgetReviewStore(database, job_id).initialize(report.token_overflows)
+            checkpoint_path, checkpoint_digest, checkpoint_size = (
+                write_projection_checkpoint(
+                    workspace,
+                    stage_cursor="token_review",
+                    job_id=job_id,
+                    config_hash=config.config_hash(),
+                    resource_fingerprints=resource_fingerprints or {},
+                    samples=imported.samples,
+                    projections=review_projections,
+                    report=report.as_dict(),
+                )
+            )
+            if hasattr(database, "record_artifact"):
+                database.record_artifact(
+                    job_id,
+                    kind="projection_checkpoint_token",
+                    relative_path=checkpoint_path.relative_to(workspace).as_posix(),
+                    sha256=checkpoint_digest,
+                    size_bytes=checkpoint_size,
+                )
 
         # Every issue is visible in the control plane before the job can enter
         # a waiting state. Keep prior rows for audit; recovery attempts get a
@@ -1359,16 +1729,8 @@ def _run_offline_pipeline_impl(
         database.update_job_status(job_id, "committing", expected_status=current_state)
 
     dataset_root.mkdir(parents=True, exist_ok=True)
+    staged = list({item.relative_path: item for item in staged}.values())
     report.committed_files = commit_staged_files(dataset_root, staging, staged, journal)
-    if database is not None and job_id is not None and hasattr(database, "record_artifact"):
-        for item in staged:
-            database.record_artifact(
-                job_id,
-                kind="staged_export",
-                relative_path=item.relative_path,
-                sha256=item.sha256,
-                size_bytes=item.size,
-            )
     finish_pipeline_stage("completed", processed=report.exported_samples)
     _write_issue_log(workspace, report)
     return report

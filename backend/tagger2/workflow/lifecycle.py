@@ -11,6 +11,7 @@ failing is parked rather than retried without limit.
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -184,40 +185,122 @@ class JobLifecycle:
         cannot process it at once.
         """
 
+        return sample_id in self.claim_batch(
+            [sample_id],
+            owner=owner,
+            lease_seconds=lease_seconds,
+        )
+
+    def claim_batch(
+        self,
+        sample_ids: Sequence[int],
+        *,
+        owner: str,
+        lease_seconds: int = DEFAULT_LEASE_SECONDS,
+    ) -> list[int]:
+        """Claim up to 500 samples atomically and return the acquired ids."""
+
+        normalized = list(dict.fromkeys(int(sample_id) for sample_id in sample_ids))
+        if len(normalized) > 500:
+            raise LifecycleError("sample lease batches cannot exceed 500 items")
+        if not owner:
+            raise LifecycleError("sample lease owner must be non-empty")
         now = _now()
         expires = _iso(now + timedelta(seconds=lease_seconds))
+        acquired: list[int] = []
         with self.database.connection() as conn:
-            # Serialise the read/claim pair.  The old SELECT followed by an
-            # unconstrained UPDATE allowed two workers to claim the same
-            # pending row when they raced on a busy SQLite database.
             conn.execute("BEGIN IMMEDIATE")
-            row = conn.execute(
-                "SELECT status, lease_owner, lease_expires_at, attempt_count"
-                " FROM workflow_samples WHERE job_id = ? AND sample_id = ?",
-                (self.job_id, sample_id),
-            ).fetchone()
-            if row is None:
-                raise LifecycleError(f"unknown sample: {sample_id}")
-            if str(row["status"]) in {"completed", "skipped"}:
-                return False
+            for sample_id in normalized:
+                row = conn.execute(
+                    "SELECT status, lease_owner, lease_expires_at, attempt_count"
+                    " FROM workflow_samples WHERE job_id = ? AND sample_id = ?",
+                    (self.job_id, sample_id),
+                ).fetchone()
+                if row is None:
+                    raise LifecycleError(f"unknown sample: {sample_id}")
+                status = str(row["status"])
+                existing_owner = str(row["lease_owner"] or "")
+                if status in {"completed", "skipped"}:
+                    continue
 
-            existing_expiry = _parse(row["lease_expires_at"])
-            if (
-                str(row["status"]) == "processing"
-                and existing_expiry is not None
-                and existing_expiry > now
-                and str(row["lease_owner"] or "") != owner
-            ):
-                return False
+                existing_expiry = _parse(row["lease_expires_at"])
+                if (
+                    status == "processing"
+                    and existing_expiry is not None
+                    and existing_expiry > now
+                    and existing_owner != owner
+                ):
+                    continue
 
-            conn.execute(
-                "UPDATE workflow_samples"
-                " SET status = 'processing', lease_owner = ?, lease_expires_at = ?,"
-                "     attempt_count = attempt_count + 1, updated_at = ?"
-                " WHERE job_id = ? AND sample_id = ?",
-                (owner, expires, _iso(now), self.job_id, sample_id),
-            )
-        return True
+                if status == "processing" and existing_owner == owner:
+                    conn.execute(
+                        "UPDATE workflow_samples SET lease_expires_at = ?, updated_at = ?"
+                        " WHERE job_id = ? AND sample_id = ?",
+                        (expires, _iso(now), self.job_id, sample_id),
+                    )
+                else:
+                    conn.execute(
+                        "UPDATE workflow_samples"
+                        " SET status = 'processing', lease_owner = ?, lease_expires_at = ?,"
+                        "     attempt_count = attempt_count + 1, updated_at = ?"
+                        " WHERE job_id = ? AND sample_id = ?",
+                        (owner, expires, _iso(now), self.job_id, sample_id),
+                    )
+                acquired.append(sample_id)
+        return acquired
+
+    def heartbeat_samples(
+        self,
+        sample_ids: Sequence[int],
+        *,
+        owner: str,
+        lease_seconds: int = DEFAULT_LEASE_SECONDS,
+    ) -> int:
+        """Extend live leases owned by this worker without adding attempts."""
+
+        normalized = list(dict.fromkeys(int(sample_id) for sample_id in sample_ids))
+        if len(normalized) > 500:
+            raise LifecycleError("sample lease batches cannot exceed 500 items")
+        now = _now()
+        expires = _iso(now + timedelta(seconds=lease_seconds))
+        refreshed = 0
+        with self.database.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            for sample_id in normalized:
+                cursor = conn.execute(
+                    "UPDATE workflow_samples SET lease_expires_at = ?, updated_at = ?"
+                    " WHERE job_id = ? AND sample_id = ?"
+                    " AND status = 'processing' AND lease_owner = ?",
+                    (expires, _iso(now), self.job_id, sample_id, owner),
+                )
+                refreshed += int(cursor.rowcount or 0)
+        return refreshed
+
+    def release_batch(
+        self,
+        outcomes: Mapping[int, str],
+        *,
+        owner: str,
+    ) -> int:
+        """Release a claimed batch while refusing to overwrite another lease."""
+
+        if len(outcomes) > 500:
+            raise LifecycleError("sample lease batches cannot exceed 500 items")
+        if any(status not in {"completed", "failed", "pending", "skipped"} for status in outcomes.values()):
+            raise LifecycleError("unsupported sample status in release batch")
+        released = 0
+        with self.database.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            for sample_id, status in outcomes.items():
+                cursor = conn.execute(
+                    "UPDATE workflow_samples"
+                    " SET status = ?, error = NULL, lease_owner = NULL,"
+                    " lease_expires_at = NULL, updated_at = ?"
+                    " WHERE job_id = ? AND sample_id = ? AND lease_owner = ?",
+                    (status, _iso(_now()), self.job_id, int(sample_id), owner),
+                )
+                released += int(cursor.rowcount or 0)
+        return released
 
     def release_sample(self, sample_id: int, *, status: str, error: str | None = None) -> None:
         """Finish a sample and drop its lease."""

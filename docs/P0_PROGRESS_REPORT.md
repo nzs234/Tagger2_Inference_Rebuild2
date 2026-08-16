@@ -1,6 +1,6 @@
 # Dataset Workflow P0 progress
 
-Updated 2026-08-13. This report supersedes the earlier WIP snapshot that
+Updated 2026-08-16. This report supersedes the earlier WIP snapshot that
 described Count Review, lifecycle controls, Restore, and sample registration as
 unimplemented.
 
@@ -25,11 +25,10 @@ unimplemented.
 
 ## Verification
 
-- Backend: `420 passed, 1 skipped`.
-- Frontend: `39 passed`; ESLint and TypeScript/Vite build pass.
-- Full repository mypy gate: pass (`72` source files across backend and scripts).
-- Explicit Ruff gate (`E4`, `E7`, `E9`, `F`): pass.
-- Source algorithm port guard: `17 passed`.
+- Release validation records the current backend/frontend/Playwright counts in
+  its generated report instead of leaving stale numbers in this progress file.
+- Full repository mypy, Ruff, source-port verification, ESLint and
+  TypeScript/Vite remain required release gates.
 - Updated real/API smoke: 20 randomly selected image+JSON pairs from the
   user-provided training-set folder completed `pending -> queued -> completed`;
   60 files were exported with zero failures/issues. Legacy `{tag,nl}` sidecars
@@ -50,9 +49,9 @@ unimplemented.
   `ocr-paddleocr-2-9-1-cpu-v1`. The resource bytes remain outside Git under
   ignored `data/`; setup/import commands are documented in `README.md`.
 - Stage-run persistence now covers pipeline/import/caption/classify/replace/
-  OCR/NL/policy/token/export/review with checkpoints; finer per-batch
-  orchestration, long-lived SSE, pressure/chaos tests, and GPU-specific
-  acceptance remain future work.
+  OCR/NL/policy/token/export/review with immutable projection and staged-file
+  checkpoints; 500-sample leases and long-lived SSE are wired. Pressure/chaos
+  and GPU-specific acceptance remain future work.
 - Pressure/chaos testing was intentionally skipped for this delivery pass per
   request; only the small real-material flow gate was required.
 

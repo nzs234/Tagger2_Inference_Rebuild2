@@ -107,3 +107,36 @@ def test_events_route_validates_cursor_and_projects_payload(tmp_path: Path):
         )
         assert invalid.status_code == 400
         assert invalid.json()["detail"]["code"] == "invalid_event_cursor"
+
+
+def test_event_stream_replays_from_last_event_id_and_closes_when_terminal(tmp_path: Path):
+    database, job_id = _database(tmp_path)
+    assert database.update_job_status(job_id, "completed", expected_status="pending")
+    events = database.list_events(job_id)
+    first_cursor = events[0]["event_id"]
+    last_cursor = events[-1]["event_id"]
+
+    app = FastAPI()
+    app.include_router(
+        create_workflow_router(
+            PathAllowlist(),
+            WorkflowResourceCatalog(tmp_path / "resources"),
+            database=database,
+        )
+    )
+    with TestClient(app) as client:
+        response = client.get(
+            f"/api/v1/workflows/jobs/{job_id}/events/stream",
+            headers={"Last-Event-ID": str(first_cursor)},
+        )
+        assert response.status_code == 200
+        assert response.headers["content-type"].startswith("text/event-stream")
+        assert f"id: {last_cursor}\n" in response.text
+        assert f"id: {first_cursor}\n" not in response.text
+
+        invalid = client.get(
+            f"/api/v1/workflows/jobs/{job_id}/events/stream",
+            headers={"Last-Event-ID": "not-an-integer"},
+        )
+        assert invalid.status_code == 400
+        assert invalid.json()["detail"]["code"] == "invalid_event_cursor"

@@ -7,7 +7,7 @@ import shutil
 import sqlite3
 from pathlib import Path
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 # Migration checksums are deliberately immutable.  Do not derive the checksum
 # from ``SCHEMA_SQL``: changing the current schema must not make an old
@@ -16,6 +16,7 @@ MIGRATION_CHECKSUMS = {
     1: "workflow-schema-v1",
     2: "workflow-schema-v2-leases",
     3: "workflow-schema-v3-job-states",
+    4: "workflow-schema-v4-restore-discard-state",
 }
 
 SCHEMA_SQL = """
@@ -52,7 +53,9 @@ CREATE TABLE IF NOT EXISTS workflow_jobs (
     created_at TEXT NOT NULL,
     started_at TEXT,
     finished_at TEXT,
-    error TEXT
+    error TEXT,
+    restored_at TEXT,
+    discarded_at TEXT
 );
 
 -- Durable control-plane events.  ``event_id`` is the per-database monotonic
@@ -499,7 +502,20 @@ def apply_migrations(db_path: Path) -> None:
                 """)
                 
                 conn.execute("""
-                    INSERT INTO workflow_jobs_v3 SELECT * FROM workflow_jobs
+                    INSERT INTO workflow_jobs_v3 (
+                        job_id, config_version, config_json, config_hash, profile,
+                        work_mode, overwrite_mode, source_root_id, output_root_id,
+                        workspace_path, status, current_module_id, total_samples,
+                        processed_samples, succeeded_samples, failed_samples,
+                        skipped_samples, created_at, started_at, finished_at, error
+                    )
+                    SELECT
+                        job_id, config_version, config_json, config_hash, profile,
+                        work_mode, overwrite_mode, source_root_id, output_root_id,
+                        workspace_path, status, current_module_id, total_samples,
+                        processed_samples, succeeded_samples, failed_samples,
+                        skipped_samples, created_at, started_at, finished_at, error
+                    FROM workflow_jobs
                 """)
                 conn.execute("DROP TABLE workflow_jobs")
                 conn.execute("ALTER TABLE workflow_jobs_v3 RENAME TO workflow_jobs")
@@ -515,6 +531,22 @@ def apply_migrations(db_path: Path) -> None:
                 raise
             finally:
                 conn.execute("PRAGMA foreign_keys=ON")
+
+        if applied < 4:
+            backup = backup or _backup_before_migration(Path(db_path))
+            existing = {
+                str(column[1])
+                for column in conn.execute("PRAGMA table_info(workflow_jobs)").fetchall()
+            }
+            for column in ("restored_at", "discarded_at"):
+                if column not in existing:
+                    conn.execute(f"ALTER TABLE workflow_jobs ADD COLUMN {column} TEXT")
+            conn.execute(
+                "INSERT INTO schema_migrations (version, checksum, applied_at)"
+                " VALUES (?, ?, datetime('now'))",
+                (4, MIGRATION_CHECKSUMS[4]),
+            )
+            conn.commit()
 
         # Keep the remaining DDL idempotent so a partially created database heals.
         # Existing v3 databases may still have the old table-level UNIQUE key.

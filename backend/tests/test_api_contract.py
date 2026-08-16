@@ -269,7 +269,7 @@ def test_provider_type_is_editable_and_deleted_defaults_stay_deleted(tmp_path: P
                 "name": "NewAPI gateway",
                 "kind": "custom",
                 "protocol": "openai",
-                "base_url": "https://gateway.example.test/v1",
+                    "base_url": "https://example.com/v1",
                 "primary_model": "vision-a",
             },
         )
@@ -326,7 +326,7 @@ def test_unsaved_provider_discovery_uses_ephemeral_keys_and_closes_client(tmp_pa
             json={
                 "kind": "custom",
                 "protocol": "openai",
-                "base_url": "https://gateway.example.test/v1",
+                    "base_url": "https://example.com/v1",
                 "api_keys": ["key-a", "key-b", "key-a"],
             },
         )

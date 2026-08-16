@@ -172,6 +172,61 @@ def test_auth_error_is_not_retried():
     assert error.code == "provider_auth"
 
 
+def test_request_time_dns_rebinding_is_blocked(monkeypatch):
+    calls = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}]})
+
+    monkeypatch.setattr(
+        "tagger2.security.socket.getaddrinfo",
+        lambda *_args, **_kwargs: [(2, 1, 6, "", ("127.0.0.1", 443))],
+    )
+
+    async def run():
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        provider = OpenAICompatibleProvider(
+            ProviderConfig(kind="openai", base_url="https://provider.example", model="vision"),
+            client=client,
+        )
+        provider.validate_destination = True
+        try:
+            with __import__("pytest").raises(ProviderError) as error:
+                await provider.generate([], "prompt")
+            return error.value
+        finally:
+            await provider.aclose()
+
+    error = asyncio.run(run())
+    assert error.code == "provider_destination_blocked"
+    assert calls == 0
+
+
+def test_provider_does_not_follow_redirect_to_a_new_destination():
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(str(request.url))
+        return httpx.Response(302, headers={"Location": "http://127.0.0.1/private"})
+
+    async def run():
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        provider = OpenAICompatibleProvider(
+            ProviderConfig(kind="openai", base_url="https://provider.example", model="vision"),
+            client=client,
+        )
+        try:
+            with __import__("pytest").raises(ProviderError):
+                await provider._request("GET", "https://provider.example/redirect")
+        finally:
+            await provider.aclose()
+
+    asyncio.run(run())
+    assert calls == ["https://provider.example/redirect"]
+
+
 def test_rate_limit_rotates_key_without_waiting_for_retry_after():
     keys = []
 
