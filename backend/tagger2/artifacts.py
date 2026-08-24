@@ -7,10 +7,11 @@ import json
 import os
 import tempfile
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Mapping, Protocol, Sequence
 
 from .anima import ANIMA_SCHEMA_VERSION, AnimaPayload, anima_dict, normalize_anima_payload
+from .config import DEFAULT_IMAGE_EXTENSIONS
 from .schemas import TagItem
 from .storage import ArtifactRecord, config_digest
 
@@ -20,6 +21,17 @@ LOCAL_TAG_SCHEMA_VERSION = "local-tags-v2"
 HYBRID_NL_TAGS_SCHEMA_VERSION = "hybrid-nl-tags-v1"
 HYBRID_LOCAL_TAGS_SCHEMA_VERSION = "hybrid-local-tags-v1"
 ArtifactValidator = Callable[..., bool]
+# Sidecar extensions this application writes next to an image.  Included so a
+# target that already points at a sidecar is not suffixed twice.
+SIDECAR_EXTENSIONS = frozenset({".txt", ".json"})
+KNOWN_ARTIFACT_EXTENSIONS = DEFAULT_IMAGE_EXTENSIONS | SIDECAR_EXTENSIONS
+# Per-name limit shared by NTFS (UTF-16 units) and common Linux filesystems
+# (bytes).  Applied to temporary names so long image filenames stay writable.
+MAX_NAME_BYTES = 255
+# Windows rejects paths above this length unless long paths are enabled.
+MAX_WINDOWS_PATH = 259
+# Leading dot plus ``mkstemp``'s random component and the ``.tmp`` suffix.
+_TEMP_NAME_OVERHEAD = 16
 
 
 class ArtifactStorage(Protocol):
@@ -75,6 +87,91 @@ def hash_config(value: Mapping[str, Any]) -> str:
     return config_digest(value)
 
 
+def strip_artifact_suffix(name: str) -> str:
+    """Drop only a real trailing image/sidecar extension from a file name.
+
+    ``Path.stem`` and ``Path.with_suffix`` treat everything after the last dot
+    as an extension.  Generation filenames carry dots inside the name, so the
+    two-step ``stem`` then ``with_suffix`` idiom silently truncates them::
+
+        43900-...,_(andyredtiger_1.2),yellow.png
+          -> stem            43900-...,_(andyredtiger_1.2),yellow
+          -> with_suffix()   43900-...,_(andyredtiger_1.txt   # wrong
+
+    Only a suffix that is a known image or sidecar extension is removed here;
+    every other dot in the name is preserved verbatim so the sidecar always
+    pairs with its image.
+    """
+
+    suffix = PurePosixPath(name).suffix
+    if suffix and suffix.casefold() in KNOWN_ARTIFACT_EXTENSIONS:
+        return name[: -len(suffix)]
+    return name
+
+
+def replace_suffix(path: str | Path, suffix: str) -> Path:
+    """Return the sibling of ``path`` whose extension is ``suffix``.
+
+    Used for every image/sidecar pairing so a TXT always lands on the image
+    name plus ``.txt``.
+    """
+
+    source = Path(path)
+    return source.with_name(strip_artifact_suffix(source.name) + suffix)
+
+
+def numbered_name(name: str, index: int) -> str:
+    """Return ``name (index).ext`` without truncating dots inside the name."""
+
+    base = strip_artifact_suffix(name)
+    return f"{base} ({index}){name[len(base):]}"
+
+
+def numbered_path(path: Path, index: int) -> Path:
+    """Return the conflict-renamed sibling of ``path``."""
+
+    return path.with_name(numbered_name(path.name, index))
+
+
+def _bounded_temp_prefix(name: str, parent: Path) -> str:
+    """Keep ``mkstemp`` names inside the filesystem limits.
+
+    The temporary name is ``.<name>.<random>.tmp``, so a long image filename
+    pushes the sidecar temporary past the 255-unit per-name limit (and past
+    Windows' 260-character path limit) even though the image itself was
+    writable.  Only the temporary name is shortened; the destination name is
+    never altered.
+    """
+
+    budget = MAX_NAME_BYTES - _TEMP_NAME_OVERHEAD
+    if os.name == "nt":
+        available = MAX_WINDOWS_PATH - len(str(parent)) - 1 - _TEMP_NAME_OVERHEAD
+        budget = min(budget, available)
+    budget = max(budget, 0)
+    encoded = name.encode("utf-8", "surrogatepass")
+    if len(encoded) > budget:
+        name = encoded[:budget].decode("utf-8", "ignore")
+    return f".{name}." if name else "."
+
+
+def _create_temporary(destination: Path) -> tuple[int, str]:
+    """Create the temporary file used for an atomic replace.
+
+    The descriptive prefix keeps orphaned temporaries diagnosable.  A path that
+    is still too long for the platform falls back to a minimal prefix so a
+    long-named sidecar is written instead of failing next to its image.
+    """
+
+    try:
+        return tempfile.mkstemp(
+            prefix=_bounded_temp_prefix(destination.name, destination.parent),
+            suffix=".tmp",
+            dir=destination.parent,
+        )
+    except OSError:
+        return tempfile.mkstemp(prefix=".", suffix=".tmp", dir=destination.parent)
+
+
 def atomic_write_bytes(path: str | Path, data: bytes) -> Path:
     """Write bytes with flush/fsync and an atomic same-volume replacement."""
 
@@ -82,7 +179,7 @@ def atomic_write_bytes(path: str | Path, data: bytes) -> Path:
     destination.parent.mkdir(parents=True, exist_ok=True)
     if destination.exists() and destination.is_symlink():
         raise ValueError("refusing to replace a symbolic-link artifact")
-    descriptor, temporary = tempfile.mkstemp(prefix=f".{destination.name}.", suffix=".tmp", dir=destination.parent)
+    descriptor, temporary = _create_temporary(destination)
     temporary_path = Path(temporary)
     try:
         with os.fdopen(descriptor, "wb") as stream:
@@ -344,16 +441,16 @@ class ArtifactManager:
         source = Path(source_path)
         normalized = _coerce_payload(payload)
         if output_dir is None:
-            stem_path = source.with_suffix("")
+            base = source
         else:
             relative = Path(relative_path) if relative_path is not None else Path(source.name)
             # Caller supplies an allowlisted root.  Still reject absolute and
             # upward paths at this final filesystem boundary.
             if relative.is_absolute() or ".." in relative.parts:
                 raise ValueError("artifact relative path escapes output root")
-            stem_path = (Path(output_dir) / relative).with_suffix("")
-        json_path = stem_path.with_suffix(".json")
-        txt_path = stem_path.with_suffix(".txt") if write_txt else None
+            base = Path(output_dir) / relative
+        json_path = replace_suffix(base, ".json")
+        txt_path = replace_suffix(base, ".txt") if write_txt else None
         source_hash = hash_file(source)
         json_bytes = (json.dumps(anima_dict(normalized), ensure_ascii=False, indent=2) + "\n").encode("utf-8")
         atomic_write_bytes(json_path, json_bytes)
@@ -432,13 +529,13 @@ def write_anima_artifacts(
     """Standalone atomic writer for tools that do not use the job database."""
 
     source = Path(source_path)
-    stem = source.with_suffix("") if output_dir is None else Path(output_dir) / source.stem
+    base = source if output_dir is None else Path(output_dir) / source.name
     normalized = _coerce_payload(payload)
-    json_path = stem.with_suffix(".json")
+    json_path = replace_suffix(base, ".json")
     atomic_write_json(json_path, anima_dict(normalized))
     txt_path: Path | None = None
     if write_txt:
-        txt_path = stem.with_suffix(".txt")
+        txt_path = replace_suffix(base, ".txt")
         atomic_write_text(txt_path, render_anima_txt(normalized))
     return json_path, txt_path
 
@@ -462,7 +559,11 @@ __all__ = [
     "ArtifactWriteResult",
     "HYBRID_LOCAL_TAGS_SCHEMA_VERSION",
     "HYBRID_NL_TAGS_SCHEMA_VERSION",
+    "KNOWN_ARTIFACT_EXTENSIONS",
     "LOCAL_TAG_SCHEMA_VERSION",
+    "MAX_NAME_BYTES",
+    "MAX_WINDOWS_PATH",
+    "SIDECAR_EXTENSIONS",
     "TXT_FIELD_ORDER",
     "artifact_is_current",
     "atomic_write_bytes",
@@ -471,9 +572,13 @@ __all__ = [
     "hash_bytes",
     "hash_config",
     "hash_file",
+    "numbered_name",
+    "numbered_path",
     "render_anima_txt",
     "render_hybrid_nl_tags",
     "render_online_txt",
+    "replace_suffix",
+    "strip_artifact_suffix",
     "validate_anima_file",
     "validate_artifact_file",
     "validate_local_tags_file",

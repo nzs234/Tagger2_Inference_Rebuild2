@@ -36,8 +36,11 @@ from .artifacts import (
     HYBRID_NL_TAGS_SCHEMA_VERSION,
     LOCAL_TAG_SCHEMA_VERSION,
     ArtifactManager,
+    numbered_name,
+    numbered_path,
     render_hybrid_nl_tags,
     render_online_txt,
+    strip_artifact_suffix,
     validate_anima_file,
     validate_artifact_file,
     validate_local_tags_file,
@@ -812,6 +815,10 @@ class Runtime:
         root_id = output.get("root_id") or job.output_root_id
         relative_base = str(output.get("relative_path") or "").strip().replace("\\", "/")
         source = self.resolve_item_path(item)
+        # Only the real image extension is removed.  Generation filenames carry
+        # dots inside the name ("(andyredtiger_1.2),yellow.png"), which
+        # Path.stem would truncate and leave the sidecar unmatched.
+        base_name = strip_artifact_suffix(source.name)
         if root_id:
             root = self.allowlist.get(root_id)
             if root.kind != "output" or not root.writable:
@@ -819,20 +826,20 @@ class Runtime:
             rel = Path(relative_base) if relative_base else Path(item.relative_path).parent
             if rel.is_absolute() or ".." in rel.parts:
                 raise PathNotAllowedError("output path escapes root")
-            return self.allowlist.resolve(root_id, (rel / source.stem).as_posix() + suffix, for_write=True)
+            return self.allowlist.resolve(root_id, (rel / base_name).as_posix() + suffix, for_write=True)
         # No explicit output root means write beside the source image.
         if item.source_root_id:
             root = self.allowlist.get(item.source_root_id)
             if root.kind != "input":
                 raise PathNotAllowedError("invalid source root")
-            return (source.parent / source.stem).with_suffix(suffix)
+            return source.with_name(base_name + suffix)
         # Upload jobs have no user destination; keep artifacts inside the app.
         if item.payload.get("upload_path"):
             base = self.settings.artifact_dir or self.settings.project_root / "data" / "artifacts"
             job_dir = base / job.id
             job_dir.mkdir(parents=True, exist_ok=True)
             artifact_name = str(item.payload.get("artifact_name") or item.relative_path)
-            return (job_dir / Path(artifact_name).stem).with_suffix(suffix)
+            return job_dir / (strip_artifact_suffix(Path(artifact_name).name) + suffix)
         raise PathNotAllowedError("scanned inputs require a writable output root")
 
     def _conflict_path(self, path: Path, policy: str, *, valid: bool = False) -> tuple[Path, bool]:
@@ -840,7 +847,7 @@ class Runtime:
             return path, True
         if path.exists() and policy == "rename":
             for index in range(1, 10000):
-                candidate = path.with_name(f"{path.stem} ({index}){path.suffix}")
+                candidate = numbered_path(path, index)
                 if not candidate.exists():
                     return candidate, False
         return path, False
@@ -970,12 +977,8 @@ class Runtime:
         if not txt_target.exists() and (json_target is None or not json_target.exists()):
             return txt_target, json_target
         for index in range(1, 10_000):
-            candidate_txt = txt_target.with_name(f"{txt_target.stem} ({index}){txt_target.suffix}")
-            candidate_json = (
-                json_target.with_name(f"{json_target.stem} ({index}){json_target.suffix}")
-                if json_target is not None
-                else None
-            )
+            candidate_txt = numbered_path(txt_target, index)
+            candidate_json = numbered_path(json_target, index) if json_target is not None else None
             if not candidate_txt.exists() and (
                 candidate_json is None or not candidate_json.exists()
             ):
@@ -1962,8 +1965,7 @@ def create_app(settings: AppConfig | None = None) -> FastAPI:
                 artifact_name = filename
                 duplicate = 2
                 while artifact_name.casefold() in artifact_names:
-                    original = Path(filename)
-                    artifact_name = f"{original.stem} ({duplicate}){original.suffix}"
+                    artifact_name = numbered_name(filename, duplicate)
                     duplicate += 1
                 artifact_names.add(artifact_name.casefold())
                 records.append({
