@@ -7,25 +7,39 @@ sent a vendor-specific field by accident.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Any, Mapping
 
 
 CAPABILITY_SCHEMA_VERSION = "image-capabilities-v1"
-CAPABILITY_VERIFIED_AT = "2026-08-17"
+CAPABILITY_VERIFIED_AT = "2026-08-28"
 
-GOOGLE_RATIOS = (
-    "1:1", "2:3", "3:2", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9",
-    "21:9", "1:4", "4:1", "1:8", "8:1", "9:21",
+# Gemini: the ten base ratios apply to every Nano Banana model; the extreme
+# panoramas (1:4, 4:1, 1:8, 8:1) are only documented for the Flash tier.
+GOOGLE_BASE_RATIOS = (
+    "1:1", "2:3", "3:2", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9", "21:9",
 )
-GOOGLE_SIZES = ("512", "1K", "2K", "4K")
+GOOGLE_FLASH_RATIOS = GOOGLE_BASE_RATIOS + ("1:4", "4:1", "1:8", "8:1")
+# OpenAI gpt-image models: fixed presets, plus arbitrary WIDTHxHEIGHT for
+# gpt-image-2 (divisible by 16, ratio 1:3..3:1, max 3840x2160).
 OPENAI_SIZES = ("auto", "1024x1024", "1536x1024", "1024x1536")
+OPENAI_CUSTOM_SIZE_SENTINEL = "custom"
+SIZE_PATTERN = re.compile(r"\d{2,5}x\d{2,5}")
 OPENAI_QUALITIES = ("auto", "low", "medium", "high")
 OPENAI_BACKGROUNDS = ("auto", "transparent", "opaque")
 OPENAI_FORMATS = ("png", "jpeg", "webp")
 OPENAI_MODERATION = ("auto", "low")
 OPENAI_FIDELITY = ("low", "high")
 RESPONSE_FORMATS = ("b64_json", "url")
+# xAI Imagine API (grok-imagine-image): JSON bodies, resolution + quality
+# controls, up to 3 reference images for edits.
+XAI_RATIOS = (
+    "auto", "1:1", "2:3", "3:2", "3:4", "4:3", "9:16", "16:9",
+    "9:19.5", "19.5:9", "9:20", "20:9", "1:2", "2:1", "21:9", "5:2",
+)
+XAI_RESOLUTIONS = ("1k", "2k")
+XAI_QUALITIES = ("low", "medium")
 
 
 @dataclass(frozen=True, slots=True)
@@ -94,7 +108,7 @@ def capability_for_style(capability: ImageCapability, style: str) -> ImageCapabi
             notes=capability.notes,
         )
     elif capability.family == "xai_grok_image":
-        allowed = {"size", "quality", "aspect_ratio", "response_format"}
+        allowed = {"aspect_ratio", "resolution", "quality", "response_format"}
     elif capability.family == "google_gemini":
         # Explicit compatible-images mode carries these values in the Gemini
         # extension envelope in addition to the standard Images fields.
@@ -164,8 +178,8 @@ _GOOGLE = ImageCapability(
         "temperature", "top_p", "top_k", "multi_image_strategy",
     ),
     enums={
-        "aspect_ratio": GOOGLE_RATIOS,
-        "image_size": GOOGLE_SIZES,
+        "aspect_ratio": GOOGLE_BASE_RATIOS,
+        "image_size": ("1K", "2K", "4K"),
         "multi_image_strategy": ("parallel", "candidate_count"),
     },
     defaults={
@@ -202,28 +216,31 @@ _OPENAI = ImageCapability(
         "output_format": "png", "moderation": "auto", "response_format": "b64_json",
     },
     max_references=16,
-    max_outputs=8,
-    source_url="https://platform.openai.com/docs/guides/images",
+    max_outputs=10,
+    source_url="https://platform.openai.com/docs/api-reference/images/create",
     notes="OpenAI Images generation/edit endpoints.",
 )
 
 _XAI = ImageCapability(
     family="xai_grok_image",
-    label="xAI Grok Image",
+    label="xAI Grok Imagine",
     known=True,
     operations=("generate", "edit"),
-    parameters=("size", "quality", "aspect_ratio", "response_format"),
+    parameters=("aspect_ratio", "resolution", "quality", "response_format"),
     enums={
-        "size": OPENAI_SIZES,
-        "quality": OPENAI_QUALITIES,
-        "aspect_ratio": GOOGLE_RATIOS,
+        "aspect_ratio": XAI_RATIOS,
+        "resolution": XAI_RESOLUTIONS,
+        "quality": XAI_QUALITIES,
         "response_format": RESPONSE_FORMATS,
     },
-    defaults={"size": "auto", "quality": "auto", "response_format": "b64_json"},
-    max_references=8,
-    max_outputs=8,
-    source_url="https://docs.x.ai/docs/guides/image-generations",
-    notes="xAI image endpoints use OpenAI-shaped authentication and media fields.",
+    defaults={
+        "aspect_ratio": "auto", "resolution": "1k", "quality": "medium",
+        "response_format": "b64_json",
+    },
+    max_references=3,
+    max_outputs=10,
+    source_url="https://docs.x.ai/developers/rest-api-reference/inference/images",
+    notes="xAI Imagine JSON endpoints; edits accept up to 3 reference images.",
 )
 
 _UNKNOWN = ImageCapability(
@@ -247,21 +264,22 @@ _FAMILIES = {
     "unknown": _UNKNOWN,
 }
 
-_GOOGLE_MODEL_LIMITS: Mapping[str, tuple[tuple[str, ...], str, int, str]] = {
-    "gemini-3-pro-image": (("1K", "2K", "4K"), "1K", 14, "Nano Banana Pro"),
-    "gemini-3-pro-image-preview": (("1K", "2K", "4K"), "1K", 14, "Nano Banana Pro Preview"),
-    "gemini-3.1-flash-image": (("512", "1K", "2K", "4K"), "1K", 10, "Nano Banana 2"),
-    "gemini-3.1-flash-lite-image": (("512", "1K"), "1K", 10, "Nano Banana 2 Lite"),
-    "gemini-2.5-flash-image": (("1K",), "1K", 3, "Nano Banana"),
+_GOOGLE_MODEL_LIMITS: Mapping[str, tuple[tuple[str, ...], tuple[str, ...], str, int, str]] = {
+    "gemini-3-pro-image": (("1K", "2K", "4K"), GOOGLE_BASE_RATIOS, "1K", 14, "Nano Banana Pro"),
+    "gemini-3-pro-image-preview": (("1K", "2K", "4K"), GOOGLE_BASE_RATIOS, "1K", 14, "Nano Banana Pro Preview"),
+    "gemini-3.1-flash-image": (("512", "1K", "2K", "4K"), GOOGLE_FLASH_RATIOS, "1K", 10, "Nano Banana 2"),
+    "gemini-3.1-flash-lite-image": (("1K",), GOOGLE_BASE_RATIOS, "1K", 10, "Nano Banana 2 Lite"),
+    "gemini-2.5-flash-image": (("1K",), GOOGLE_BASE_RATIOS, "1K", 3, "Nano Banana"),
 }
 
 
 def _specialize_model(capability: ImageCapability, model: str, *, kind: str) -> ImageCapability:
     normalized = model.casefold().removeprefix("models/")
     if capability.family == "google_gemini" and normalized in _GOOGLE_MODEL_LIMITS:
-        sizes, default_size, max_references, label = _GOOGLE_MODEL_LIMITS[normalized]
+        sizes, ratios, default_size, max_references, label = _GOOGLE_MODEL_LIMITS[normalized]
         enums = dict(capability.enums)
         enums["image_size"] = sizes
+        enums["aspect_ratio"] = ratios
         defaults = dict(capability.defaults)
         defaults["image_size"] = default_size
         return ImageCapability(
@@ -290,6 +308,24 @@ def _specialize_model(capability: ImageCapability, model: str, *, kind: str) -> 
             max_outputs=capability.max_outputs,
             source_url=capability.source_url,
             notes="Legacy Grok image generation endpoint; editing and size controls are not assumed.",
+        )
+    if capability.family == "openai_gpt_image" and kind == "openai" and normalized.startswith("gpt-image-2"):
+        # gpt-image-2 accepts arbitrary WIDTHxHEIGHT sizes (divisible by 16,
+        # aspect ratio between 1:3 and 3:1, up to 3840x2160).
+        enums = dict(capability.enums)
+        enums["size"] = capability.enums.get("size", OPENAI_SIZES) + (OPENAI_CUSTOM_SIZE_SENTINEL,)
+        return ImageCapability(
+            family=capability.family,
+            label=capability.label,
+            known=capability.known,
+            operations=capability.operations,
+            parameters=capability.parameters,
+            enums=enums,
+            defaults=capability.defaults,
+            max_references=capability.max_references,
+            max_outputs=capability.max_outputs,
+            source_url=capability.source_url,
+            notes=capability.notes,
         )
     if capability.family == "openai_gpt_image" and kind == "openai":
         parameters = tuple(name for name in capability.parameters if name != "response_format")
@@ -323,7 +359,7 @@ def _family_is_known(family: str, model: str, configured_family: str | None) -> 
     if family == "openai_gpt_image":
         return normalized.startswith("gpt-image")
     if family == "xai_grok_image":
-        return normalized == "grok-2-image-1212"
+        return normalized == "grok-2-image-1212" or normalized.startswith("grok-imagine-image")
     return False
 
 

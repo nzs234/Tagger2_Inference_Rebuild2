@@ -14,9 +14,10 @@ class ImageJobConfig(BaseModel):
     model: str = Field(min_length=1, max_length=256)
     operation: Literal["generate", "edit"] = "generate"
     prompt: str = Field(min_length=1, max_length=20_000)
-    n: int = Field(default=1, ge=1, le=8)
+    n: int = Field(default=1, ge=1, le=10)
     aspect_ratio: str | None = Field(default=None, max_length=16)
     image_size: str | None = Field(default=None, max_length=16)
+    resolution: str | None = Field(default=None, max_length=8)
     multi_image_strategy: Literal["parallel", "candidate_count"] = "parallel"
     include_text_modality: bool = False
     system_instruction: str | None = Field(default=None, max_length=20_000)

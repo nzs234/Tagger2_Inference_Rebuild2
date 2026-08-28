@@ -9,6 +9,7 @@ export interface ImageGenerationDraft {
   n: number
   aspectRatio: string
   imageSize: string
+  resolution: string
   size: string
   quality: string
   background: string
@@ -33,6 +34,7 @@ export const initialImageGenerationDraft: ImageGenerationDraft = {
   n: 1,
   aspectRatio: '1:1',
   imageSize: '1K',
+  resolution: '1k',
   size: 'auto',
   quality: 'auto',
   background: 'auto',
@@ -68,7 +70,7 @@ export const useImageGenerationStore = create<ImageGenerationStore>()(
     }),
     {
       name: 'tagger2-image-generation-draft',
-      version: 1,
+      version: 2,
       storage: createJSONStorage(() => localStorage),
       partialize: ({ draft, activeJobId }) => ({ draft, activeJobId }),
     },

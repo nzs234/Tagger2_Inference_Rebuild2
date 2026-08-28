@@ -23,7 +23,7 @@ export function ImageGeneration() {
   const activeJobId = useImageGenerationStore((state) => state.activeJobId)
   const setActiveJobId = useImageGenerationStore((state) => state.setActiveJobId)
   const {
-    providerId, model, operation, prompt, n, aspectRatio, imageSize, size, quality,
+    providerId, model, operation, prompt, n, aspectRatio, imageSize, resolution, size, quality,
     background, outputFormat, outputCompression, moderation, inputFidelity,
     responseFormat, includeTextModality, systemInstruction, temperature, topP,
     topK, multiImageStrategy,
@@ -88,6 +88,7 @@ export function ImageGeneration() {
       operation: capability.operations.includes(current.operation) ? current.operation : 'generate',
       aspectRatio: capability.defaults.aspect_ratio ? String(capability.defaults.aspect_ratio) : current.aspectRatio,
       imageSize: capability.defaults.image_size ? String(capability.defaults.image_size) : current.imageSize,
+      resolution: capability.defaults.resolution ? String(capability.defaults.resolution) : current.resolution,
       size: capability.defaults.size ? String(capability.defaults.size) : current.size,
       quality: capability.defaults.quality ? String(capability.defaults.quality) : current.quality,
       multiImageStrategy: hasParameter(capability, 'multi_image_strategy') ? current.multiImageStrategy : 'parallel',
@@ -107,7 +108,7 @@ export function ImageGeneration() {
 
   const createMutation = useMutation({
     mutationFn: () => api.createImageGenerationJob(buildConfig(capability, {
-      providerId, model, operation, prompt, n, aspectRatio, imageSize, size, quality, background,
+      providerId, model, operation, prompt, n, aspectRatio, imageSize, resolution, size, quality, background,
       outputFormat, outputCompression, moderation, inputFidelity, responseFormat, includeTextModality,
       systemInstruction, temperature, topP, topK, multiImageStrategy,
     }), references.map((reference) => reference.file)),
@@ -196,8 +197,13 @@ export function ImageGeneration() {
           <div className="form-grid three-columns">
             <Field label="数量"><input type="number" min={1} max={capability?.max_outputs ?? 8} value={n} onChange={(event) => updateDraft({ n: Math.max(1, Math.min(capability?.max_outputs ?? 8, Number(event.target.value) || 1)) })} /></Field>
             {hasParameter(capability, 'aspect_ratio') && <Field label="比例"><select value={aspectRatio} onChange={(event) => updateDraft({ aspectRatio: event.target.value })}>{options(capability, 'aspect_ratio', [aspectRatio]).map((value) => <option key={value}>{value}</option>)}</select></Field>}
+            {hasParameter(capability, 'resolution') && <Field label="分辨率"><select value={resolution} onChange={(event) => updateDraft({ resolution: event.target.value })}>{options(capability, 'resolution', ['1k', '2k']).map((value) => <option key={value}>{value.toUpperCase()}</option>)}</select></Field>}
             {hasParameter(capability, 'image_size') && <Field label="图像尺寸"><select value={imageSize} onChange={(event) => updateDraft({ imageSize: event.target.value })}>{options(capability, 'image_size', ['1K']).map((value) => <option key={value}>{value}</option>)}</select></Field>}
-            {hasParameter(capability, 'size') && <Field label="画布尺寸"><select value={size} onChange={(event) => updateDraft({ size: event.target.value })}>{options(capability, 'size', ['auto']).map((value) => <option key={value}>{value}</option>)}</select></Field>}
+            {hasParameter(capability, 'size') && <Field label="画布尺寸">{supportsCustomSize(capability)
+              ? <input list="image-size-presets" value={size} onChange={(event) => updateDraft({ size: event.target.value })} placeholder="预设或自定义 宽x高" />
+              : <select value={size} onChange={(event) => updateDraft({ size: event.target.value })}>{options(capability, 'size', ['auto']).map((value) => <option key={value}>{value}</option>)}</select>}
+              <datalist id="image-size-presets">{options(capability, 'size', ['auto']).filter((value) => value !== 'custom').map((value) => <option key={value} value={value}>{value}</option>)}</datalist>
+            </Field>}
           </div>
           <details className="image-advanced-block">
             <summary className="image-advanced-heading"><strong>高级参数</strong><small>{capability?.known ? '按模型能力显示' : '兼容模式仅发送基础字段'}</small></summary>
@@ -279,12 +285,16 @@ function options(capability: ImageGenerationCapability | undefined, name: string
   return values?.length ? values : fallback
 }
 
+function supportsCustomSize(capability: ImageGenerationCapability | undefined): boolean {
+  return Boolean(capability?.enums.size?.includes('custom'))
+}
+
 function buildConfig(capability: ImageGenerationCapability | undefined, values: {
-  providerId: string; model: string; operation: 'generate' | 'edit'; prompt: string; n: number; aspectRatio: string; imageSize: string; size: string; quality: string; background: string; outputFormat: string; outputCompression: number; moderation: string; inputFidelity: string; responseFormat: string; includeTextModality: boolean; systemInstruction: string; temperature: number; topP: number; topK: number; multiImageStrategy: string
+  providerId: string; model: string; operation: 'generate' | 'edit'; prompt: string; n: number; aspectRatio: string; imageSize: string; resolution: string; size: string; quality: string; background: string; outputFormat: string; outputCompression: number; moderation: string; inputFidelity: string; responseFormat: string; includeTextModality: boolean; systemInstruction: string; temperature: number; topP: number; topK: number; multiImageStrategy: string
 }): Record<string, unknown> {
   const config: Record<string, unknown> = { provider_id: values.providerId, model: values.model.trim(), operation: values.operation, prompt: values.prompt.trim(), n: values.n }
   const add = (name: string, value: unknown) => { if (hasParameter(capability, name)) config[name] = value }
-  add('aspect_ratio', values.aspectRatio); add('image_size', values.imageSize); add('size', values.size); add('quality', values.quality); add('background', values.background)
+  add('aspect_ratio', values.aspectRatio); add('image_size', values.imageSize); add('resolution', values.resolution); add('size', values.size.trim() || undefined); add('quality', values.quality); add('background', values.background)
   add('output_format', values.outputFormat); if (['jpeg', 'webp'].includes(values.outputFormat)) add('output_compression', values.outputCompression); add('moderation', values.moderation); if (values.operation === 'edit') add('input_fidelity', values.inputFidelity); add('response_format', values.responseFormat)
   add('include_text_modality', values.includeTextModality); add('system_instruction', values.systemInstruction.trim() || undefined); add('temperature', values.temperature); add('top_p', values.topP); add('top_k', values.topK)
   add('multi_image_strategy', values.multiImageStrategy)

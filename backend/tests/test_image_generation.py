@@ -13,6 +13,7 @@ from fastapi.testclient import TestClient
 from PIL import Image
 
 from tagger2.image_generation.capabilities import (
+    GOOGLE_BASE_RATIOS,
     capabilities_for,
     capability_for_style,
     capability_object,
@@ -100,14 +101,26 @@ def test_openai_and_xai_image_requests_use_generation_and_edit_endpoints():
     assert payload["quality"] == "high"
     assert files is None
 
-    xai = _client(family="xai_grok_image", style="openai_images", model="grok-2-image-1212")
+    xai = _client(family="xai_grok_image", style="openai_images", model="grok-imagine-image-2.0")
     edit_endpoint, edit_payload, edit_files = xai._build_request(
-        ImageRequest(model="grok-2-image-1212", prompt="repaint", operation="edit", n=1, aspect_ratio="1:1"),
-        [_prepared()],
+        ImageRequest(
+            model="grok-imagine-image-2.0",
+            prompt="repaint",
+            operation="edit",
+            n=1,
+            aspect_ratio="19.5:9",
+            resolution="2k",
+            quality="low",
+        ),
+        [_prepared(), _prepared()],
     )
     assert edit_endpoint.endswith("/v1/images/edits")
-    assert edit_payload["aspect_ratio"] == "1:1"
-    assert edit_files and edit_files[0][0] == "image[]"
+    assert edit_payload["aspect_ratio"] == "19.5:9"
+    assert edit_payload["resolution"] == "2k"
+    assert edit_payload["quality"] == "low"
+    assert edit_files is None
+    assert len(edit_payload["images"]) == 2
+    assert all(item["url"].startswith("data:image/") for item in edit_payload["images"])
 
 
 def test_chat_style_does_not_force_native_google_request():
@@ -336,8 +349,23 @@ def test_nano_banana_model_overrides_constrain_size_and_reference_count():
         protocol="gemini",
         model="gemini-3.1-flash-lite-image",
     )
-    assert lite["enums"]["image_size"] == ["512", "1K"]
+    assert lite["enums"]["image_size"] == ["1K"]
+    assert lite["enums"]["aspect_ratio"] == list(GOOGLE_BASE_RATIOS)
     assert lite["max_references"] == 10
+    flash = capabilities_for(
+        kind="gemini",
+        protocol="gemini",
+        model="gemini-3.1-flash-image",
+    )
+    assert flash["enums"]["image_size"] == ["512", "1K", "2K", "4K"]
+    assert "1:8" in flash["enums"]["aspect_ratio"]
+    pro = capabilities_for(
+        kind="gemini",
+        protocol="gemini",
+        model="gemini-3-pro-image",
+    )
+    assert "1:8" not in pro["enums"]["aspect_ratio"]
+    assert "9:21" not in pro["enums"]["aspect_ratio"]
     legacy = capabilities_for(
         kind="gemini",
         protocol="gemini",
@@ -363,6 +391,73 @@ def test_official_legacy_grok_and_gpt_image_expose_only_supported_parameters():
     )
     assert "quality" in openai["parameters"]
     assert "response_format" not in openai["parameters"]
+
+
+def test_grok_imagine_registry_matches_official_controls():
+    grok = capabilities_for(
+        kind="xai",
+        protocol="openai",
+        model="grok-imagine-image-2.0",
+    )
+    assert grok["known"] is True
+    assert grok["operations"] == ["generate", "edit"]
+    assert grok["parameters"] == ["aspect_ratio", "resolution", "quality", "response_format"]
+    assert grok["enums"]["resolution"] == ["1k", "2k"]
+    assert grok["enums"]["quality"] == ["low", "medium"]
+    assert grok["enums"]["aspect_ratio"] == [
+        "auto", "1:1", "2:3", "3:2", "3:4", "4:3", "9:16", "16:9",
+        "9:19.5", "19.5:9", "9:20", "20:9", "1:2", "2:1", "21:9", "5:2",
+    ]
+    assert grok["max_references"] == 3
+    assert grok["max_outputs"] == 10
+    assert grok["defaults"]["resolution"] == "1k"
+
+
+def test_gpt_image_2_accepts_custom_width_by_height_sizes(tmp_path):
+    image = capabilities_for(
+        kind="openai",
+        protocol="openai",
+        model="gpt-image-2",
+    )
+    assert "custom" in image["enums"]["size"]
+    settings = AppConfig(project_root=tmp_path, data_dir=tmp_path / "data", production=False)
+    service = ImageGenerationService(
+        settings,
+        provider_profiles=lambda _provider_id: None,
+        secrets=None,
+    )
+    capability = capability_object(
+        kind="openai",
+        protocol="openai",
+        model="gpt-image-2",
+        configured_family="openai_gpt_image",
+    )
+    service._validate_config(
+        ImageJobConfig(provider_id="openai", model="gpt-image-2", prompt="wide banner", size="1536x864"),
+        capability,
+        reference_count=0,
+        image_style="openai_images",
+    )
+    with pytest.raises(Exception, match="不受模型支持"):
+        service._validate_config(
+            ImageJobConfig(provider_id="openai", model="gpt-image-2", prompt="weird size", size="banana"),
+            capability,
+            reference_count=0,
+            image_style="openai_images",
+        )
+    strict = capability_object(
+        kind="openai",
+        protocol="openai",
+        model="gpt-image-1",
+        configured_family="openai_gpt_image",
+    )
+    with pytest.raises(Exception, match="不受模型支持"):
+        service._validate_config(
+            ImageJobConfig(provider_id="openai", model="gpt-image-1", prompt="no custom", size="1536x864"),
+            strict,
+            reference_count=0,
+            image_style="openai_images",
+        )
 
 
 def test_unregistered_grok_model_requires_explicit_family_for_extended_parameters():

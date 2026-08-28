@@ -26,6 +26,7 @@ class ImageRequest:
     n: int
     aspect_ratio: str | None = None
     image_size: str | None = None
+    resolution: str | None = None
     multi_image_strategy: str = "parallel"
     include_text_modality: bool = False
     system_instruction: str | None = None
@@ -239,12 +240,26 @@ class ImageGenerationClient:
         ):
             if value is not None:
                 values[key] = value
-        if request.aspect_ratio is not None and self.family == "xai_grok_image":
-            values["aspect_ratio"] = request.aspect_ratio
+        if self.family == "xai_grok_image":
+            # xAI Imagine replaces the OpenAI size presets with its own
+            # aspect_ratio + resolution controls on both endpoints.
+            if request.aspect_ratio is not None:
+                values["aspect_ratio"] = request.aspect_ratio
+            if request.resolution is not None:
+                values["resolution"] = request.resolution
         if self.family == "google_gemini":
             values.update(self._google_compatible_extensions(request))
         if not references:
             return f"{base}/images/generations", values, None
+        if self.family == "xai_grok_image":
+            # xAI edits take a JSON body with data-URI reference images
+            # instead of the OpenAI multipart form.
+            references_payload = [{"url": image.data_url, "type": "image_url"} for image in references]
+            if len(references_payload) == 1:
+                values["image"] = references_payload[0]
+            else:
+                values["images"] = references_payload
+            return f"{base}/images/edits", values, None
         files = [
             ("image[]", (f"reference-{index}.jpg", image.data, image.mime_type))
             for index, image in enumerate(references)

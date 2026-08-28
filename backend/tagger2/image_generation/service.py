@@ -17,6 +17,8 @@ from ..security import SecurityError, UploadValidationError, validate_provider_u
 from ..secrets import CompositeSecretStore
 from ..storage import config_digest
 from .capabilities import (
+    OPENAI_CUSTOM_SIZE_SENTINEL,
+    SIZE_PATTERN,
     ImageCapability,
     capability_for_style,
     capability_from_public,
@@ -508,6 +510,7 @@ class ImageGenerationService:
             n=requested,
             aspect_ratio=config.aspect_ratio,
             image_size=config.image_size,
+            resolution=config.resolution,
             multi_image_strategy=config.multi_image_strategy,
             include_text_modality=config.include_text_modality,
             system_instruction=config.system_instruction,
@@ -617,7 +620,17 @@ class ImageGenerationService:
             )
         for key, choices in capability.enums.items():
             value = values.get(key)
-            if value is not None and value not in choices:
+            if value is None:
+                continue
+            if (
+                key == "size"
+                and OPENAI_CUSTOM_SIZE_SENTINEL in choices
+                and SIZE_PATTERN.fullmatch(str(value))
+            ):
+                # gpt-image-2 accepts arbitrary WIDTHxHEIGHT sizes; the finer
+                # divisibility and range rules stay enforced upstream.
+                continue
+            if value not in choices:
                 raise ImageGenerationServiceError("参数值不受模型支持", code="image_parameter_invalid")
         if config.operation == "edit" and reference_count == 0:
             raise ImageGenerationServiceError("编辑操作需要参考图", code="image_reference_required")
