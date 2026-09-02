@@ -206,15 +206,15 @@ export const tagManagerApi = {
     return request<TagManagerStatsPage>(`${datasetPath(sessionId)}/tags/stats${suffix}`)
   },
 
-  /** The tag database lives outside the tag-manager prefix. */
+  /** Tag database queries under /api/v1/tag-manager/tag-db. */
   tagDb: (profile: TagManagerProfile, query?: string, limit = 20) => {
     const search = new URLSearchParams()
     search.set('profile', profile)
     if (query) search.set('query', query)
     search.set('limit', String(limit))
-    return request<TagDbQueryResult>(`/tag-db?${search.toString()}`)
+    return request<TagDbQueryResult>(`/tag-manager/tag-db?${search.toString()}`)
   },
-  tagDbInfo: () => request<TagDbInfo>('/tag-db/info'),
+  tagDbInfo: () => request<TagDbInfo>('/tag-manager/tag-db/info'),
 }
 
 /** Serialises image-list query parameters exactly as the backend expects. */

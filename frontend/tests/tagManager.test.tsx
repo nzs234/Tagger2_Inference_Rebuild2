@@ -75,7 +75,7 @@ function setupFetch(state: HarnessState) {
     const path = url.pathname
     if (path.endsWith('/health')) return json({ status: 'ok' })
     if (path.endsWith('/roots')) return json({ items: [{ id: 'in', name: '训练图片', kind: 'input', writable: true }] })
-    if (path === '/api/v1/tag-db' || path === '/tag-db') {
+    if (path.endsWith('/tag-manager/tag-db') || path.endsWith('/tag-db')) {
       state.tagDbQueries.push(url.searchParams.get('query') ?? '')
       const query = (url.searchParams.get('query') ?? '').toLowerCase()
       const matches = [

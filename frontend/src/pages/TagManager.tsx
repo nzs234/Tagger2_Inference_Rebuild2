@@ -95,7 +95,8 @@ export function TagManager() {
     mutationFn: tagManagerApi.createDataset,
     onSuccess: (created) => {
       setActiveId(created.id)
-      setNotice({ tone: 'info', text: `会话「${created.name}」已创建，正在索引图片…` })
+      const label = created.name || created.relative_path || '数据集'
+      setNotice({ tone: 'info', text: `会话「${label}」已创建，正在索引图片…` })
       void queryClient.invalidateQueries({ queryKey: ['tag-manager', 'datasets'] })
     },
     onError: (error) => fail(error, '会话创建失败'),
@@ -347,7 +348,7 @@ export function TagManager() {
         </DialogLayer>)}
 
     {confirmDelete && session && <ConfirmDialog
-      title={`删除会话「${session.name}」？`}
+      title={`删除会话「${session.name || session.relative_path || '数据集'}」？`}
       detail={<span>将删除会话索引（包含 {session.image_count} 张图片的记录）。磁盘上的图片与 sidecar 文件不会被删除。</span>}
       confirmLabel="删除会话"
       busy={deleteMutation.isPending}

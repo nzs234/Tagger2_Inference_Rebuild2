@@ -207,12 +207,12 @@ describe('tag manager API client', () => {
     const tagDb = await tagManagerApi.tagDb('e621', 'solo', 20)
     expect(tagDb.items[0]?.name).toBe('solo')
     const [tagDbUrl] = fetchMock.mock.calls[1] as [string]
-    expect(tagDbUrl).toBe('/api/v1/tag-db?profile=e621&query=solo&limit=20')
+    expect(tagDbUrl).toBe('/api/v1/tag-manager/tag-db?profile=e621&query=solo&limit=20')
 
     const info = await tagManagerApi.tagDbInfo()
     expect(info.loaded).toEqual({ e621: true, danbooru: false })
     const [infoUrl] = fetchMock.mock.calls[2] as [string]
-    expect(infoUrl).toBe('/api/v1/tag-db/info')
+    expect(infoUrl).toBe('/api/v1/tag-manager/tag-db/info')
   })
 
   it('surfaces sidecar conflicts as typed ApiErrors from the detail envelope', async () => {
