@@ -31,6 +31,7 @@ Tagger2 Inference Rebuild 将本地 Caption 模型、在线视觉模型、多供
 - [模型与 Provider](#models-and-providers)
 - [图像生成](#image-generation)
 - [数据集工作流](#dataset-workflow)
+- [标签管理](#tag-manager)
 - [输出格式](#output-format)
 - [工作流资源](#workflow-resources)
 - [配置与安全](#configuration-and-security)
@@ -71,6 +72,7 @@ Tagger2 Inference Rebuild 将本地 Caption 模型、在线视觉模型、多供
 | 视频提示词 | 根据图片和补充信息生成图生视频提示词，并管理提示词编辑结果。 |
 | 批量任务 | 扫描本机目录，创建持久化的本地、在线或混合打标任务，查看进度和历史。 |
 | 数据集工作流 | 执行 Caption、分类、标签替换、OCR、NL、人工复核、Policy、Token 检查与安全提交。 |
+| 标签管理 | 类 BooruDatasetTagManager 的数据集标签编辑：网格浏览、逐图/批量编辑、e621 与 danbooru 标签库自动补全、撤销重做。 |
 | 在线模型 | 管理 OpenAI、Gemini、Claude 和兼容 API，测试连接并发现可用模型。 |
 | 本地模型 | 下载、注册、加载和卸载模型，管理推理后端、Adapter、阈值与显存驻留。 |
 | 设置 | 管理输入/输出根目录、运行限制和非敏感运行配置。 |
@@ -280,6 +282,21 @@ Count Review 确认后只叠加人工 count，再执行 Policy；Token Review �
 - Restore 请求具备幂等记录，重复请求不会再次覆盖用户后续修改。
 - Discard 进入独立终态并释放数据集锁，不再暴露恢复操作。
 - 事件同时支持带 cursor、heartbeat 与 `Last-Event-ID` 的 SSE，以及 JSON polling fallback。
+
+<a id="tag-manager"></a>
+
+## 标签管理
+
+类似 BooruDatasetTagManager 的数据集标签编辑工作台，面向“人工修标注”的交互场景，与数据集工作流共享九字段契约、标签库资源与路径安全原语。完整说明见 [docs/tag_manager.md](docs/tag_manager.md)。
+
+- **数据集会话**：选择输入根目录与相对路径打开数据集，后台扫描图片与标注并建立索引，支持递归、mtime 增量刷新与多会话。
+- **网格浏览**：缩略图网格按文件名/修改时间/标签数排序，按标签组合（包含 all/any、排除）、标注格式与有无 sidecar 过滤。
+- **三种可编辑格式**：booru 平面 TXT、本地标签 JSON（保留 category/score 元数据）、九字段 Anima JSON（分字段表单，九字段顺序冻结）。raw e621 分组 JSON 只读展示。
+- **标签库自动补全**：e621 快照开箱即用；danbooru 用 `scripts/import_classification_snapshot.py --profile danbooru` 导入官方导出后即可用，补全返回分类、post_count 与别名指向。
+- **批量操作**：多选或按过滤器圈定后 批量添加/删除/替换（支持正则）；九字段仅作用于 tags/appearance/environment 三个列表字段。
+- **撤销/重做**：每会话保留最近 20 步操作日志；所有写回为原子写并带 mtime 乐观锁。
+- **标签统计**：频次排行（带分类着色），点击即加入过滤。
+- **缩略图**：服务端按需生成并磁盘缓存，解码前执行字节与像素预算校验。
 
 <a id="output-format"></a>
 
@@ -600,10 +617,12 @@ Tagger2_Inference_Rebuild2/
 ## 相关文档
 
 - [中文使用说明](USER_GUIDE_zh-CN.txt)
+- [标签管理模块说明](docs/tag_manager.md)
 - [Dataset Workflow 模块说明](docs/workflow_module.md)
 - [Dataset Workflow 路径操作说明](docs/workflow_manual_paths.md)
 - [固定上游兼容性报告](docs/workflow_compatibility_report.md)
 - [发行包内容与资源指纹](docs/release_package_contents.md)
+- [V1.05 标签管理与优化说明](docs/V1.05_RELEASE_NOTES.md)
 - [V1.04.1 部署修复说明](docs/V1.04.1_RELEASE_NOTES.md)
 - [V1.04 图像生成功能说明](docs/V1.04_RELEASE_NOTES.md)
 - [最新 Release](https://github.com/nzs234/Tagger2_Inference_Rebuild2/releases/latest)
