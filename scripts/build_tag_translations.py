@@ -48,7 +48,7 @@ import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterator
+from typing import Any, Iterator
 
 project_root = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(project_root / "backend"))
@@ -427,22 +427,23 @@ def main() -> int:
     danbooru_count, danbooru_hash = write_csv_gz(out_dir / "danbooru-zh.csv.gz", danbooru)
     e621_count, e621_hash = write_csv_gz(out_dir / "e621-zh.csv.gz", e621)
 
-    manifest = {
+    profiles: dict[str, dict[str, Any]] = {
+        "danbooru": {
+            "file": "danbooru-zh.csv.gz",
+            "entries": danbooru_count,
+            "sha256": danbooru_hash,
+        },
+        "e621": {
+            "file": "e621-zh.csv.gz",
+            "entries": e621_count,
+            "sha256": e621_hash,
+            "note": "Danbooru 词条与 e621 标签命名空间的交集",
+        },
+    }
+    manifest: dict[str, Any] = {
         "format": MANIFEST_FORMAT,
         "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "profiles": {
-            "danbooru": {
-                "file": "danbooru-zh.csv.gz",
-                "entries": danbooru_count,
-                "sha256": danbooru_hash,
-            },
-            "e621": {
-                "file": "e621-zh.csv.gz",
-                "entries": e621_count,
-                "sha256": e621_hash,
-                "note": "Danbooru 词条与 e621 标签命名空间的交集",
-            },
-        },
+        "profiles": profiles,
         "sources": used,
     }
     (out_dir / "MANIFEST.json").write_text(
@@ -450,10 +451,10 @@ def main() -> int:
     )
 
     print("Written:")
-    for profile, info in manifest["profiles"].items():  # type: ignore[union-attr]
-        path = out_dir / str(info["file"])  # type: ignore[index]
+    for profile, info in profiles.items():
+        path = out_dir / str(info["file"])
         print(f"  {profile:<9} {path.name}  {path.stat().st_size:,} bytes"
-              f"  {info['entries']:,} entries")  # type: ignore[index]
+              f"  {info['entries']:,} entries")
     return 0
 
 
