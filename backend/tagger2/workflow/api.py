@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import logging
 import stat
 from collections.abc import Callable, Sequence
 from pathlib import Path
@@ -16,6 +17,9 @@ from .db import WorkflowDatabase, default_workflow_database_path
 from .policy_config_parser import parse_policy_config
 from .preflight import WorkflowPreflightError, WorkflowPreflightService
 from .resources import WorkflowResourceCatalog
+
+
+logger = logging.getLogger("tagger2.workflow.api")
 
 
 def _build_public_error_codes() -> dict[type, str]:
@@ -758,12 +762,20 @@ def create_workflow_router(
 
         try:
             JobLifecycle(database, job_id).transition("failed")
-        except Exception:  # noqa: BLE001, S110
-            pass
+        except Exception as cleanup_exc:  # noqa: BLE001
+            logger.warning(
+                "workflow job %s: lifecycle transition to failed failed during failure recording: %s",
+                job_id,
+                cleanup_exc,
+            )
         try:
             database.update_job_status(job_id, status="failed", error=code)
-        except Exception:  # noqa: BLE001, S110
-            pass
+        except Exception as cleanup_exc:  # noqa: BLE001
+            logger.warning(
+                "workflow job %s: status update to failed failed during failure recording: %s",
+                job_id,
+                cleanup_exc,
+            )
         try:
             with database.connection() as conn:
                 conn.execute(
@@ -771,8 +783,12 @@ def create_workflow_router(
                     "WHERE job_id = ? AND status IN ('pending', 'running')",
                     (utc_now(), job_id),
                 )
-        except Exception:  # noqa: BLE001, S110
-            pass
+        except Exception as cleanup_exc:  # noqa: BLE001
+            logger.warning(
+                "workflow job %s: stage-run cleanup failed during failure recording: %s",
+                job_id,
+                cleanup_exc,
+            )
 
     async def _execute_job_async(job_id: str) -> None:
         """Execute a workflow job in the background, updating status and seeding reviews."""
@@ -1023,6 +1039,20 @@ def create_workflow_router(
                     # from degrading into a warning-only OCR skip.
                     raise ValueError(f"OCR resource failed execution probe: {exc}") from exc
 
+            # Policy config converted to dataclass if enabled.  Resolved before
+            # the NL adapter below so an invalid policy fails before an adapter
+            # (and its dedicated event loop) exists and must be cleaned up.
+            policy_config_arg = None
+            if config.policy.get("enabled") and resume_cursor != "token_review":
+                try:
+                    policy_config_arg = parse_policy_config(config.policy)
+                except Exception as exc:
+                    raise ValueError(f"invalid policy configuration: {exc}") from exc
+
+            # Resolve the frozen tokenizer resource unless a test explicitly
+            # injected a deterministic counter.
+            token_counter_arg = _token_counter_for_config(config)
+
             # NL client if provider configured
             nl_client = None
             if config.nl.get("enabled") and resume_cursor is None:
@@ -1062,10 +1092,16 @@ def create_workflow_router(
                             raw_keys = secret_store.get(secret_ref)
                             if raw_keys:
                                 keys = [k.strip() for k in raw_keys.replace(",", "\n").split("\n") if k.strip()]
-                        except Exception:  # noqa: BLE001, S110
-                            pass
+                        except Exception as secret_exc:  # noqa: BLE001
+                            logger.warning(
+                                "workflow job %s: provider secret %s unavailable, "
+                                "continuing without API keys: %s",
+                                job_id,
+                                secret_ref,
+                                secret_exc,
+                            )
                     cfg["api_keys"] = tuple(keys)
-                    
+
                     # Create provider instance
                     provider = create_provider(ProviderConfig.from_mapping(cfg))
                     nl_client = ProviderNlAdapter(
@@ -1073,37 +1109,32 @@ def create_workflow_router(
                         model=(str(config.nl.get("model")) if config.nl.get("model") else None),
                     )
 
-            # Policy config converted to dataclass if enabled
-            policy_config_arg = None
-            if config.policy.get("enabled") and resume_cursor != "token_review":
-                try:
-                    policy_config_arg = parse_policy_config(config.policy)
-                except Exception as exc:
-                    raise ValueError(f"invalid policy configuration: {exc}") from exc
-
-            # Resolve the frozen tokenizer resource unless a test explicitly
-            # injected a deterministic counter.
-            token_counter_arg = _token_counter_for_config(config)
-
-            report = await asyncio.to_thread(
-                run_offline_pipeline,
-                config,
-                source_root=source_path,
-                output_root=output_path,
-                workspace=workspace,
-                replacement_index_path=replacement_index_path,
-                resource_fingerprints=resource_fingerprints,
-                resource_manifests=frozen_manifests,
-                tag_predictor=tag_predictor,
-                classification_rules=classification_rules,
-                policy_config=policy_config_arg,
-                token_counter=token_counter_arg,
-                ocr_engine=ocr_engine,
-                nl_client=nl_client,
-                database=database,
-                job_id=job_id,
-                resource_verifier=verify_all_frozen_resources,
-            )
+            try:
+                report = await asyncio.to_thread(
+                    run_offline_pipeline,
+                    config,
+                    source_root=source_path,
+                    output_root=output_path,
+                    workspace=workspace,
+                    replacement_index_path=replacement_index_path,
+                    resource_fingerprints=resource_fingerprints,
+                    resource_manifests=frozen_manifests,
+                    tag_predictor=tag_predictor,
+                    classification_rules=classification_rules,
+                    policy_config=policy_config_arg,
+                    token_counter=token_counter_arg,
+                    ocr_engine=ocr_engine,
+                    nl_client=nl_client,
+                    database=database,
+                    job_id=job_id,
+                    resource_verifier=verify_all_frozen_resources,
+                )
+            finally:
+                # The adapter owns a dedicated event loop plus the provider's
+                # pooled connections; it must drain even when the pipeline
+                # raises, or the loop and client leak per job run.
+                if nl_client is not None:
+                    nl_client.close()
     
             # Persist the stage report so the UI can read per-stage counters
             # (OCR included) without the pipeline holding process state.
@@ -1616,8 +1647,12 @@ def create_workflow_router(
                     error="restore_failed",
                     expected_status="restoring",
                 )
-            except Exception:  # noqa: BLE001, S110
-                pass
+            except Exception as cleanup_exc:  # noqa: BLE001
+                logger.warning(
+                    "workflow job %s: restore failure status update failed: %s",
+                    job_id,
+                    cleanup_exc,
+                )
             try:
                 database.record_operation(
                     job_id,
@@ -1627,12 +1662,20 @@ def create_workflow_router(
                     payload={"code": "restore_failed"},
                 )
                 database.record_event(job_id, "restore_failed", payload={"code": "restore_failed"})
-            except Exception:  # noqa: BLE001, S110
-                pass
+            except Exception as cleanup_exc:  # noqa: BLE001
+                logger.warning(
+                    "workflow job %s: restore failure operation record failed: %s",
+                    job_id,
+                    cleanup_exc,
+                )
             try:
                 database.release_dataset_locks(job_id)
-            except Exception:  # noqa: BLE001, S110
-                pass
+            except Exception as cleanup_exc:  # noqa: BLE001
+                logger.warning(
+                    "workflow job %s: restore failure lock release failed: %s",
+                    job_id,
+                    cleanup_exc,
+                )
         
         try:
             # Serialize Restore against new starts. The terminal job released

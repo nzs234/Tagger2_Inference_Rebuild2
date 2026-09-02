@@ -273,6 +273,12 @@ _GOOGLE_MODEL_LIMITS: Mapping[str, tuple[tuple[str, ...], tuple[str, ...], str, 
 }
 
 
+def _matches_gpt_image_model(normalized: str) -> bool:
+    """Boundary-aware match so prefixed proxy aliases (firefly-gpt-image-2)
+    resolve to the GPT-image family while random names (notgpt-image-2) do not."""
+    return normalized.startswith("gpt-image") or "-gpt-image" in normalized
+
+
 def _specialize_model(capability: ImageCapability, model: str, *, kind: str) -> ImageCapability:
     normalized = model.casefold().removeprefix("models/")
     if capability.family == "google_gemini" and normalized in _GOOGLE_MODEL_LIMITS:
@@ -309,9 +315,11 @@ def _specialize_model(capability: ImageCapability, model: str, *, kind: str) -> 
             source_url=capability.source_url,
             notes="Legacy Grok image generation endpoint; editing and size controls are not assumed.",
         )
-    if capability.family == "openai_gpt_image" and kind == "openai" and normalized.startswith("gpt-image-2"):
+    if capability.family == "openai_gpt_image" and normalized.endswith("gpt-image-2"):
         # gpt-image-2 accepts arbitrary WIDTHxHEIGHT sizes (divisible by 16,
-        # aspect ratio between 1:3 and 3:1, up to 3840x2160).
+        # aspect ratio between 1:3 and 3:1, up to 3840x2160).  Proxies may
+        # expose the model under a prefixed alias (e.g. firefly-gpt-image-2),
+        # so the suffix match intentionally ignores the provider kind.
         enums = dict(capability.enums)
         enums["size"] = capability.enums.get("size", OPENAI_SIZES) + (OPENAI_CUSTOM_SIZE_SENTINEL,)
         return ImageCapability(
@@ -327,7 +335,16 @@ def _specialize_model(capability: ImageCapability, model: str, *, kind: str) -> 
             source_url=capability.source_url,
             notes=capability.notes,
         )
-    if capability.family == "openai_gpt_image" and kind == "openai":
+    if capability.family == "openai_gpt_image" and (
+        kind == "openai" or _matches_gpt_image_model(normalized)
+    ):
+        # The official OpenAI Images endpoint (kind == "openai") rejects
+        # response_format for gpt-image models, and a model whose name
+        # boundary-matches the family (e.g. firefly-gpt-image-1) is the same
+        # backend behind a proxy prefix regardless of provider kind, so it
+        # must not advertise the field either.  Unrecognised alias names on
+        # custom gateways keep response_format because those backends may
+        # still need it to select b64_json output.
         parameters = tuple(name for name in capability.parameters if name != "response_format")
         enums = {name: values for name, values in capability.enums.items() if name != "response_format"}
         defaults = {name: value for name, value in capability.defaults.items() if name != "response_format"}
@@ -357,7 +374,7 @@ def _family_is_known(family: str, model: str, configured_family: str | None) -> 
             token in normalized for token in ("image", "nano-banana", "nanobanana")
         )
     if family == "openai_gpt_image":
-        return normalized.startswith("gpt-image")
+        return _matches_gpt_image_model(normalized)
     if family == "xai_grok_image":
         return normalized == "grok-2-image-1212" or normalized.startswith("grok-imagine-image")
     return False
@@ -384,7 +401,7 @@ def infer_family(
         return "xai_grok_image"
     if protocol == "gemini" or kind in {"gemini", "antigravity"} or "nano-banana" in normalized or "nanobanana" in normalized:
         return "google_gemini"
-    if normalized.startswith("gpt-image"):
+    if _matches_gpt_image_model(normalized):
         return "openai_gpt_image"
     if explicit == "unknown":
         return "unknown"

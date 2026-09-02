@@ -12,6 +12,9 @@ UPDATE_SCRIPT = ROOT / "scripts" / "update_from_git.ps1"
 
 
 def _run(command: list[str], *, cwd: Path) -> subprocess.CompletedProcess[str]:
+    # PowerShell and git emit console output in the system ANSI codepage on
+    # localized Windows, so strict UTF-8 decoding would crash the harness
+    # instead of surfacing the real script result.
     return subprocess.run(
         command,
         cwd=cwd,
@@ -19,12 +22,13 @@ def _run(command: list[str], *, cwd: Path) -> subprocess.CompletedProcess[str]:
         capture_output=True,
         text=True,
         encoding="utf-8",
+        errors="replace",
     )
 
 
 def _git(cwd: Path, *arguments: str) -> str:
     result = _run(["git", *arguments], cwd=cwd)
-    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.returncode == 0, (result.stdout or "") + (result.stderr or "")
     return result.stdout.strip()
 
 
@@ -33,6 +37,16 @@ def _powershell() -> str:
     if executable is None:
         pytest.skip("PowerShell is not available")
     return executable
+
+
+def _powershell_run(script_args: list[str], *, cwd: Path) -> subprocess.CompletedProcess[str]:
+    # Windows PowerShell 5.1 refuses -File scripts under the default Restricted
+    # execution policy; Bypass is scoped to this process only. pwsh accepts it
+    # as well, so CI and local runs share one invocation shape.
+    return _run(
+        [_powershell(), "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", *script_args],
+        cwd=cwd,
+    )
 
 
 def test_update_script_fast_forwards_and_rejects_tracked_changes(tmp_path: Path) -> None:
@@ -56,11 +70,8 @@ def test_update_script_fast_forwards_and_rejects_tracked_changes(tmp_path: Path)
     _git(seed, "commit", "-am", "second")
     _git(seed, "push", "origin", "main")
 
-    result = _run(
+    result = _powershell_run(
         [
-            _powershell(),
-            "-NoProfile",
-            "-File",
             str(UPDATE_SCRIPT),
             "-ProjectRoot",
             str(checkout),
@@ -71,7 +82,7 @@ def test_update_script_fast_forwards_and_rejects_tracked_changes(tmp_path: Path)
         ],
         cwd=ROOT,
     )
-    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.returncode == 0, (result.stdout or "") + (result.stderr or "")
     assert _git(checkout, "rev-parse", "HEAD") == _git(seed, "rev-parse", "HEAD")
     assert (checkout / "tracked.txt").read_text(encoding="utf-8") == "two\n"
 
@@ -81,11 +92,8 @@ def test_update_script_fast_forwards_and_rejects_tracked_changes(tmp_path: Path)
     _git(seed, "push", "origin", "main")
     before = _git(checkout, "rev-parse", "HEAD")
 
-    blocked = _run(
+    blocked = _powershell_run(
         [
-            _powershell(),
-            "-NoProfile",
-            "-File",
             str(UPDATE_SCRIPT),
             "-ProjectRoot",
             str(checkout),
@@ -93,6 +101,6 @@ def test_update_script_fast_forwards_and_rejects_tracked_changes(tmp_path: Path)
         cwd=ROOT,
     )
     assert blocked.returncode != 0
-    assert "uncommitted tracked changes" in (blocked.stdout + blocked.stderr)
+    assert "uncommitted tracked changes" in (blocked.stdout or "") + (blocked.stderr or "")
     assert _git(checkout, "rev-parse", "HEAD") == before
     assert (checkout / "tracked.txt").read_text(encoding="utf-8") == "local edit\n"

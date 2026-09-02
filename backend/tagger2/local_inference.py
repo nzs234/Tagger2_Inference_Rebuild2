@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import gc
+import logging
 import os
+import pickle
 import threading
 import time
 from collections import OrderedDict
@@ -19,6 +21,9 @@ from PIL import Image
 from .model_registry import ModelBackend, ModelRecord, ModelRegistry
 from .preprocessing import preprocess_batch, preprocess_image
 from .schemas import TagItem
+
+
+logger = logging.getLogger("tagger2.local_inference")
 
 
 class InferenceError(RuntimeError):
@@ -371,10 +376,13 @@ class LocalInferenceEngine:
             if not unsafe_allowed:
                 raise UnsafeModelError("pickle-based weights require explicit trust")
             # Restricted weights-only loading is attempted first. Full pickle
-            # deserialisation occurs only after the caller explicitly opts in.
+            # deserialisation occurs only after the caller explicitly opts in,
+            # and only when torch itself rejected the checkpoint contents.
             try:
                 state = torch.load(record.weight_path, map_location="cpu", weights_only=True)
-            except Exception:
+            except Exception as exc:
+                if not _is_pickle_restriction_error(exc):
+                    raise
                 state = torch.load(record.weight_path, map_location="cpu", weights_only=False)
 
         if isinstance(state, torch.nn.Module):
@@ -1102,6 +1110,7 @@ def _run_classifier(
     except Exception:
         # Optional aesthetic classification must not discard otherwise
         # valid tagger output. Keep the failure structured and path-free.
+        logger.warning("aesthetic classifier failed; output continues without scores", exc_info=True)
         return {"errors": ["classifier_failed"]}
 
 
@@ -1133,7 +1142,29 @@ def _run_classifier_batch(
             raise TypeError("classifier batch result length does not match input")
         return [dict(value) if isinstance(value, Mapping) else {"errors": ["classifier_failed"]} for value in values]
     except Exception:
+        logger.warning("batch aesthetic classifier failed; output continues without scores", exc_info=True)
         return [{"errors": ["classifier_failed"]} for _ in images]
+
+
+def _is_pickle_restriction_error(exc: Exception) -> bool:
+    """Only a weights_only/pickle-restriction rejection may escalate to unsafe unpickling.
+
+    Verified against torch 2.10: restricted loads raise ``pickle.UnpicklingError``
+    (message prefixed with "Weights only load failed") or, for TorchScript/legacy
+    archives, a ``RuntimeError`` naming ``weights_only=True``. Transient I/O
+    failures (missing or truncated file, permissions) must not unlock full pickle
+    deserialisation, so everything else is rejected here.
+    """
+
+    if isinstance(exc, pickle.UnpicklingError):
+        return True
+    if not isinstance(exc, (RuntimeError, TypeError, ValueError)):
+        return False
+    message = str(exc).casefold()
+    return any(
+        marker in message
+        for marker in ("weights only load failed", "weightsunpickler", "weights_only", "not an allowed global")
+    )
 
 
 def _is_out_of_memory(exc: BaseException) -> bool:

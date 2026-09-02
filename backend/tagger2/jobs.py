@@ -94,7 +94,8 @@ class JobManager:
     async def _create_and_start(self, job_id: str) -> JobRecord:
         await self.start(job_id)
         record = self.storage.get_job(job_id)
-        assert record is not None
+        if record is None:
+            raise KeyError(job_id)
         return record
 
     async def start(self, job_id: str) -> asyncio.Task[None]:
@@ -132,7 +133,8 @@ class JobManager:
         except asyncio.CancelledError:
             raise
         record = self.storage.get_job(job_id)
-        assert record is not None
+        if record is None:
+            raise KeyError(job_id)
         return record
 
     async def pause(self, job_id: str) -> JobRecord:

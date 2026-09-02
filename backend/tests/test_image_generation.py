@@ -14,9 +14,11 @@ from PIL import Image
 
 from tagger2.image_generation.capabilities import (
     GOOGLE_BASE_RATIOS,
+    _family_is_known,
     capabilities_for,
     capability_for_style,
     capability_object,
+    infer_family,
 )
 from tagger2.image_generation.client import ImageGenerationClient, ImageRequest
 from tagger2.image_generation.client import ImageCallResult, ResolvedImage
@@ -391,6 +393,53 @@ def test_official_legacy_grok_and_gpt_image_expose_only_supported_parameters():
     )
     assert "quality" in openai["parameters"]
     assert "response_format" not in openai["parameters"]
+
+
+def test_prefixed_gpt_image_proxy_aliases_match_family_with_name_boundaries():
+    assert infer_family(kind="openai", protocol="openai", model="firefly-gpt-image-2") == "openai_gpt_image"
+    assert infer_family(kind="openai", protocol="openai", model="notgpt-image-2") == "unknown"
+    assert _family_is_known("openai_gpt_image", "firefly-gpt-image-2", None) is True
+
+    aliased_two = capabilities_for(
+        kind="openai",
+        protocol="openai",
+        model="firefly-gpt-image-2",
+    )
+    assert aliased_two["family"] == "openai_gpt_image"
+    assert "custom" in aliased_two["enums"]["size"]
+
+    # A prefixed alias on a chat-compat gateway kind gets the same
+    # response_format treatment as the official kind.
+    aliased_one = capabilities_for(
+        kind="custom",
+        protocol="openai",
+        model="firefly-gpt-image-1",
+    )
+    assert aliased_one["family"] == "openai_gpt_image"
+    assert "response_format" not in aliased_one["parameters"]
+
+    # Alias names that do not boundary-match the family stay conservative on
+    # custom gateways: explicit family, but response_format is kept.
+    unrelated = capabilities_for(
+        kind="custom",
+        protocol="openai",
+        model="my-image-model",
+        configured_family="openai_gpt_image",
+    )
+    assert "response_format" in unrelated["parameters"]
+
+    # Names without the gpt-image boundary keep the conservative unknown shape.
+    unknown = capabilities_for(kind="openai", protocol="openai", model="notgpt-image-2")
+    assert unknown["family"] == "unknown"
+    assert unknown["known"] is False
+    assert unknown["parameters"] == ["response_format"]
+
+    # Official model names behave exactly as before.
+    assert infer_family(kind="openai", protocol="openai", model="gpt-image-2") == "openai_gpt_image"
+    official_one = capabilities_for(kind="openai", protocol="openai", model="gpt-image-1")
+    assert official_one["family"] == "openai_gpt_image"
+    assert "response_format" not in official_one["parameters"]
+    assert "custom" not in official_one["enums"]["size"]
 
 
 def test_grok_imagine_registry_matches_official_controls():

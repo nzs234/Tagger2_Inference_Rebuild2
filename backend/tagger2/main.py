@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import itertools
 import json
+import logging
 import os
 import re
 import shutil
@@ -88,6 +89,9 @@ from .video_prompts import (
     parse_video_prompt_response,
     resolve_h3_base_mode,
 )
+
+
+logger = logging.getLogger("tagger2.main")
 
 
 DEFAULT_NL_PROMPT = """Instruction (Deep Scan):
@@ -1884,6 +1888,12 @@ def create_app(settings: AppConfig | None = None) -> FastAPI:
                 ),
             )
         except Exception:
+            logger.exception(
+                "unhandled server error [request_id=%s] %s %s",
+                request_id,
+                request.method,
+                request.url.path,
+            )
             response = JSONResponse(
                 status_code=500,
                 content=_error_payload(
@@ -2423,6 +2433,7 @@ def create_app(settings: AppConfig | None = None) -> FastAPI:
                 ),
             )
         except Exception:
+            logger.exception("provider %s connection test failed", provider_id)
             return JSONResponse(
                 status_code=502,
                 content=_error_payload(

@@ -412,7 +412,8 @@ class SQLiteStorage:
                 now,
             )
         record = self.get_job(job_id)
-        assert record is not None
+        if record is None:
+            raise RuntimeError(f"job {job_id} missing after create_job insert")
         return record
 
     def _insert_item(
@@ -516,7 +517,8 @@ class SQLiteStorage:
                 data.update(redact_secrets(dict(event)))
             self._insert_event(connection, job_id, data, now)
         record = self.get_job(job_id)
-        assert record is not None
+        if record is None:
+            raise RuntimeError(f"job {job_id} missing after transition to {state}")
         return record
 
     set_job_state = transition_job

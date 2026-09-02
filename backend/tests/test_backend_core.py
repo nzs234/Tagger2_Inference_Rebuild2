@@ -184,6 +184,55 @@ def test_registry_has_opaque_id_and_refuses_untrusted_pickle(tmp_path: Path) -> 
         LocalInferenceEngine(registry, device="cpu").load(record.model_id)
 
 
+def test_unsafe_pickle_fallback_refuses_non_pickle_errors(tmp_path: Path, monkeypatch) -> None:
+    torch = pytest.importorskip("torch")
+    model = _model_dir(tmp_path)
+    registry = ModelRegistry([model.parent])
+    record = registry.register(model, trusted=True)
+    engine = LocalInferenceEngine(registry, device="cpu")
+    calls: list[bool] = []
+
+    def fake_load(_path, *, map_location=None, weights_only=True, **_kwargs):
+        del map_location
+        calls.append(weights_only)
+        if weights_only:
+            raise OSError("disk full")
+        raise AssertionError("weights_only=False must not be attempted for non-pickle errors")
+
+    monkeypatch.setattr(torch, "load", fake_load)
+
+    with pytest.raises(OSError, match="disk full"):
+        engine._load_pytorch(record, unsafe_allowed=True)
+    assert calls == [True]
+
+
+def test_unsafe_pickle_fallback_follows_weights_only_rejection(tmp_path: Path, monkeypatch) -> None:
+    torch = pytest.importorskip("torch")
+    model = _model_dir(tmp_path)
+    registry = ModelRegistry([model.parent])
+    record = registry.register(model, trusted=True)
+    engine = LocalInferenceEngine(registry, device="cpu")
+    calls: list[bool] = []
+    fallback_model = torch.nn.Module()
+
+    def fake_load(_path, *, map_location=None, weights_only=True, **_kwargs):
+        del map_location
+        calls.append(weights_only)
+        if weights_only:
+            raise RuntimeError(
+                "Weights only load failed. In PyTorch 2.6, we changed the default value of the "
+                "`weights_only` argument in `torch.load` from `False` to `True`. "
+                "WeightsUnpickler error: Unsupported global GLOBAL os.system"
+            )
+        return fallback_model
+
+    monkeypatch.setattr(torch, "load", fake_load)
+
+    loaded, _ = engine._load_pytorch(record, unsafe_allowed=True)
+    assert calls == [True, False]
+    assert loaded is fallback_model
+
+
 def test_threshold_snapshot_and_merge_do_not_mutate_model(tmp_path: Path) -> None:
     record = ModelRegistry([_model_dir(tmp_path).parent]).discover()[0]
     original = dict(record.thresholds)

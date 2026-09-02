@@ -18,6 +18,13 @@ from .capabilities import ImageCapability
 from .parser import ParsedImage, parse_response, truncate_debug
 
 
+# One backoff ceiling for every retry class: the shared vision-provider
+# helper (providers.base.backoff_seconds) caps both HTTP Retry-After and
+# transport backoff at the same 120 s so no single failure can stall a
+# bounded job worker for minutes.
+_MAX_RETRY_DELAY_SECONDS = 120.0
+
+
 @dataclass(frozen=True, slots=True)
 class ImageRequest:
     model: str
@@ -354,7 +361,11 @@ class ImageGenerationClient:
                     if not error.retryable or attempt >= self.config.max_retries:
                         raise last
                     self.key_pool.cooldown(key, self.config.key_cooldown_seconds)
-                    await asyncio.sleep(min(120.0, max(0.0, error.retry_after or self.config.retry_base_seconds * (2**attempt))))
+                    delay = min(
+                        _MAX_RETRY_DELAY_SECONDS,
+                        max(0.0, error.retry_after or self.config.retry_base_seconds * (2**attempt)),
+                    )
+                    await asyncio.sleep(delay)
                     continue
                 return response
             except asyncio.CancelledError:
@@ -366,7 +377,10 @@ class ImageGenerationClient:
                 if attempt >= self.config.max_retries:
                     raise last from exc
                 self.key_pool.cooldown(key, self.config.key_cooldown_seconds)
-                await asyncio.sleep(min(30.0, self.config.retry_base_seconds * (2**attempt)))
+                delay = min(
+                    _MAX_RETRY_DELAY_SECONDS, self.config.retry_base_seconds * (2**attempt)
+                )
+                await asyncio.sleep(delay)
         raise last or ProviderError("image provider request failed", code="image_provider_request_failed")
 
     async def _send_bounded(

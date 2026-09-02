@@ -944,6 +944,7 @@ def _run_offline_pipeline_impl(
             reuse_original_nl=bool(config.nl.get('reuse_original_nl', True)),
             use_image=bool(config.nl.get('use_image', True)),
             use_full_json=bool(config.nl.get('use_full_json', False)),
+            concurrency=int(config.nl.get('concurrency', 4)),
             ocr_by_path={
                 relative_path: {
                     "regions": result.detected_regions,

@@ -73,6 +73,7 @@ SECTION_SCHEMA: dict[str, dict[str, Any]] = {
         "use_full_json": bool,
         "prompt_preset": "str",
         "length": ("enum", ("short", "medium", "long")),
+        "concurrency": ("int", 1, 32),
     },
     "count_review": {
         "enabled": bool,
@@ -384,6 +385,7 @@ class WorkflowJobConfigV1:
         "use_full_json": False,
         "prompt_preset": "general",
         "length": "medium",  # "short" (2-3), "medium" (4-5), "long" (6-8) sentences
+        "concurrency": 4,  # parallel NL requests against one provider profile
     })
     
     # Count review configuration

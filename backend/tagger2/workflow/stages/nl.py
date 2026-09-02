@@ -162,18 +162,47 @@ def run_nl_stage(
     use_image: bool = True,
     use_full_json: bool = False,
     ocr_by_path: Mapping[str, Mapping[str, Any]] | None = None,
+    concurrency: int = 1,
 ) -> NlStageReport:
     """Generate NL for every sample that needs it.
 
     A sample that already carries NL is reused when ``reuse_original_nl`` is set,
     so an existing human caption is never silently replaced. Validation failures
     are recorded per sample and leave the existing NL untouched.
+
+    When ``concurrency`` is above one and the client exposes ``complete_many``,
+    requests are dispatched concurrently; per-sample outcomes and error text are
+    identical to the sequential path.
     """
 
     report = NlStageReport()
     source_root = Path(source_root)
     system_prompt = build_system_prompt(preset, length)
 
+    def fail(relative: str, message: str) -> None:
+        report.failed += 1
+        report.results.append(
+            NlResult(relative_image_path=relative, error=message)
+        )
+
+    def accept(relative: str, body: bytes) -> None:
+        try:
+            nl, observation = _validate_response(body)
+        except (NlError, NlValidationError) as exc:
+            fail(relative, str(exc))
+            return
+        except Exception as exc:  # noqa: BLE001 - surfaced as a per-sample issue
+            fail(relative, f"NL request failed: {exc}")
+            return
+        if nl == NL_IMAGE_NOT_RECEIVED:
+            fail(relative, "nl_image_not_received")
+            return
+        report.generated += 1
+        report.results.append(
+            NlResult(relative_image_path=relative, nl=nl, observation=observation)
+        )
+
+    pending: list[tuple[Any, NlRequest]] = []
     for sample in samples:
         relative = sample.relative_image_path
         projection = projections.get(relative, {})
@@ -193,61 +222,61 @@ def run_nl_stage(
             try:
                 candidate.relative_to(source_root_resolved)
             except ValueError:
-                report.failed += 1
-                report.results.append(
-                    NlResult(relative_image_path=relative, error="nl_image_path_escape")
-                )
+                fail(relative, "nl_image_path_escape")
                 continue
             if not candidate.is_file():
-                report.failed += 1
-                report.results.append(
-                    NlResult(relative_image_path=relative, error="nl_image_missing")
-                )
+                fail(relative, "nl_image_missing")
                 continue
             image_path = candidate
 
-        request = NlRequest(
-            relative_image_path=relative,
-            system_prompt=system_prompt,
-            payload=build_payload(
-                projection,
-                use_full_json=use_full_json,
-                current_nl=existing,
-                ocr=(
-                    dict((ocr_by_path or {}).get(relative, {}))
-                    if relative in (ocr_by_path or {})
-                    else None
+        pending.append(
+            (
+                sample,
+                NlRequest(
+                    relative_image_path=relative,
+                    system_prompt=system_prompt,
+                    payload=build_payload(
+                        projection,
+                        use_full_json=use_full_json,
+                        current_nl=existing,
+                        ocr=(
+                            dict((ocr_by_path or {}).get(relative, {}))
+                            if relative in (ocr_by_path or {})
+                            else None
+                        ),
+                    ),
+                    image_path=image_path,
                 ),
-            ),
-            image_path=image_path,
+            )
         )
 
+    batch_complete = getattr(client, "complete_many", None)
+    if concurrency > 1 and callable(batch_complete) and pending:
+        outcomes = batch_complete(
+            [request for _, request in pending], concurrency=concurrency
+        )
+        for (sample, _request), (status, value) in zip(pending, outcomes):
+            relative = sample.relative_image_path
+            if status == "error":
+                if isinstance(value, (NlError, NlValidationError)):
+                    fail(relative, str(value))
+                else:
+                    fail(relative, f"NL request failed: {value}")
+                continue
+            accept(relative, value)
+        return report
+
+    for sample, request in pending:
+        relative = sample.relative_image_path
         try:
             body = client.complete(request)
-            nl, observation = _validate_response(body)
-            if nl == NL_IMAGE_NOT_RECEIVED:
-                report.failed += 1
-                report.results.append(
-                    NlResult(relative_image_path=relative, error="nl_image_not_received")
-                )
-                continue
         except (NlError, NlValidationError) as exc:
-            report.failed += 1
-            report.results.append(
-                NlResult(relative_image_path=relative, error=str(exc))
-            )
+            fail(relative, str(exc))
             continue
         except Exception as exc:  # noqa: BLE001 - surfaced as a per-sample issue
-            report.failed += 1
-            report.results.append(
-                NlResult(relative_image_path=relative, error=f"NL request failed: {exc}")
-            )
+            fail(relative, f"NL request failed: {exc}")
             continue
-
-        report.generated += 1
-        report.results.append(
-            NlResult(relative_image_path=relative, nl=nl, observation=observation)
-        )
+        accept(relative, body)
 
     return report
 
