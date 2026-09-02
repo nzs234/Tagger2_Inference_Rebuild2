@@ -321,3 +321,61 @@ def test_router_error_envelope_and_happy_paths(workspace):
         f"/api/v1/tag-manager/datasets/{session['id']}/images", params={"kind": "weird"}
     )
     assert bad_filter.status_code == 422
+
+
+def test_edit_rejects_read_only_root_with_actionable_error(tmp_path: Path):
+    dataset = tmp_path / "dataset"
+    dataset.mkdir()
+    _make_image(dataset, "a.png")
+
+    allowlist = PathAllowlist()
+    allowlist.register(dataset, root_id="ro-root", kind="input", writable=False)
+    service = TagManagerService(
+        store=TagManagerStore(":memory:"),
+        allowlist=allowlist,
+        thumbnails=FakeThumbnails(),
+        tag_database=FakeTagDatabase(),
+    )
+    session = service.create_session(
+        CreateDatasetRequest(root_id="ro-root", relative_path="", profile="e621")
+    )
+    service.index_session(str(session["id"]))
+    items = service.list_images(str(session["id"]))["items"]
+
+    with pytest.raises(TagManagerError) as excinfo:
+        service.save_image(
+            str(session["id"]),
+            int(items[0]["id"]),
+            ImageEditRequest(content=TagTxtContent(tags=["x"])),
+        )
+    assert excinfo.value.code == "root_not_writable"
+    assert excinfo.value.status_code == 403
+
+    with pytest.raises(TagManagerError) as excinfo:
+        service.batch_operation(
+            str(session["id"]),
+            BatchOperationRequest(op="add", tags=["x"], image_ids=[int(items[0]["id"])]),
+        )
+    assert excinfo.value.code == "root_not_writable"
+
+
+def test_autocomplete_maps_missing_snapshot_to_clean_error(tmp_path: Path):
+    class MissingSnapshotDb(FakeTagDatabase):
+        def ensure_loaded(self, profile: str, *, resource_id: str | None = None) -> None:
+            from tagger2.tag_manager.tag_db import TagDatabaseError
+
+            raise TagDatabaseError("no classify resource for profile 'danbooru'")
+
+    allowlist = PathAllowlist()
+    allowlist.register(tmp_path, root_id="any-root", kind="input", writable=False)
+    service = TagManagerService(
+        store=TagManagerStore(":memory:"),
+        allowlist=allowlist,
+        thumbnails=FakeThumbnails(),
+        tag_database=MissingSnapshotDb(),
+    )
+
+    with pytest.raises(TagManagerError) as excinfo:
+        service.autocomplete("danbooru", "wolf")
+    assert excinfo.value.code == "tag_db_unavailable"
+    assert excinfo.value.status_code == 409

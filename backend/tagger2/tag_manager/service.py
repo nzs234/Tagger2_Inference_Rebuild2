@@ -38,6 +38,7 @@ from .sidecar_io import (
     render_tags_json,
 )
 from .storage import TagManagerStore
+from .tag_db import TagDatabaseError
 
 logger = logging.getLogger("tagger2.tag_manager")
 
@@ -315,8 +316,27 @@ class TagManagerService:
 
     # -- editing -----------------------------------------------------------
 
+    def _require_writable_root(self, session: Mapping[str, Any]) -> None:
+        """Editing writes sidecars in place, so the session root must be writable."""
+
+        try:
+            root = self.allowlist.get(str(session["root_id"]))
+        except PathNotAllowedError as exc:
+            raise TagManagerError(
+                "数据集根目录不存在或未授权",
+                code="path_not_allowed",
+                status_code=403,
+            ) from exc
+        if not root.writable:
+            raise TagManagerError(
+                "数据集根目录不可写：请在设置中为该目录开启可写权限后再编辑标签",
+                code="root_not_writable",
+                status_code=403,
+            )
+
     def save_image(self, session_id: str, image_id: int, edit: ImageEditRequest) -> dict[str, Any]:
         session = self._require_session(session_id)
+        self._require_writable_root(session)
         image = self._require_image(session_id, image_id)
         kind = str(edit.content.kind)
         current_kind = str(image["sidecar_kind"])
@@ -392,6 +412,7 @@ class TagManagerService:
 
     def batch_operation(self, session_id: str, request: BatchOperationRequest) -> dict[str, Any]:
         session = self._require_session(session_id)
+        self._require_writable_root(session)
         targets = self._resolve_targets(session_id, request)
         if not targets:
             return {"affected": 0, "changes": []}
@@ -541,6 +562,7 @@ class TagManagerService:
         self, session_id: str, changes: list[Mapping[str, Any]], *, use: str
     ) -> None:
         session = self._require_session(session_id)
+        self._require_writable_root(session)
         categories = _CategoryResolver(self.tag_database, str(session["profile"]))
         for change in changes:
             image = self.store.get_image(session_id, int(change["image_id"]))
@@ -573,7 +595,16 @@ class TagManagerService:
         return self.store.tag_stats(session_id, limit=min(max(limit, 1), 1000), min_count=max(min_count, 1))
 
     def autocomplete(self, profile: str, query: str, *, limit: int = 20, resource_id: str | None = None) -> dict[str, Any]:
-        self.tag_database.ensure_loaded(profile, resource_id=resource_id)
+        try:
+            self.tag_database.ensure_loaded(profile, resource_id=resource_id)
+        except TagDatabaseError as exc:
+            # A missing snapshot is a setup state, not a server fault: danbooru
+            # autocomplete needs scripts/import_classification_snapshot.py.
+            raise TagManagerError(
+                f"标签库未就绪：{exc}",
+                code="tag_db_unavailable",
+                status_code=409,
+            ) from exc
         return {
             "profile": profile,
             "items": self.tag_database.autocomplete(profile, query, limit=min(max(limit, 1), 50)),

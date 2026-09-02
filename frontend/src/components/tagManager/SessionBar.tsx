@@ -20,10 +20,10 @@ function SessionStatusBadge({ session }: { session: TagManagerSession }) {
   </span>
 }
 
-export function SessionBar({ sessions, activeSession, inputRoots, active, creating, refreshing, deleting, undoPending, redoPending, actionsDisabled, onSelect, onCreate, onRefresh, onDelete, onUndo, onRedo }: {
+export function SessionBar({ sessions, activeSession, writableRoots, active, creating, refreshing, deleting, undoPending, redoPending, actionsDisabled, onSelect, onCreate, onRefresh, onDelete, onUndo, onRedo }: {
   sessions: TagManagerSession[]
   activeSession?: TagManagerSession
-  inputRoots: RootInfo[]
+  writableRoots: RootInfo[]
   active?: string
   creating: boolean
   refreshing: boolean
@@ -40,7 +40,7 @@ export function SessionBar({ sessions, activeSession, inputRoots, active, creati
   onRedo: () => void
 }) {
   const [rootId, setRootId] = useState('')
-  const effectiveRootId = inputRoots.some((root) => root.id === rootId) ? rootId : inputRoots[0]?.id ?? ''
+  const effectiveRootId = writableRoots.some((root) => root.id === rootId) ? rootId : writableRoots[0]?.id ?? ''
   const [relativePath, setRelativePath] = useState('')
   const [profile, setProfile] = useState<TagManagerProfile>('e621')
   const [recursive, setRecursive] = useState(true)
@@ -76,7 +76,7 @@ export function SessionBar({ sessions, activeSession, inputRoots, active, creati
         <Field label="数据目录">
           <select value={effectiveRootId} onChange={(event) => setRootId(event.target.value)}>
             <option value="">选择输入目录</option>
-            {inputRoots.map((root) => <option key={root.id} value={root.id}>{root.name}</option>)}
+            {writableRoots.map((root) => <option key={root.id} value={root.id}>{root.name}</option>)}
           </select>
         </Field>
         <Field label="相对路径" hint="数据集在所选目录下的子路径，留空表示整个目录">
@@ -106,7 +106,7 @@ export function SessionBar({ sessions, activeSession, inputRoots, active, creati
               name: relativePath.trim().split(/[\\/]/).filter(Boolean).at(-1) || undefined,
             })}
           >打开</Button>
-          {inputRoots.length === 0 && <small className="tm-session-hint">没有可用的输入目录，请先在设置中登记。</small>}
+          {writableRoots.length === 0 && <small className="tm-session-hint">没有可写的根目录：请先在设置中登记目录并开启可写权限。</small>}
         </div>
       </div>
     </div>

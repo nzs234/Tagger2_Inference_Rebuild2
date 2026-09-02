@@ -169,7 +169,8 @@ export function TagManager() {
   })
 
   const actionsDisabled = !sessionReady
-  const inputRoots = (roots.data?.items ?? []).filter((root) => root.kind === 'input')
+  // Editing writes sidecars in place, so only writable roots can host a dataset.
+  const writableRoots = (roots.data?.items ?? []).filter((root) => root.writable)
 
   const setFilter = (next: ImageFilterState) => {
     setFilterState(next)
@@ -242,7 +243,7 @@ export function TagManager() {
     <SessionBar
       sessions={sessions}
       activeSession={session}
-      inputRoots={inputRoots}
+      writableRoots={writableRoots}
       active={activeId}
       creating={createMutation.isPending}
       refreshing={refreshMutation.isPending}
