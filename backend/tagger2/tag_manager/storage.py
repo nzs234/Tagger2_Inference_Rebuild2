@@ -17,8 +17,19 @@ from pathlib import Path
 from typing import Any
 
 from ..workflow.contracts import utc_now
+from .translations import normalize_lookup_key
 
 SCHEMA_VERSION = 1
+
+# SQLite side of ``normalize_lookup_key``: the same lowercase underscore form
+# so a filter typed with spaces matches a sidecar written with underscores.
+_TAG_KEY_SQL = "REPLACE(LOWER(t.tag), ' ', '_')"
+
+
+def normalize_tag_key(tag: str) -> str:
+    """Return the comparison key used by tag filters."""
+
+    return normalize_lookup_key(tag)
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -352,27 +363,31 @@ class TagManagerStore:
         clauses: list[str] = ["d.session_id = ?"]
         values: list[Any] = [session_id]
 
+        # Sidecars spell the same tag with underscores or spaces depending on
+        # the writer, so filters match on a normalized key rather than the
+        # stored spelling.
         if include_tags:
+            keys = [normalize_tag_key(tag) for tag in include_tags]
             if include_mode == "any":
-                placeholders = ", ".join("?" for _ in include_tags)
+                placeholders = ", ".join("?" for _ in keys)
                 clauses.append(
                     f"EXISTS (SELECT 1 FROM dataset_image_tags t"
-                    f" WHERE t.image_id = d.id AND t.tag IN ({placeholders}))"
+                    f" WHERE t.image_id = d.id AND {_TAG_KEY_SQL} IN ({placeholders}))"
                 )
-                values.extend(include_tags)
+                values.extend(keys)
             else:
-                for tag in include_tags:
+                for key in keys:
                     clauses.append(
                         "EXISTS (SELECT 1 FROM dataset_image_tags t"
-                        " WHERE t.image_id = d.id AND t.tag = ?)"
+                        f" WHERE t.image_id = d.id AND {_TAG_KEY_SQL} = ?)"
                     )
-                    values.append(tag)
+                    values.append(key)
         for tag in exclude_tags:
             clauses.append(
                 "NOT EXISTS (SELECT 1 FROM dataset_image_tags t"
-                " WHERE t.image_id = d.id AND t.tag = ?)"
+                f" WHERE t.image_id = d.id AND {_TAG_KEY_SQL} = ?)"
             )
-            values.append(tag)
+            values.append(normalize_tag_key(tag))
         if kind != "any":
             clauses.append("d.sidecar_kind = ?")
             values.append(kind)
@@ -549,4 +564,5 @@ __all__ = [
     "TagManagerStore",
     "TagManagerStoreError",
     "default_tag_manager_database_path",
+    "normalize_tag_key",
 ]

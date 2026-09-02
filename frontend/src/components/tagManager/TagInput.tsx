@@ -1,7 +1,15 @@
 import { LoaderCircle } from 'lucide-react'
 import { useEffect, useRef, useState } from 'react'
-import { formatPostCount, tagManagerApi, type TagDbEntry, type TagManagerProfile } from '../../lib/tagManager'
+import {
+  formatPostCount,
+  formatTagForDisplay,
+  tagManagerApi,
+  toWriteStyle,
+  type TagDbEntry,
+  type TagManagerProfile,
+} from '../../lib/tagManager'
 import { tagCategoryClass, tagCategoryLabel } from '../../lib/tagCategories'
+import { usePreferences } from '../../store/app'
 
 /**
  * Debounced tag-database autocomplete input. Enter commits the first
@@ -15,6 +23,8 @@ export function TagInput({ profile, label, placeholder, disabled, onAdd }: {
   disabled?: boolean
   onAdd: (tag: string, category?: string) => void
 }) {
+  const bilingual = usePreferences((state) => state.bilingualTags)
+  const tagStyle = usePreferences((state) => state.tagStyle)
   const [text, setText] = useState('')
   const [suggestions, setSuggestions] = useState<TagDbEntry[]>([])
   const [open, setOpen] = useState(false)
@@ -22,7 +32,8 @@ export function TagInput({ profile, label, placeholder, disabled, onAdd }: {
   const requestId = useRef(0)
 
   useEffect(() => {
-    const query = text.trim()
+    const rawQuery = text.trim()
+    const query = toWriteStyle(rawQuery, 'underscore')
     if (!query || disabled) {
       setSuggestions([])
       setOpen(false)
@@ -51,7 +62,7 @@ export function TagInput({ profile, label, placeholder, disabled, onAdd }: {
   }, [text, profile, disabled])
 
   const commit = (raw: string, category?: string) => {
-    const tag = raw.trim().replace(/\s+/g, '_')
+    const tag = toWriteStyle(raw.trim(), tagStyle)
     if (!tag) return
     onAdd(tag, category)
     setText('')
@@ -82,13 +93,36 @@ export function TagInput({ profile, label, placeholder, disabled, onAdd }: {
     />
     {loading && <LoaderCircle className="spin tm-autocomplete-spinner" size={13} aria-hidden="true" />}
     {open && suggestions.length > 0 && <ul id={`${label}-suggestions`} className="tm-suggest-list" role="listbox" aria-label={`${label}建议`}>
-      {suggestions.map((entry) => <li key={entry.name} role="option" aria-selected="false">
-        <button type="button" className="tm-suggest-item" title={entry.alias_of ? `别名 → ${entry.alias_of}` : entry.name} onMouseDown={(event) => { event.preventDefault(); commit(entry.name, entry.category) }}>
-          <span className={`tm-pill ${tagCategoryClass(entry.category)}`}>{tagCategoryLabel(entry.category)}</span>
-          <span className="tm-suggest-name">{entry.name}</span>
-          <small>{formatPostCount(entry.post_count)}</small>
-        </button>
-      </li>)}
+      {suggestions.map((entry) => {
+        const displayTag = formatTagForDisplay(entry.name, tagStyle)
+        const showTranslation = bilingual && Boolean(entry.translation)
+        const titleText = entry.alias_of
+          ? `别名 → ${formatTagForDisplay(entry.alias_of, tagStyle)}`
+          : showTranslation && entry.translation
+            ? `${displayTag} · ${entry.translation}`
+            : displayTag
+
+        return (
+          <li key={entry.name} role="option" aria-selected="false">
+            <button
+              type="button"
+              className="tm-suggest-item"
+              title={titleText}
+              onMouseDown={(event) => {
+                event.preventDefault()
+                commit(entry.name, entry.category)
+              }}
+            >
+              <span className={`tm-pill ${tagCategoryClass(entry.category)}`}>{tagCategoryLabel(entry.category)}</span>
+              <span className="tm-suggest-name">
+                {displayTag}
+                {showTranslation && entry.translation && <span className="tm-suggest-zh">({entry.translation})</span>}
+              </span>
+              <small>{formatPostCount(entry.post_count)}</small>
+            </button>
+          </li>
+        )
+      })}
     </ul>}
   </div>
 }

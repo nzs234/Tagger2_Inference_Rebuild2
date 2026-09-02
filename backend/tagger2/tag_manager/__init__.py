@@ -11,10 +11,12 @@ from .contracts import (
     ImageEditRequest,
     ImageFilter,
     NineFieldEdit,
+    NlTranslateRequest,
     SaveTagsContent,
     StandardJsonContent,
     TagsJsonContent,
     TagEdit,
+    TranslationLookupRequest,
 )
 from .sidecar_io import (
     SidecarContent,
@@ -29,6 +31,7 @@ from .storage import TagManagerStore, default_tag_manager_database_path
 from .service import TagManagerError, TagManagerService
 from .tag_db import TagDatabase, TagDatabaseError, TagInfo
 from .thumbnails import ThumbnailError, ThumbnailService
+from .translations import TagTranslations, default_translation_dir
 
 __all__ = [
     "BatchOperationRequest",
@@ -36,6 +39,7 @@ __all__ = [
     "ImageEditRequest",
     "ImageFilter",
     "NineFieldEdit",
+    "NlTranslateRequest",
     "SaveTagsContent",
     "SidecarContent",
     "SidecarKind",
@@ -47,11 +51,14 @@ __all__ = [
     "TagManagerError",
     "TagManagerService",
     "TagManagerStore",
+    "TagTranslations",
     "TagsJsonContent",
     "ThumbnailError",
     "ThumbnailService",
+    "TranslationLookupRequest",
     "dedup_tags",
     "default_tag_manager_database_path",
+    "default_translation_dir",
     "load_sidecar",
     "render_standard_json",
     "render_tag_txt",

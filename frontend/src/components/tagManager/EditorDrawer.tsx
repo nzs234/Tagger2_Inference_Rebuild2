@@ -2,16 +2,22 @@ import { LoaderCircle, RotateCcw, X } from 'lucide-react'
 import { useState } from 'react'
 import { Button, DialogLayer, EmptyState, Field, IconButton, Notice } from '../ui'
 import { tagCategoryClass } from '../../lib/tagCategories'
-import type {
-  StandardJsonContent,
-  StandardJsonFields,
-  TagManagerEditableContent,
-  TagManagerImageContent,
-  TagManagerImageDetail,
-  TagManagerProfile,
-  TagsJsonContent,
-  TagTxtContent,
+import {
+  formatTagForDisplay,
+  toWriteStyle,
+  translationFor,
+  type StandardJsonContent,
+  type StandardJsonFields,
+  type TagManagerEditableContent,
+  type TagManagerImageContent,
+  type TagManagerImageDetail,
+  type TagManagerProfile,
+  type TagsJsonContent,
+  type TagTxtContent,
+  type TagStyle,
 } from '../../lib/tagManager'
+import { usePreferences } from '../../store/app'
+import { NlTranslatePanel } from './NlTranslatePanel'
 import { TagPillEditor } from './TagPillEditor'
 
 const QUALITY_CHOICES = ['general', 'sensitive', 'questionable', 'explicit']
@@ -24,8 +30,37 @@ const COUNT_CHOICES: Array<{ value: StandardJsonFields['count']; label: string }
   { value: 'group', label: 'group · 多人' },
 ]
 
+type Translations = Record<string, string>
+
 function isReadOnly(content: TagManagerImageContent): boolean {
   return content.kind === 'raw_e621_json' || content.kind === 'none'
+}
+
+/** Rewrite every tag-like value of an outgoing payload in the active style. */
+function applyWriteStyle(
+  content: TagManagerEditableContent,
+  style: TagStyle,
+): TagManagerEditableContent {
+  if (content.kind === 'tag_txt') {
+    return { kind: 'tag_txt', tags: content.tags.map((tag) => toWriteStyle(tag, style)) }
+  }
+  if (content.kind === 'tags_json') {
+    return {
+      kind: 'tags_json',
+      tags: content.tags.map((entry) => ({ ...entry, text: toWriteStyle(entry.text, style) })),
+    }
+  }
+  const fields = content.fields
+  return {
+    kind: 'standard_json',
+    fields: {
+      ...fields,
+      quality: fields.quality.map((tag) => toWriteStyle(tag, style)),
+      appearance: fields.appearance.map((tag) => toWriteStyle(tag, style)),
+      tags: fields.tags.map((tag) => toWriteStyle(tag, style)),
+      environment: fields.environment.map((tag) => toWriteStyle(tag, style)),
+    },
+  }
 }
 
 /**
@@ -43,6 +78,7 @@ export function EditorDrawer({ detail, profile, saving, conflict, onClose, onSav
   onReload: () => void
 }) {
   const [draft, setDraft] = useState<TagManagerImageContent>(() => detail.content)
+  const tagStyle = usePreferences((state) => state.tagStyle)
   const readOnly = isReadOnly(draft)
 
   return <DialogLayer onClose={onClose}>
@@ -64,17 +100,27 @@ export function EditorDrawer({ detail, profile, saving, conflict, onClose, onSav
           <span>sidecar 在编辑期间被外部修改，本次保存已被拒绝以避免覆盖他人改动。</span>
           <Button size="sm" variant="outline" icon={<RotateCcw size={13} />} onClick={onReload}>重新加载</Button>
         </Notice>}
-        <EditorBody draft={draft} profile={profile} readOnly={readOnly} onDraft={setDraft} />
+        <EditorBody
+          draft={draft}
+          profile={profile}
+          readOnly={readOnly}
+          translations={detail.translations ?? {}}
+          onDraft={setDraft}
+        />
       </div>
       <footer className="tm-drawer-footer">
-        <span className="muted">保存会写入 sidecar 并记入撤销日志</span>
+        <span className="muted">
+          保存会写入 sidecar 并记入撤销日志{tagStyle === 'space' ? '，标签以空格写入' : ''}
+        </span>
         <div className="tm-drawer-footer-actions">
           <Button variant="secondary" onClick={onClose}>关闭</Button>
           <Button
             icon={saving ? <LoaderCircle className="spin" size={15} /> : undefined}
             disabled={readOnly || saving}
             onClick={() => {
-              if (draft.kind === 'tag_txt' || draft.kind === 'tags_json' || draft.kind === 'standard_json') onSave(draft)
+              if (draft.kind === 'tag_txt' || draft.kind === 'tags_json' || draft.kind === 'standard_json') {
+                onSave(applyWriteStyle(draft, tagStyle))
+              }
             }}
           >保存</Button>
         </div>
@@ -83,10 +129,11 @@ export function EditorDrawer({ detail, profile, saving, conflict, onClose, onSav
   </DialogLayer>
 }
 
-function EditorBody({ draft, profile, readOnly, onDraft }: {
+function EditorBody({ draft, profile, readOnly, translations, onDraft }: {
   draft: TagManagerImageContent
   profile: TagManagerProfile
   readOnly: boolean
+  translations: Translations
   onDraft: (next: TagManagerImageContent) => void
 }) {
   if (draft.kind === 'tag_txt') {
@@ -94,7 +141,7 @@ function EditorBody({ draft, profile, readOnly, onDraft }: {
     return <section className="tm-editor-section" aria-label="tag_txt 编辑器">
       <p className="tm-editor-hint">点击标签即可移除；回车或点击建议添加新标签。</p>
       <TagPillEditor
-        entries={content.tags.map((text) => ({ text }))}
+        entries={content.tags.map((text) => ({ text, translation: translationFor(translations, text) }))}
         profile={profile}
         addLabel="添加标签"
         disabled={readOnly}
@@ -110,7 +157,12 @@ function EditorBody({ draft, profile, readOnly, onDraft }: {
     return <section className="tm-editor-section" aria-label="tags_json 编辑器">
       <p className="tm-editor-hint">条目可携带分类与置信度；新标签的分类来自标签库查询结果。</p>
       <TagPillEditor
-        entries={content.tags.map((entry) => ({ text: entry.text, category: entry.category, score: entry.score }))}
+        entries={content.tags.map((entry) => ({
+          text: entry.text,
+          category: entry.category,
+          score: entry.score,
+          translation: translationFor(translations, entry.text),
+        }))}
         profile={profile}
         addLabel="添加标签"
         disabled={readOnly}
@@ -124,23 +176,43 @@ function EditorBody({ draft, profile, readOnly, onDraft }: {
     </section>
   }
   if (draft.kind === 'standard_json') {
-    return <StandardJsonEditor content={draft as StandardJsonContent} profile={profile} readOnly={readOnly} onDraft={onDraft} />
+    return <StandardJsonEditor
+      content={draft as StandardJsonContent}
+      profile={profile}
+      readOnly={readOnly}
+      translations={translations}
+      onDraft={onDraft}
+    />
   }
   if (draft.kind === 'raw_e621_json') {
-    return <section className="tm-editor-section" aria-label="raw_e621_json 只读视图">
-      <Notice tone="info">该图片的 sidecar 是 e621 原始 JSON，只能查看，不能在编辑器中修改。</Notice>
-      <div className="tm-pill-row">
-        {draft.tags.map((tag) => <span key={tag} className={`tm-pill ${tagCategoryClass(null)}`}>{tag}</span>)}
-      </div>
-    </section>
+    return <RawE621View tags={draft.tags} translations={translations} />
   }
   return <EmptyState title="暂无 sidecar" detail="该图片还没有标签文件。可以先使用批量操作为多张图片添加标签，保存后会生成 sidecar。" />
 }
 
-function StandardJsonEditor({ content, profile, readOnly, onDraft }: {
+function RawE621View({ tags, translations }: { tags: string[]; translations: Translations }) {
+  const bilingual = usePreferences((state) => state.bilingualTags)
+  const tagStyle = usePreferences((state) => state.tagStyle)
+  return <section className="tm-editor-section" aria-label="raw_e621_json 只读视图">
+    <Notice tone="info">该图片的 sidecar 是 e621 原始 JSON，只能查看，不能在编辑器中修改。</Notice>
+    <div className="tm-pill-row">
+      {tags.map((tag) => {
+        const translation = bilingual ? translationFor(translations, tag) : null
+        const display = formatTagForDisplay(tag, tagStyle)
+        return <span key={tag} className={`tm-pill ${tagCategoryClass(null)}`} title={translation ? `${display} · ${translation}` : display}>
+          <span>{display}</span>
+          {translation && <span className="tm-pill-zh">{translation}</span>}
+        </span>
+      })}
+    </div>
+  </section>
+}
+
+function StandardJsonEditor({ content, profile, readOnly, translations, onDraft }: {
   content: StandardJsonContent
   profile: TagManagerProfile
   readOnly: boolean
+  translations: Translations
   onDraft: (next: TagManagerImageContent) => void
 }) {
   const fields = content.fields
@@ -153,7 +225,7 @@ function StandardJsonEditor({ content, profile, readOnly, onDraft }: {
     })
   }
   const listEditor = (key: 'appearance' | 'tags' | 'environment', label: string) => <TagPillEditor
-    entries={fields[key].map((text) => ({ text }))}
+    entries={fields[key].map((text) => ({ text, translation: translationFor(translations, text) }))}
     profile={profile}
     addLabel={`添加${label}标签`}
     disabled={readOnly}
@@ -176,7 +248,7 @@ function StandardJsonEditor({ content, profile, readOnly, onDraft }: {
         ))}
       </div>
       <TagPillEditor
-        entries={fields.quality.map((text) => ({ text }))}
+        entries={fields.quality.map((text) => ({ text, translation: translationFor(translations, text) }))}
         profile={profile}
         addLabel="添加质量标签"
         disabled={readOnly}
@@ -203,6 +275,11 @@ function StandardJsonEditor({ content, profile, readOnly, onDraft }: {
       <Field label="自然语言描述">
         <textarea aria-label="自然语言描述" value={fields.nl} disabled={readOnly} onChange={(event) => setFields({ nl: event.target.value })} />
       </Field>
+      <NlTranslatePanel
+        text={fields.nl}
+        disabled={readOnly}
+        onApply={(translated) => setFields({ nl: translated })}
+      />
     </div>
   </section>
 }

@@ -1,11 +1,16 @@
 import { ImageIcon } from 'lucide-react'
 import { useEffect, useRef, useState, type ReactNode, type RefObject } from 'react'
-import type { TagManagerImageSummary } from '../../lib/tagManager'
+import { tagCategoryClass } from '../../lib/tagCategories'
+import { formatTagForDisplay, type TagManagerImageSummary } from '../../lib/tagManager'
+import { usePreferences } from '../../store/app'
 
 const CARD_HEIGHT = 224
 const CARD_MIN_WIDTH = 150
 const GRID_GAP = 10
 const SCROLL_CONTAINER_HEIGHT = 560
+
+// Cards are fixed height, so only the first few tags fit; the drawer shows all.
+const CARD_TAG_LIMIT = 4
 
 function sidecarLabel(kind: TagManagerImageSummary['sidecar_kind']): string {
   if (kind === 'tag_txt') return 'TXT'
@@ -91,6 +96,27 @@ function GridThumb({ url, name }: { url: string; name: string }) {
   return <img className="tm-thumb" src={url} alt={name} loading="lazy" onError={() => setFailed(true)} />
 }
 
+function CardTags({ tags }: { tags: TagManagerImageSummary['tags'] }) {
+  const bilingual = usePreferences((state) => state.bilingualTags)
+  const tagStyle = usePreferences((state) => state.tagStyle)
+  if (tags.length === 0) return null
+  return <div className="tm-card-tags">
+    {tags.slice(0, CARD_TAG_LIMIT).map((entry) => {
+      const display = formatTagForDisplay(entry.tag, tagStyle)
+      const translation = bilingual ? entry.translation : null
+      return <span
+        key={entry.tag}
+        className={`tm-pill ${tagCategoryClass(entry.category)}`}
+        title={translation ? `${display} · ${translation}` : display}
+      >
+        <span>{display}</span>
+        {translation && <span className="tm-pill-zh">{translation}</span>}
+      </span>
+    })}
+    {tags.length > CARD_TAG_LIMIT && <span className="tm-card-tags-more">+{tags.length - CARD_TAG_LIMIT}</span>}
+  </div>
+}
+
 export function ImageGrid({ images, thumbnailUrl, selectedIds, editingId, empty, onToggleSelect, onOpen }: {
   images: TagManagerImageSummary[]
   thumbnailUrl: (image: TagManagerImageSummary) => string
@@ -137,6 +163,7 @@ export function ImageGrid({ images, thumbnailUrl, selectedIds, editingId, empty,
             <span className="tm-badge">{image.tag_count} 标签</span>
             <span className={`tm-badge ${image.sidecar_kind === 'none' ? 'tm-badge-missing' : ''}`}>{sidecarLabel(image.sidecar_kind)}</span>
           </div>
+          <CardTags tags={image.tags} />
         </div>
       )
     }}

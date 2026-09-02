@@ -4,6 +4,7 @@ import { API_BASE, request } from './api'
 
 export type TagManagerProfile = 'e621' | 'danbooru'
 export type TagManagerSessionStatus = 'indexing' | 'ready' | 'error'
+export type TagStyle = 'underscore' | 'space'
 
 export interface TagManagerSession {
   id: string
@@ -33,6 +34,7 @@ export type TagManagerSidecarKind = 'none' | 'tag_txt' | 'tags_json' | 'standard
 export interface TagManagerImageTag {
   tag: string
   category: string
+  translation?: string | null
 }
 
 export interface TagManagerImageSummary {
@@ -107,6 +109,7 @@ export type TagManagerImageContent = TagManagerEditableContent | RawE621JsonCont
 export interface TagManagerImageDetail extends TagManagerImageSummary {
   content: TagManagerImageContent
   sidecar_mtime: number | string | null
+  translations?: Record<string, string>
 }
 
 export interface TagManagerUpdateResult {
@@ -139,6 +142,7 @@ export interface TagManagerTagStat {
   tag: string
   category: string
   count: number
+  translation?: string | null
 }
 
 export interface TagManagerStatsPage {
@@ -150,6 +154,7 @@ export interface TagDbEntry {
   category: string
   post_count: number
   alias_of?: string | null
+  translation?: string | null
 }
 
 export interface TagDbQueryResult {
@@ -157,9 +162,44 @@ export interface TagDbQueryResult {
   items: TagDbEntry[]
 }
 
+export interface TagDbProfileTranslationInfo {
+  entries: number
+  loaded: boolean
+  source: string | null
+  updated: string | null
+}
+
 export interface TagDbInfo {
   available: { e621: string[]; danbooru: string[] }
   loaded: { e621: boolean; danbooru: boolean }
+  translations?: {
+    e621: TagDbProfileTranslationInfo
+    danbooru: TagDbProfileTranslationInfo
+  }
+}
+
+export interface TagTranslationLookupRequest {
+  profile: TagManagerProfile
+  tags: string[]
+}
+
+export interface TagTranslationLookupResult {
+  profile: TagManagerProfile
+  translations: Record<string, string>
+}
+
+export interface NlTranslateRequest {
+  text: string
+  target?: 'zh' | 'en'
+  provider_id?: string
+  model?: string
+}
+
+export interface NlTranslateResult {
+  text: string
+  target: 'zh' | 'en'
+  provider_id: string
+  model: string
 }
 
 // --- Client ---
@@ -215,6 +255,18 @@ export const tagManagerApi = {
     return request<TagDbQueryResult>(`/tag-manager/tag-db?${search.toString()}`)
   },
   tagDbInfo: () => request<TagDbInfo>('/tag-manager/tag-db/info'),
+
+  lookupTranslations: (body: TagTranslationLookupRequest) =>
+    request<TagTranslationLookupResult>('/tag-manager/translations/lookup', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+
+  nlTranslate: (body: NlTranslateRequest) =>
+    request<NlTranslateResult>('/tag-manager/nl/translate', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
 }
 
 /** Serialises image-list query parameters exactly as the backend expects. */
@@ -244,4 +296,37 @@ export function formatPostCount(value: number): string {
   if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(1).replace(/\.0$/, '')}m`
   if (value >= 1_000) return `${(value / 1_000).toFixed(1).replace(/\.0$/, '')}k`
   return String(value)
+}
+
+/** Render a tag in the user's preferred separator style. */
+export function formatTagForDisplay(tag: string, style: TagStyle): string {
+  return style === 'space' ? tag.replace(/_/g, ' ') : tag.replace(/\s+/g, '_')
+}
+
+/**
+ * The spelling written back to the sidecar. Identical to the display form on
+ * purpose: the toggle governs what is stored, not only what is shown.
+ */
+export function toWriteStyle(tag: string, style: TagStyle): string {
+  return formatTagForDisplay(tag, style)
+}
+
+/** Dictionary key for translation lookups, mirroring the backend's rule. */
+export function translationKey(tag: string): string {
+  return tag.trim().replace(/\s+/g, '_').toLowerCase()
+}
+
+/** Resolve one tag's Chinese name from an image detail's translation map. */
+export function translationFor(
+  translations: Record<string, string> | undefined,
+  tag: string,
+): string | null {
+  if (!translations) return null
+  const direct = translations[tag]
+  if (direct) return direct
+  const key = translationKey(tag)
+  for (const [candidate, value] of Object.entries(translations)) {
+    if (translationKey(candidate) === key) return value
+  }
+  return null
 }

@@ -72,7 +72,7 @@ Tagger2 Inference Rebuild 将本地 Caption 模型、在线视觉模型、多供
 | 视频提示词 | 根据图片和补充信息生成图生视频提示词，并管理提示词编辑结果。 |
 | 批量任务 | 扫描本机目录，创建持久化的本地、在线或混合打标任务，查看进度和历史。 |
 | 数据集工作流 | 执行 Caption、分类、标签替换、OCR、NL、人工复核、Policy、Token 检查与安全提交。 |
-| 标签管理 | 类 BooruDatasetTagManager 的数据集标签编辑：网格浏览、逐图/批量编辑、e621 与 danbooru 标签库自动补全、撤销重做。 |
+| 标签管理 | 类 BooruDatasetTagManager 的数据集标签编辑：网格浏览、逐图/批量编辑、e621 与 danbooru 标签库自动补全、中英双语标签、下划线/空格切换、NL 在线翻译、撤销重做。 |
 | 在线模型 | 管理 OpenAI、Gemini、Claude 和兼容 API，测试连接并发现可用模型。 |
 | 本地模型 | 下载、注册、加载和卸载模型，管理推理后端、Adapter、阈值与显存驻留。 |
 | 设置 | 管理输入/输出根目录、运行限制和非敏感运行配置。 |
@@ -292,7 +292,10 @@ Count Review 确认后只叠加人工 count，再执行 Policy；Token Review �
 - **数据集会话**：选择输入根目录与相对路径打开数据集，后台扫描图片与标注并建立索引，支持递归、mtime 增量刷新与多会话。
 - **网格浏览**：缩略图网格按文件名/修改时间/标签数排序，按标签组合（包含 all/any、排除）、标注格式与有无 sidecar 过滤。
 - **三种可编辑格式**：booru 平面 TXT、本地标签 JSON（保留 category/score 元数据）、九字段 Anima JSON（分字段表单，九字段顺序冻结）。raw e621 分组 JSON 只读展示。
-- **标签库自动补全**：e621 快照开箱即用；danbooru 用 `scripts/import_classification_snapshot.py --profile danbooru` 导入官方导出后即可用，补全返回分类、post_count 与别名指向。
+- **标签库自动补全**：e621 与 danbooru 快照均随发布包注册，补全返回分类、post_count 与别名指向；如需自建可用 `scripts/import_classification_snapshot.py --profile danbooru` 导入。
+- **中英双语显示**：标签同时显示英文原名与中文译名，词库（Danbooru 31 万条 / e621 6.8 万条）随仓库离线提供，可一键关闭；缺失词库时自动退回纯英文。
+- **下划线 / 空格切换**：一个开关同时控制显示与保存写入的分隔符风格；过滤按归一化键比较，两种拼写互通。
+- **NL 在线翻译**：九字段的 `nl` 段落可用已配置的在线大模型中↔英翻译，结果需显式「替换 NL」才写入草稿。
 - **批量操作**：多选或按过滤器圈定后 批量添加/删除/替换（支持正则）；九字段仅作用于 tags/appearance/environment 三个列表字段。
 - **撤销/重做**：每会话保留最近 20 步操作日志；所有写回为原子写并带 mtime 乐观锁。
 - **标签统计**：频次排行（带分类着色），点击即加入过滤。
@@ -618,6 +621,7 @@ Tagger2_Inference_Rebuild2/
 
 - [中文使用说明](USER_GUIDE_zh-CN.txt)
 - [标签管理模块说明](docs/tag_manager.md)
+- [标签中文词库来源与许可](resources/tag_translations/README.md)
 - [Dataset Workflow 模块说明](docs/workflow_module.md)
 - [Dataset Workflow 路径操作说明](docs/workflow_manual_paths.md)
 - [固定上游兼容性报告](docs/workflow_compatibility_report.md)

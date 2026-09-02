@@ -1,7 +1,14 @@
 import { useState } from 'react'
 import { LoaderCircle, Wand2 } from 'lucide-react'
 import { Button, ConfirmDialog, Field, Panel } from '../ui'
-import type { ImageFilterState, TagManagerBatchRequest, TagManagerProfile } from '../../lib/tagManager'
+import {
+  formatTagForDisplay,
+  toWriteStyle,
+  type ImageFilterState,
+  type TagManagerBatchRequest,
+  type TagManagerProfile,
+} from '../../lib/tagManager'
+import { usePreferences } from '../../store/app'
 import { TagPillEditor, type PillEntry } from './TagPillEditor'
 
 type BatchOp = TagManagerBatchRequest['op']
@@ -29,14 +36,18 @@ export function BatchBar({ profile, filter, selectedIds, filteredTotal, submitti
   const [useRegex, setUseRegex] = useState(false)
   const [scope, setScope] = useState<BatchScope>('selected')
   const [confirming, setConfirming] = useState(false)
+  const tagStyle = usePreferences((state) => state.tagStyle)
 
   const scopeCount = scope === 'selected' ? selectedIds.length : filteredTotal
   const canSubmit = tags.length > 0 && scopeCount > 0 && !submitting && !disabled
 
   const buildBody = (): TagManagerBatchRequest => ({
     op,
-    tags: tags.map((entry) => entry.text),
-    replacement: op === 'replace' ? replacement : undefined,
+    // A regex pattern is not a tag name, so it is never restyled.
+    tags: tags.map((entry) => (useRegex ? entry.text : toWriteStyle(entry.text, tagStyle))),
+    replacement: op === 'replace'
+      ? (useRegex ? replacement : toWriteStyle(replacement, tagStyle))
+      : undefined,
     use_regex: useRegex,
     image_ids: scope === 'selected' ? [...selectedIds].sort((left, right) => left - right) : undefined,
     filter: scope === 'filtered' ? filter : undefined,
@@ -87,8 +98,8 @@ export function BatchBar({ profile, filter, selectedIds, filteredTotal, submitti
       title={`对 ${scopeCount} 张图片执行「${OP_LABELS[op]}」？`}
       detail={<span>
         范围：<strong>{scope === 'selected' ? `选中的 ${selectedIds.length} 张图片` : `当前过滤结果的全部 ${filteredTotal} 张图片`}</strong>。
-        标签：<strong>{tags.map((entry) => entry.text).join(', ')}</strong>
-        {op === 'replace' && <> → <strong>{replacement || '（空）'}</strong></>}
+        标签：<strong>{tags.map((entry) => formatTagForDisplay(entry.text, tagStyle)).join(', ')}</strong>
+        {op === 'replace' && <> → <strong>{replacement ? formatTagForDisplay(replacement, tagStyle) : '（空）'}</strong></>}
         {useRegex && <>（正则模式）</>}。此操作会写入撤销日志，可撤销。
       </span>}
       confirmLabel="确认执行"

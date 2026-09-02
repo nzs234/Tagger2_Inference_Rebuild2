@@ -26,6 +26,8 @@ from .contracts import (
     CreateDatasetRequest,
     ImageEditRequest,
     ImageFilter,
+    NlTranslateRequest,
+    TranslationLookupRequest,
 )
 from .sidecar_io import (
     NINE_FIELDS,
@@ -39,6 +41,7 @@ from .sidecar_io import (
 )
 from .storage import TagManagerStore
 from .tag_db import TagDatabaseError
+from .translations import TagTranslations
 
 logger = logging.getLogger("tagger2.tag_manager")
 
@@ -49,6 +52,25 @@ JOURNAL_DEPTH = 20
 # Nine-field list fields that batch tag operations apply to.  Character,
 # series, artist, quality, count and nl are never touched by batch edits.
 BATCH_TAG_FIELDS = ("tags", "appearance", "environment")
+
+# Nine-field entries whose values are tag-like and therefore translatable; the
+# free-form nl paragraph is translated by the online model instead.
+TRANSLATABLE_FIELDS = ("quality", "appearance", "tags", "environment")
+
+NL_TRANSLATION_SYSTEM_PROMPT = {
+    "zh": (
+        "You translate image dataset captions from English into Simplified Chinese. "
+        "Return only the translation as a single paragraph. Do not add notes, "
+        "explanations, quotes or markdown. Keep proper nouns, character names and "
+        "series titles recognizable, and preserve the original level of detail."
+    ),
+    "en": (
+        "You translate image dataset captions into natural English. "
+        "Return only the translation as a single paragraph. Do not add notes, "
+        "explanations, quotes or markdown. Keep proper nouns, character names and "
+        "series titles recognizable, and preserve the original level of detail."
+    ),
+}
 
 
 class TagManagerError(RuntimeError):
@@ -70,11 +92,21 @@ class TagManagerService:
         allowlist: PathAllowlist,
         thumbnails: Any,
         tag_database: Any,
+        translations: Any = None,
+        provider_factory: Any = None,
+        provider_ids: Any = None,
     ) -> None:
         self.store = store
         self.allowlist = allowlist
         self.thumbnails = thumbnails
         self.tag_database = tag_database
+        # The dictionaries ship with the app, so the default instance is the
+        # committed one; tests point at their own directory.
+        self.translations = translations if translations is not None else TagTranslations()
+        # NL translation borrows the app's configured online providers; both
+        # hooks stay optional so the service is usable without them.
+        self._provider_factory = provider_factory
+        self._provider_ids = provider_ids
         self._session_locks: dict[str, threading.Lock] = {}
         self._locks_guard = threading.Lock()
 
@@ -270,7 +302,6 @@ class TagManagerService:
         limit: int = 200,
     ) -> dict[str, Any]:
         session = self._require_session(session_id)
-        del session
         image_filter = image_filter or ImageFilter()
         items, total = self.store.list_images(
             session_id,
@@ -284,20 +315,28 @@ class TagManagerService:
             limit=min(max(limit, 1), 1000),
         )
         tags_by_image = self.store.image_tags([int(item["id"]) for item in items])
+        profile = str(session["profile"])
         for item in items:
-            item["tags"] = tags_by_image.get(int(item["id"]), [])
+            item["tags"] = self._annotate_tags(profile, tags_by_image.get(int(item["id"]), []))
         return {"items": items, "total": total}
 
     def get_image(self, session_id: str, image_id: int) -> dict[str, Any]:
         session = self._require_session(session_id)
         image = self._require_image(session_id, image_id)
+        profile = str(session["profile"])
         tags = self.store.image_tags([int(image["id"])]).get(int(image["id"]), [])
-        image["tags"] = tags
+        image["tags"] = self._annotate_tags(profile, tags)
         content, live_mtime = self._load_content_and_mtime(
             paths=self._sidecar_paths(session, image)
         )
         image["content"] = _content_payload(content)
         image["sidecar_mtime"] = live_mtime
+        # The editor renders the sidecar's own tag strings, which can differ
+        # from the indexed rows (nine-field documents carry several lists), so
+        # ship one translation map covering everything the drawer will show.
+        image["translations"] = self.translations.translate_many(
+            profile, _content_tag_strings(content)
+        )
         return image
 
     def thumbnail(self, session_id: str, image_id: int, *, size: int) -> Path:
@@ -591,8 +630,11 @@ class TagManagerService:
     # -- stats / autocomplete ----------------------------------------------
 
     def tag_stats(self, session_id: str, *, limit: int = 200, min_count: int = 1) -> list[dict[str, Any]]:
-        self._require_session(session_id)
-        return self.store.tag_stats(session_id, limit=min(max(limit, 1), 1000), min_count=max(min_count, 1))
+        session = self._require_session(session_id)
+        rows = self.store.tag_stats(
+            session_id, limit=min(max(limit, 1), 1000), min_count=max(min_count, 1)
+        )
+        return self._annotate_tags(str(session["profile"]), rows)
 
     def autocomplete(self, profile: str, query: str, *, limit: int = 20, resource_id: str | None = None) -> dict[str, Any]:
         try:
@@ -605,10 +647,10 @@ class TagManagerService:
                 code="tag_db_unavailable",
                 status_code=409,
             ) from exc
-        return {
-            "profile": profile,
-            "items": self.tag_database.autocomplete(profile, query, limit=min(max(limit, 1), 50)),
-        }
+        items = self.tag_database.autocomplete(profile, query, limit=min(max(limit, 1), 50))
+        for item in items:
+            item["translation"] = self.translations.translate(profile, str(item["name"]))
+        return {"profile": profile, "items": items}
 
     def tag_db_info(self) -> dict[str, Any]:
         return {
@@ -617,7 +659,82 @@ class TagManagerService:
                 profile: self.tag_database.is_loaded(profile)
                 for profile in ("e621", "danbooru")
             },
+            "translations": self.translations.info(),
         }
+
+    def lookup_translations(self, request: TranslationLookupRequest) -> dict[str, Any]:
+        """Resolve Chinese names for an explicit tag batch."""
+
+        return {
+            "profile": request.profile,
+            "translations": self.translations.translate_many(request.profile, request.tags),
+        }
+
+    async def translate_nl(self, request: NlTranslateRequest) -> dict[str, Any]:
+        """Translate one NL caption with a configured online provider."""
+
+        provider_id = (request.provider_id or "").strip() or self._first_provider_id()
+        if not provider_id or self._provider_factory is None:
+            raise TagManagerError(
+                "没有可用的在线模型：请先在「Provider 配置」中添加并启用一个在线模型",
+                code="nl_translate_unavailable",
+                status_code=409,
+            )
+        try:
+            provider = self._provider_factory(provider_id)
+        except Exception as exc:  # noqa: BLE001 - provider errors are sanitized below
+            raise TagManagerError(
+                f"在线模型不可用：{exc}",
+                code="nl_translate_unavailable",
+                status_code=409,
+            ) from exc
+        try:
+            text = await provider.generate(
+                image=None,
+                prompt=request.text,
+                model=(request.model or "").strip() or None,
+                system_prompt=NL_TRANSLATION_SYSTEM_PROMPT[request.target],
+            )
+        except Exception as exc:  # noqa: BLE001 - one failure mode for the UI
+            logger.warning("tag manager NL translation failed via %s: %s", provider_id, exc)
+            raise TagManagerError(
+                f"翻译失败：{exc}",
+                code="nl_translate_failed",
+                status_code=502,
+                retryable=True,
+            ) from exc
+        translated = str(text or "").strip()
+        if not translated:
+            raise TagManagerError(
+                "翻译失败：在线模型返回了空结果",
+                code="nl_translate_failed",
+                status_code=502,
+                retryable=True,
+            )
+        return {
+            "text": translated,
+            "target": request.target,
+            "provider_id": provider_id,
+            "model": (request.model or "").strip() or str(getattr(provider, "model", "")),
+        }
+
+    def _first_provider_id(self) -> str:
+        if self._provider_ids is None:
+            return ""
+        try:
+            candidates = list(self._provider_ids())
+        except Exception:  # noqa: BLE001 - a broken registry must not 500 here
+            return ""
+        return str(candidates[0]) if candidates else ""
+
+    def _annotate_tags(
+        self, profile: str, rows: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """Attach the Chinese name to each tag row, in place."""
+
+        for row in rows:
+            row["translation"] = self.translations.translate(profile, str(row["tag"]))
+        return rows
 
     # -- helpers -----------------------------------------------------------
 
@@ -773,6 +890,26 @@ def _read_sidecar_text(path: Path) -> str | None:
         return path.read_text(encoding="utf-8-sig")
     except OSError:
         return None
+
+
+def _content_tag_strings(content: SidecarContent) -> list[str]:
+    """Every tag-like string the editor will render for one sidecar.
+
+    Nine-field documents keep tags across several lists, so the translation map
+    has to cover all of them rather than only the indexed ``tags`` field.
+    """
+
+    if content.kind == "standard_json":
+        document = content.document or {}
+        values: list[str] = []
+        for field in TRANSLATABLE_FIELDS:
+            entries = document.get(field) or ()
+            if isinstance(entries, str):
+                values.append(entries)
+            elif isinstance(entries, (list, tuple)):
+                values.extend(str(entry) for entry in entries)
+        return values
+    return list(content.tags)
 
 
 def _content_payload(content: SidecarContent) -> dict[str, Any]:

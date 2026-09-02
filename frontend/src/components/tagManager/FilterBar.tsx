@@ -1,8 +1,15 @@
 import { Field } from '../ui'
-import type { ImageFilterState, TagManagerSidecarFilter, TagManagerSort } from '../../lib/tagManager'
+import {
+  formatTagForDisplay,
+  type ImageFilterState,
+  type TagManagerSidecarFilter,
+  type TagManagerSort,
+} from '../../lib/tagManager'
+import { usePreferences } from '../../store/app'
 
+/** Filters accept either separator style; the backend matches both. */
 function parseTagList(value: string): string[] {
-  return value.split(',').map((tag) => tag.trim().replace(/\s+/g, '_')).filter(Boolean)
+  return value.split(',').map((tag) => tag.trim()).filter(Boolean)
 }
 
 export function FilterBar({ filter, sort, disabled, onChange, onSortChange }: {
@@ -12,10 +19,13 @@ export function FilterBar({ filter, sort, disabled, onChange, onSortChange }: {
   onChange: (next: ImageFilterState) => void
   onSortChange: (sort: TagManagerSort) => void
 }) {
+  const tagStyle = usePreferences((state) => state.tagStyle)
+  const render = (tags: string[]) => tags.map((tag) => formatTagForDisplay(tag, tagStyle)).join(', ')
+
   return <div className="tm-filter-grid">
-    <Field label="包含标签" hint="逗号分隔，例如 solo, long_hair">
+    <Field label="包含标签" hint="逗号分隔，下划线或空格均可">
       <input
-        value={filter.includeTags.join(', ')}
+        value={render(filter.includeTags)}
         aria-label="包含标签"
         disabled={disabled}
         spellCheck={false}
@@ -36,7 +46,7 @@ export function FilterBar({ filter, sort, disabled, onChange, onSortChange }: {
     </Field>
     <Field label="排除标签" hint="逗号分隔">
       <input
-        value={filter.excludeTags.join(', ')}
+        value={render(filter.excludeTags)}
         aria-label="排除标签"
         disabled={disabled}
         spellCheck={false}

@@ -2,7 +2,8 @@ import { useQuery } from '@tanstack/react-query'
 import { LoaderCircle } from 'lucide-react'
 import { EmptyState, Notice } from '../ui'
 import { tagCategoryClass, tagCategoryLabel } from '../../lib/tagCategories'
-import { tagManagerApi } from '../../lib/tagManager'
+import { formatTagForDisplay, tagManagerApi } from '../../lib/tagManager'
+import { usePreferences } from '../../store/app'
 
 /**
  * Top-tags leaderboard. Clicking a tag appends it to the include filter,
@@ -13,6 +14,8 @@ export function StatsPanel({ sessionId, enabled, onTagClick }: {
   enabled: boolean
   onTagClick: (tag: string) => void
 }) {
+  const bilingual = usePreferences((state) => state.bilingualTags)
+  const tagStyle = usePreferences((state) => state.tagStyle)
   const stats = useQuery({
     queryKey: ['tag-manager', 'stats', sessionId],
     queryFn: () => tagManagerApi.stats(sessionId, { limit: 50 }),
@@ -31,14 +34,24 @@ export function StatsPanel({ sessionId, enabled, onTagClick }: {
     return <EmptyState title="暂无标签统计" detail="索引完成后这里会展示出现频率最高的标签。" />
   }
   return <ol className="tm-stats-list">
-    {items.map((item) => (
-      <li key={item.tag}>
-        <button type="button" className="tm-stats-row" title={`筛选包含 ${item.tag}`} onClick={() => onTagClick(item.tag)}>
+    {items.map((item) => {
+      const display = formatTagForDisplay(item.tag, tagStyle)
+      const translation = bilingual ? item.translation : null
+      return <li key={item.tag}>
+        <button
+          type="button"
+          className="tm-stats-row"
+          title={translation ? `筛选包含 ${display} · ${translation}` : `筛选包含 ${display}`}
+          onClick={() => onTagClick(item.tag)}
+        >
           <span className={`tm-pill ${tagCategoryClass(item.category)}`}>{tagCategoryLabel(item.category)}</span>
-          <span className="tm-stats-name">{item.tag}</span>
+          <span className="tm-stats-name">
+            {display}
+            {translation && <span className="tm-stats-zh">{translation}</span>}
+          </span>
           <small>{item.count}</small>
         </button>
       </li>
-    ))}
+    })}
   </ol>
 }

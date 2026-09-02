@@ -7,6 +7,7 @@ import { FilterBar } from '../components/tagManager/FilterBar'
 import { ImageGrid } from '../components/tagManager/ImageGrid'
 import { SessionBar } from '../components/tagManager/SessionBar'
 import { StatsPanel } from '../components/tagManager/StatsPanel'
+import { TagDisplayBar } from '../components/tagManager/TagDisplayBar'
 import { Button, ConfirmDialog, DialogLayer, EmptyState, Notice, Panel } from '../components/ui'
 import { api, ApiError } from '../lib/api'
 import {
@@ -270,6 +271,7 @@ export function TagManager() {
       <div className="tm-main">
         <Panel title="筛选与排序" eyebrow="FILTER">
           <FilterBar filter={filter} sort={sort} disabled={!sessionReady} onChange={setFilter} onSortChange={changeSort} />
+          <TagDisplayBar profile={session?.profile ?? 'e621'} />
         </Panel>
         <Panel
           title="图片"

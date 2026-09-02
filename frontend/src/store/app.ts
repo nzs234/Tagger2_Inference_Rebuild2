@@ -12,6 +12,7 @@ import type {
   VideoPromptRevision,
   ThemeMode,
 } from '../types'
+import type { TagStyle } from '../lib/tagManager'
 
 interface PreferencesState {
   page: AppPage
@@ -20,11 +21,18 @@ interface PreferencesState {
   // Only the Dataset Workflow module is bilingual; the rest of the UI is Chinese.
   workflowLanguage: WorkflowLanguage
   themeMode: ThemeMode
+  bilingualTags: boolean
+  tagStyle: TagStyle
+  tagManagerTranslateProviderId: string
+  tagManagerTranslateModel: string
   setPage: (page: AppPage) => void
   setCompact: (compact: boolean) => void
   setSidebarOpen: (open: boolean) => void
   setWorkflowLanguage: (language: WorkflowLanguage) => void
   setThemeMode: (mode: ThemeMode) => void
+  setBilingualTags: (bilingual: boolean) => void
+  setTagStyle: (style: TagStyle) => void
+  setTagManagerTranslate: (providerId: string, model?: string) => void
 }
 
 export const usePreferences = create<PreferencesState>()(
@@ -35,11 +43,21 @@ export const usePreferences = create<PreferencesState>()(
       sidebarOpen: false,
       workflowLanguage: 'zh',
       themeMode: 'light',
+      bilingualTags: true,
+      tagStyle: 'underscore',
+      tagManagerTranslateProviderId: '',
+      tagManagerTranslateModel: '',
       setPage: (page) => set({ page, sidebarOpen: false }),
       setCompact: (compact) => set({ compact }),
       setSidebarOpen: (sidebarOpen) => set({ sidebarOpen }),
       setWorkflowLanguage: (workflowLanguage) => set({ workflowLanguage }),
       setThemeMode: (themeMode) => set({ themeMode }),
+      setBilingualTags: (bilingualTags) => set({ bilingualTags }),
+      setTagStyle: (tagStyle) => set({ tagStyle }),
+      setTagManagerTranslate: (providerId, model) => set((state) => ({
+        tagManagerTranslateProviderId: providerId,
+        tagManagerTranslateModel: model ?? state.tagManagerTranslateModel,
+      })),
     }),
     {
       name: 'tagger2-ui',
@@ -48,6 +66,10 @@ export const usePreferences = create<PreferencesState>()(
         compact: state.compact,
         workflowLanguage: state.workflowLanguage,
         themeMode: state.themeMode,
+        bilingualTags: state.bilingualTags,
+        tagStyle: state.tagStyle,
+        tagManagerTranslateProviderId: state.tagManagerTranslateProviderId,
+        tagManagerTranslateModel: state.tagManagerTranslateModel,
       }),
     },
   ),

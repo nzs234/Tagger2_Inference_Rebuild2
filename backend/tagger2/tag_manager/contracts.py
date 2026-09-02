@@ -161,6 +161,38 @@ class ImageEditRequest(BaseModel):
     expected_sidecar_mtime: float | None = Field(default=None, ge=0.0)
 
 
+class TranslationLookupRequest(BaseModel):
+    """Resolve Chinese names for a batch of tags in one round trip."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    profile: TagManagerProfile = "e621"
+    tags: list[str] = Field(max_length=500)
+
+    @model_validator(mode="after")
+    def _strip_tags(self) -> "TranslationLookupRequest":
+        self.tags = [tag.strip() for tag in self.tags if tag.strip()]
+        return self
+
+
+class NlTranslateRequest(BaseModel):
+    """Translate one natural-language caption with a configured online model."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    text: str = Field(min_length=1, max_length=8000)
+    target: Literal["zh", "en"] = "zh"
+    provider_id: str | None = Field(default=None, max_length=128)
+    model: str | None = Field(default=None, max_length=256)
+
+    @model_validator(mode="after")
+    def _strip_text(self) -> "NlTranslateRequest":
+        self.text = self.text.strip()
+        if not self.text:
+            raise ValueError("text must not be blank")
+        return self
+
+
 __all__ = [
     "BatchOperationRequest",
     "COUNT_VALUES",
@@ -169,10 +201,12 @@ __all__ = [
     "ImageEditRequest",
     "ImageFilter",
     "NineFieldEdit",
+    "NlTranslateRequest",
     "SidecarKindLiteral",
     "StandardJsonContent",
     "TagEdit",
     "TagManagerProfile",
     "TagTxtContent",
     "TagsJsonContent",
+    "TranslationLookupRequest",
 ]

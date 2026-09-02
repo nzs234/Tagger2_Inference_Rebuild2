@@ -10,6 +10,8 @@ from .contracts import (
     CreateDatasetRequest,
     ImageEditRequest,
     ImageFilter,
+    NlTranslateRequest,
+    TranslationLookupRequest,
 )
 from .service import TagManagerError, TagManagerService
 
@@ -176,6 +178,17 @@ def create_tag_manager_router(service: TagManagerService) -> APIRouter:
     @router.get("/tag-db/info")
     async def tag_db_info():
         return service.tag_db_info()
+
+    @router.post("/translations/lookup")
+    async def lookup_translations(request: TranslationLookupRequest):
+        return service.lookup_translations(request)
+
+    @router.post("/nl/translate")
+    async def translate_nl(request: NlTranslateRequest):
+        try:
+            return await service.translate_nl(request)
+        except TagManagerError as exc:
+            raise _error(exc) from exc
 
     return router
 

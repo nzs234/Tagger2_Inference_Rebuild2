@@ -1072,6 +1072,7 @@ small { font-size: 12px; }
 .tm-cat-rating { color: var(--tm-rating); border-color: color-mix(in srgb, var(--tm-rating) 32%, var(--line)); background: color-mix(in srgb, var(--tm-rating) 10%, var(--surface)); }
 
 .tm-pill { min-height: 24px; display: inline-flex; align-items: center; gap: 4px; padding: 2px 8px; border: 1px solid var(--line-strong); border-radius: 999px; color: var(--ink); background: var(--surface-2); font-size: 11px; font-weight: 650; overflow-wrap: anywhere; }
+.tm-pill-zh { font-weight: 400; font-size: 10px; opacity: 0.75; margin-left: 2px; }
 button.tm-pill { cursor: pointer; }
 button.tm-pill:hover:not(:disabled) { filter: brightness(0.96); text-decoration: line-through; }
 button.tm-pill:disabled { cursor: default; }
@@ -1079,6 +1080,21 @@ button.tm-pill:disabled { cursor: default; }
 .tm-pill-row { display: flex; flex-wrap: wrap; gap: 6px; }
 .tm-pill-empty { margin: 0; color: var(--subtle); font-size: 11px; }
 .tm-pill-editor { display: grid; gap: 9px; }
+
+.tm-toolbar-controls { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.tm-toolbar-hint { margin: 0; color: var(--subtle); font-size: 11px; }
+.tm-display-bar { display: grid; gap: 6px; margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--line); }
+.tm-toolbar-warning { display: flex; align-items: center; gap: 5px; color: var(--amber, #a15c00); }
+.tm-card-tags { display: flex; flex-wrap: wrap; gap: 3px; padding: 0 8px 8px; }
+.tm-card-tags .tm-pill { min-height: 18px; padding: 1px 6px; font-size: 10px; }
+.tm-card-tags-more { align-self: center; color: var(--subtle); font-size: 10px; }
+.tm-suggest-zh { color: var(--subtle); font-size: 10px; font-weight: normal; margin-left: 4px; }
+.tm-stats-zh { color: var(--subtle); font-size: 10px; font-weight: normal; margin-left: 4px; }
+.tm-nl-translate { display: grid; gap: 8px; margin-top: 6px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface-2); }
+.tm-nl-translate-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.tm-nl-translate-result { display: grid; gap: 8px; padding: 8px 10px; border: 1px solid var(--line-strong); border-radius: 6px; background: var(--surface); }
+.tm-nl-translate-text { margin: 0; font-size: 12px; line-height: 1.5; color: var(--ink); white-space: pre-wrap; word-break: break-word; }
+.tm-nl-translate-actions { display: flex; gap: 6px; justify-content: flex-end; }
 
 .tm-session-body { display: grid; gap: 14px; padding: 17px; }
 .tm-session-actions { display: flex; flex-wrap: wrap; gap: 6px; }

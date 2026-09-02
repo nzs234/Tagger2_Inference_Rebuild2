@@ -379,6 +379,8 @@ class Runtime:
             allowlist=self.allowlist,
             thumbnails=ThumbnailService(tag_manager_data_dir / "tag_manager" / "thumbnails"),
             tag_database=TagDatabase(),
+            provider_factory=self.provider,
+            provider_ids=self._enabled_provider_ids,
         )
         self.processors = ProcessorHost(self)
         self.job_manager = JobManager(self.storage)
@@ -647,6 +649,27 @@ class Runtime:
 
     async def online_processor(self, item: JobItemRecord, job: JobRecord) -> ProcessResult:
         return await ProcessorHost(self).online_processor(item, job)
+
+    def _enabled_provider_ids(self) -> list[str]:
+        """Enabled providers that actually hold a credential, in stored order.
+
+        The tag manager's NL translation falls back to the first of these when
+        the caller does not name a provider.  Default profiles are seeded on
+        first run without a key, so "enabled" alone is not enough: an unkeyed
+        profile would turn a setup state into an upstream 502.
+        """
+
+        ready: list[str] = []
+        for profile in self.storage.list_provider_profiles():
+            provider_id = profile.get("id")
+            if not provider_id or not bool(profile.get("enabled", True)):
+                continue
+            secret_ref = profile.get("secret_ref") or f"provider_{provider_id}"
+            metadata = get_secret_metadata(self.secrets, str(secret_ref))
+            if not bool(metadata.get("configured")):
+                continue
+            ready.append(str(provider_id))
+        return ready
 
     def provider(
         self,
