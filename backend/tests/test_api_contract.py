@@ -460,3 +460,126 @@ def test_mocked_online_job_writes_named_hash_tracked_artifacts(tmp_path: Path) -
         assert document["series"] == "demo series"
         assert document["nl"] == "A_red-haired subject indoors."
         assert "red hair" in Path(txt_artifact.path).read_text(encoding="utf-8")
+
+
+def test_provider_cache_is_lru_bounded_and_closes_evicted(tmp_path: Path, monkeypatch) -> None:
+    class StubProvider:
+        def __init__(self, config) -> None:
+            self.key = config.base_url
+            self.closed = False
+            created.append(self)
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    created: list[StubProvider] = []
+    monkeypatch.setattr("tagger2.main.create_provider", StubProvider)
+    settings = AppConfig(
+        project_root=tmp_path,
+        data_dir=tmp_path / "data",
+        cache_dir=tmp_path / "cache",
+        production=True,
+    )
+    runtime = create_app(settings).state.runtime
+
+    def override(index: int) -> dict[str, object]:
+        # Distinct base_urls produce distinct stable cache identities; the
+        # per-entry max_concurrency must stay irrelevant to the identity.
+        return {
+            "id": f"prov-{index}",
+            "name": f"provider-{index}",
+            "kind": "openai",
+            "base_url": f"https://host-{index}.example/v1",
+            "enabled": True,
+            "config": {"primary_model": f"model-{index}", "max_concurrency": index + 1},
+        }
+
+    instances = [runtime.provider(f"prov-{index}", profile_override=override(index)) for index in range(10)]
+
+    assert len(runtime.providers) == 8
+    assert instances[0].closed is True  # least-recently-used entries evicted…
+    assert instances[1].closed is True  # …and their clients awaited aclose()
+    assert instances[2].closed is False
+
+    # A cache hit refreshes recency: prov-2 survives the next eviction
+    # instead of prov-3.
+    runtime.provider("prov-2", profile_override=override(2))
+    runtime.provider("prov-10", profile_override=override(10))
+    assert instances[2].closed is False
+    assert instances[3].closed is True
+
+    # The most recent key still resolves to the same cached instance.
+    assert runtime.provider("prov-9", profile_override=override(9)) is instances[9]
+    assert len(created) == 11  # only cache misses construct providers
+
+
+def test_online_jobs_share_cached_provider_across_job_concurrency(tmp_path: Path, monkeypatch) -> None:
+    class FakeProvider:
+        model = "mock-vision"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def generate_anima(self, _image, _prompt, **_kwargs):
+            self.calls += 1
+            return parse_anima_response(
+                '{"quality":["highres"],"count":"solo","character":"",'
+                '"series":"","artist":"","appearance":["red_hair"],'
+                '"tags":["digital_art"],"environment":["indoor_scene"],'
+                '"nl":"A red-haired subject indoors."}'
+            )
+
+        async def aclose(self) -> None:
+            return None
+
+    built: list[FakeProvider] = []
+
+    def fake_create_provider(_config):
+        provider = FakeProvider()
+        built.append(provider)
+        return provider
+
+    monkeypatch.setattr("tagger2.main.create_provider", fake_create_provider)
+
+    stream = io.BytesIO()
+    Image.new("RGB", (8, 8), "white").save(stream, format="PNG")
+
+    with _client(tmp_path) as client:
+        runtime = client.app.state.runtime
+        job_ids = []
+        for index, concurrency in enumerate((2, 9), start=1):
+            upload = client.post(
+                "/api/v1/uploads",
+                files={"files": (f"sample-{index}.png", stream.getvalue(), "image/png")},
+            ).json()
+            created = client.post(
+                "/api/v1/jobs",
+                json={
+                    "mode": "online",
+                    "source": {"type": "upload", "upload_id": upload["upload_id"]},
+                    "provider_id": "gemini",
+                    "online_concurrency": concurrency,
+                    "output": {"json": True, "txt": False},
+                },
+            )
+            assert created.status_code == 200, created.text
+            job_ids.append(created.json()["id"])
+
+        for job_id in job_ids:
+            for _ in range(500):
+                job = client.get(f"/api/v1/jobs/{job_id}").json()
+                if job["state"] in {"succeeded", "failed", "cancelled"}:
+                    break
+                time.sleep(0.01)
+            assert job["state"] == "succeeded", job
+
+        # Exactly two providers were constructed: one for the stored profile
+        # entry and one shared snapshot entry. The different per-job
+        # max_concurrency values (2 vs 9) must not multiply cache entries.
+        assert len(built) == 2
+        snapshot_keys = [key for key in runtime.providers if key != "gemini"]
+        assert len(snapshot_keys) == 1
+        shared = runtime.providers[snapshot_keys[0]]
+        assert shared is built[1]
+        assert shared.calls == 2
+        assert runtime.providers["gemini"] is built[0]

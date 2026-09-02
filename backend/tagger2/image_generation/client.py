@@ -312,6 +312,11 @@ class ImageGenerationClient:
         payload: Mapping[str, Any],
         files: list[tuple[str, tuple[str, bytes, str]]] | None,
     ) -> httpx.Response:
+        # The endpoint is fixed for the whole retry cycle, so one validation
+        # up front is sufficient: a rejection fails the call before any key is
+        # consumed or any attempt is made (wrapped as a ProviderError), and a
+        # URL that passed once cannot fail per attempt. Re-validating inside
+        # the loop only duplicated the (DNS-resolving) check per attempt.
         try:
             validate_provider_url(endpoint, allow_local=self.config.allow_local, resolve_dns=True)
         except Exception as exc:
@@ -326,7 +331,6 @@ class ImageGenerationClient:
             elif key:
                 headers.setdefault("Authorization", f"Bearer {key}")
             try:
-                validate_provider_url(endpoint, allow_local=self.config.allow_local, resolve_dns=True)
                 if files is None:
                     request = client.build_request(
                         "POST",

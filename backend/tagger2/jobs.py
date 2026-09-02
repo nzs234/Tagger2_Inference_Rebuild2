@@ -5,10 +5,14 @@ from __future__ import annotations
 import asyncio
 import inspect
 import time
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Mapping, Protocol, Sequence
 
 from .storage import JobItemRecord, JobRecord, SQLiteStorage
+
+# States whose events, once replayed, end an SSE stream.
+_STREAM_TERMINAL_STATES = frozenset({"succeeded", "failed", "cancelled", "interrupted"})
 
 
 class ItemProcessor(Protocol):
@@ -468,26 +472,44 @@ class JobManager:
         *,
         last_event_id: int = 0,
         poll_seconds: float = 0.25,
-    ):
+    ) -> AsyncIterator[dict[str, Any]]:
         """Yield structured events for an SSE endpoint with Last-Event-ID."""
 
         sequence = max(0, int(last_event_id))
+        interval = max(0.05, min(5.0, float(poll_seconds)))
+        backoff = interval
         while True:
-            events = self.storage.get_events(job_id, after_seq=sequence)
-            for event in events:
-                sequence = event.seq
-                yield {"seq": event.seq, "job_id": event.job_id, **event.data}
-            record = self.storage.get_job(job_id)
-            if record is None:
-                return
-            if record.state in {"succeeded", "failed", "cancelled", "interrupted"}:
-                # A terminal transition and its event share one transaction.
-                # Recheck after the state read to close the small race where
-                # the first query ran immediately before that transaction.
-                if self.storage.get_events(job_id, after_seq=sequence):
-                    continue
-                return
-            await asyncio.sleep(max(0.05, min(5.0, float(poll_seconds))))
+            # One read connection serves the whole stream; a broken connection
+            # is dropped here and the next iteration reopens a fresh one.
+            with self.storage.connection() as connection:
+                while True:
+                    try:
+                        events, state = self.storage.read_events_since(
+                            job_id, sequence, connection=connection
+                        )
+                        if state in _STREAM_TERMINAL_STATES and not events:
+                            # A terminal transition and its event share one
+                            # transaction.  Recheck after the state read to
+                            # close the small race where the first query ran
+                            # immediately before that transaction.
+                            events, _ = self.storage.read_events_since(
+                                job_id, sequence, connection=connection
+                            )
+                    except Exception:
+                        await asyncio.sleep(backoff)
+                        backoff = min(5.0, backoff * 2)
+                        break
+                    backoff = interval
+                    for event in events:
+                        sequence = event.seq
+                        yield {"seq": event.seq, "job_id": event.job_id, **event.data}
+                    if state is None:
+                        return
+                    if state in _STREAM_TERMINAL_STATES:
+                        if events:
+                            continue
+                        return
+                    await asyncio.sleep(interval)
 
     async def shutdown(self) -> None:
         """Cancel workers and leave resumable jobs marked interrupted."""

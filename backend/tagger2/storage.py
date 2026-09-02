@@ -511,6 +511,11 @@ class SQLiteStorage:
                 """UPDATE jobs SET state=?,phase=?,error=?,updated_at=?,started_at=?,finished_at=? WHERE id=?""",
                 (state, phase or state, _bounded(error), now, started, finished, job_id),
             )
+            if state in TERMINAL_JOB_STATES:
+                # Full accuracy matters at terminal states: reconcile the
+                # counters from the item table instead of trusting the values
+                # that item updates maintain incrementally.
+                self._refresh_counters(connection, job_id, now)
             current = connection.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
             data = self._event_from_row(current)
             if event:
@@ -588,7 +593,7 @@ class SQLiteStorage:
                     item_id,
                 ),
             )
-            self._refresh_counters(connection, str(row["job_id"]), now)
+            self._bump_job_counters(connection, str(row["job_id"]), str(row["status"]), status, now)
             current = connection.execute("SELECT * FROM job_items WHERE id=?", (item_id,)).fetchone()
             job = connection.execute("SELECT * FROM jobs WHERE id=?", (row["job_id"],)).fetchone()
             self._insert_event(connection, str(row["job_id"]), self._event_from_row(job), now)
@@ -621,6 +626,24 @@ class SQLiteStorage:
             )
             self._refresh_counters(connection, job_id, now)
         return cursor.rowcount
+
+    def refresh_job_counters(self, job_id: str) -> JobRecord:
+        """Force a full counter recomputation for one job and return the record.
+
+        Reconciliation entry point for callers that need guaranteed accuracy
+        (for example after out-of-band item changes).  Day-to-day item updates
+        maintain the counters incrementally instead.
+        """
+
+        now = utc_now()
+        with self.transaction() as connection:
+            if connection.execute("SELECT 1 FROM jobs WHERE id=?", (job_id,)).fetchone() is None:
+                raise KeyError(job_id)
+            self._refresh_counters(connection, job_id, now)
+        record = self.get_job(job_id)
+        if record is None:
+            raise RuntimeError(f"job {job_id} missing after counter refresh")
+        return record
 
     def list_items(
         self,
@@ -666,14 +689,45 @@ class SQLiteStorage:
 
     def get_events(self, job_id: str, *, after_seq: int = 0, limit: int = 500) -> list[EventRecord]:
         with self.connection() as connection:
-            rows = connection.execute(
-                "SELECT * FROM job_events WHERE job_id=? AND seq>? ORDER BY seq LIMIT ?",
-                (job_id, max(0, int(after_seq)), max(1, min(5000, int(limit)))),
-            ).fetchall()
-        return [
+            events, _ = self._read_events_since(connection, job_id, after_seq, limit)
+        return events
+
+    def read_events_since(
+        self,
+        job_id: str,
+        after_seq: int = 0,
+        *,
+        limit: int = 500,
+        connection: sqlite3.Connection | None = None,
+    ) -> tuple[list[EventRecord], str | None]:
+        """Read new events plus the current job state over a single connection.
+
+        The SSE poll loop keeps one read connection open for the lifetime of a
+        stream and passes it back on every iteration; without ``connection``
+        this opens a short-lived one, which also lets a broken connection
+        recover on the next call.  The returned state is ``None`` when the job
+        no longer exists.
+        """
+
+        if connection is None:
+            with self.connection() as owned:
+                return self._read_events_since(owned, job_id, after_seq, limit)
+        return self._read_events_since(connection, job_id, after_seq, limit)
+
+    @staticmethod
+    def _read_events_since(
+        connection: sqlite3.Connection, job_id: str, after_seq: int, limit: int
+    ) -> tuple[list[EventRecord], str | None]:
+        rows = connection.execute(
+            "SELECT * FROM job_events WHERE job_id=? AND seq>? ORDER BY seq LIMIT ?",
+            (job_id, max(0, int(after_seq)), max(1, min(5000, int(limit)))),
+        ).fetchall()
+        events = [
             EventRecord(seq=int(row["seq"]), job_id=row["job_id"], created_at=row["created_at"], data=_json_load(row["event_json"], {}))
             for row in rows
         ]
+        job_row = connection.execute("SELECT state FROM jobs WHERE id=?", (job_id,)).fetchone()
+        return events, (str(job_row["state"]) if job_row is not None else None)
 
     def get_latest_event(self, job_id: str) -> EventRecord | None:
         with self.connection() as connection:
@@ -786,11 +840,8 @@ class SQLiteStorage:
             )
         return self.get_provider_profile(profile_id) or {}
 
-    def get_provider_profile(self, profile_id: str) -> dict[str, Any] | None:
-        with self.connection() as connection:
-            row = connection.execute("SELECT * FROM provider_profiles WHERE id=?", (profile_id,)).fetchone()
-        if row is None:
-            return None
+    @staticmethod
+    def _provider_profile_record(row: sqlite3.Row) -> dict[str, Any]:
         return {
             "id": row["id"],
             "name": row["name"],
@@ -803,10 +854,15 @@ class SQLiteStorage:
             "updated_at": row["updated_at"],
         }
 
+    def get_provider_profile(self, profile_id: str) -> dict[str, Any] | None:
+        with self.connection() as connection:
+            row = connection.execute("SELECT * FROM provider_profiles WHERE id=?", (profile_id,)).fetchone()
+        return self._provider_profile_record(row) if row is not None else None
+
     def list_provider_profiles(self) -> list[dict[str, Any]]:
         with self.connection() as connection:
-            ids = [row["id"] for row in connection.execute("SELECT id FROM provider_profiles ORDER BY name").fetchall()]
-        return [profile for profile_id in ids if (profile := self.get_provider_profile(profile_id)) is not None]
+            rows = connection.execute("SELECT * FROM provider_profiles ORDER BY name").fetchall()
+        return [self._provider_profile_record(row) for row in rows]
 
     def delete_provider_profile(self, profile_id: str) -> bool:
         with self.transaction() as connection:
@@ -837,11 +893,8 @@ class SQLiteStorage:
             )
         return {"id": profile_id, "name": name, "config": dict(config), "updated_at": now}
 
-    def get_model_profile(self, profile_id: str) -> dict[str, Any] | None:
-        with self.connection() as connection:
-            row = connection.execute("SELECT * FROM model_profiles WHERE id=?", (profile_id,)).fetchone()
-        if row is None:
-            return None
+    @staticmethod
+    def _model_profile_record(row: sqlite3.Row) -> dict[str, Any]:
         return {
             "id": row["id"],
             "name": row["name"],
@@ -850,10 +903,15 @@ class SQLiteStorage:
             "updated_at": row["updated_at"],
         }
 
+    def get_model_profile(self, profile_id: str) -> dict[str, Any] | None:
+        with self.connection() as connection:
+            row = connection.execute("SELECT * FROM model_profiles WHERE id=?", (profile_id,)).fetchone()
+        return self._model_profile_record(row) if row is not None else None
+
     def list_model_profiles(self) -> list[dict[str, Any]]:
         with self.connection() as connection:
-            ids = [row["id"] for row in connection.execute("SELECT id FROM model_profiles ORDER BY name").fetchall()]
-        return [profile for profile_id in ids if (profile := self.get_model_profile(profile_id)) is not None]
+            rows = connection.execute("SELECT * FROM model_profiles ORDER BY name").fetchall()
+        return [self._model_profile_record(row) for row in rows]
 
     def delete_model_profile(self, profile_id: str) -> bool:
         with self.transaction() as connection:
@@ -920,7 +978,43 @@ class SQLiteStorage:
         )
 
     @staticmethod
+    def _bump_job_counters(
+        connection: sqlite3.Connection, job_id: str, from_status: str, to_status: str, now: str
+    ) -> None:
+        """Apply the counter deltas of one item status transition in place.
+
+        Runs inside the caller's transaction so the item update and the job
+        counters commit atomically.  ``total`` never changes here (items are
+        only added by ``create_job``/``add_items``); processed/succeeded/
+        skipped/failed move by the difference in terminal-state membership
+        between the old and new item statuses.
+        """
+
+        if to_status == from_status:
+            return
+        deltas = (
+            int(to_status in TERMINAL_ITEM_STATES) - int(from_status in TERMINAL_ITEM_STATES),
+            int(to_status == "succeeded") - int(from_status == "succeeded"),
+            int(to_status == "skipped") - int(from_status == "skipped"),
+            int(to_status == "failed") - int(from_status == "failed"),
+        )
+        if not any(deltas):
+            return
+        connection.execute(
+            """UPDATE jobs SET processed=processed+?,succeeded=succeeded+?,skipped=skipped+?,
+            failed=failed+?,updated_at=? WHERE id=?""",
+            (*deltas, now, job_id),
+        )
+
+    @staticmethod
     def _refresh_counters(connection: sqlite3.Connection, job_id: str, now: str) -> None:
+        """Reconcile a job's counters with a full aggregation over its items.
+
+        Not used on the per-item hot path (``update_item`` maintains the
+        counters incrementally via ``_bump_job_counters``); reserved for bulk
+        item changes and terminal job transitions where full accuracy matters.
+        """
+
         counts = connection.execute(
             """SELECT COUNT(*) AS total,
             SUM(CASE WHEN status IN ('succeeded','failed','skipped','cancelled') THEN 1 ELSE 0 END) AS processed,

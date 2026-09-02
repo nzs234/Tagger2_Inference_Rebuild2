@@ -1693,7 +1693,9 @@ def create_workflow_router(
                     status_code=409,
                     detail={"code": "restore_state_race", "message": "job changed during restore"},
                 )
-            restored_count = restore_annotation_backup(backup_zip, dataset_root)
+            restored_count = await asyncio.to_thread(
+                restore_annotation_backup, backup_zip, dataset_root
+            )
             database.record_operation(
                 job_id,
                 "restore",
@@ -1768,7 +1770,9 @@ def create_workflow_router(
                 # A process may have stopped after persisting the marker but
                 # before removing the directory.  Repeating the same discard
                 # completes that cleanup without changing job history.
-                shutil.rmtree(workspace)
+                # Workspace removal can be a multi-gigabyte recursive delete;
+                # keep it off the event loop.
+                await asyncio.to_thread(shutil.rmtree, workspace)
                 database.record_operation(
                     job_id,
                     "discard",
@@ -1836,7 +1840,9 @@ def create_workflow_router(
             # The durable marker and dataset-lock release happen first.  If
             # power is lost during removal, the idempotent branch above will
             # finish deleting the marked workspace on the next request.
-            shutil.rmtree(workspace)
+            # Workspace removal can be a multi-gigabyte recursive delete;
+            # keep it off the event loop.
+            await asyncio.to_thread(shutil.rmtree, workspace)
             database.record_operation(
                 job_id,
                 "discard",
@@ -2119,7 +2125,9 @@ def create_workflow_router(
         try:
             job_config = WorkflowJobConfigV2.from_payload(config)
             job_config = _resolve_caption_model(job_config)
-            report = preflight_service.validate_config(job_config)
+            # Preflight fingerprints resources (file hashing) and queries the
+            # database; keep that blocking work off the event loop.
+            report = await asyncio.to_thread(preflight_service.validate_config, job_config)
             return report
         except WorkflowPreflightError as exc:
             raise _preflight_http_error(exc) from exc
@@ -2136,8 +2144,9 @@ def create_workflow_router(
             job_config = WorkflowJobConfigV2.from_payload(request.config)
             job_config = _resolve_caption_model(job_config)
             
-            # Run preflight validation
-            preflight_service.validate_config(job_config)
+            # Run preflight validation (resource fingerprinting + DB queries
+            # are blocking; keep them off the event loop).
+            await asyncio.to_thread(preflight_service.validate_config, job_config)
             
             workspace_root = database.db_path.parent / "jobs"
             workspace_root.mkdir(parents=True, exist_ok=True)

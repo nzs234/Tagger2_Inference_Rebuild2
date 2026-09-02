@@ -10,12 +10,15 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import io
 import ipaddress
 import json
 import os
 import re
 import socket
 import tempfile
+import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, BinaryIO, Iterable, Mapping
@@ -119,7 +122,7 @@ class PathAllowlist:
 
     def __init__(self, roots: Iterable[PathRoot | Mapping[str, Any]] | None = None):
         self._roots: dict[str, PathRoot] = {}
-        self._lock = __import__("threading").RLock()
+        self._lock = threading.RLock()
         for root in roots or ():
             if isinstance(root, PathRoot):
                 self.register(
@@ -323,6 +326,42 @@ def safe_resolve(
     )
 
 
+# Successful DNS resolutions are cached briefly because provider clients
+# re-validate destinations on every request attempt; without a cache each
+# attempt pays a blocking getaddrinfo.  Failures are never cached so a
+# transient DNS blip recovers on the next attempt.
+_DNS_CACHE_TTL_SECONDS = 300.0
+_DNS_CACHE_MAX_ENTRIES = 1024
+_DNS_CACHE: dict[tuple[str, int], tuple[float, frozenset[str]]] = {}
+_DNS_CACHE_LOCK = threading.Lock()
+
+
+def _resolve_host_addresses(host: str, port: int) -> frozenset[str]:
+    """Resolve ``host`` for provider-URL validation, honouring the TTL cache."""
+
+    key = (host.casefold(), port)
+    now = time.monotonic()
+    with _DNS_CACHE_LOCK:
+        entry = _DNS_CACHE.get(key)
+        if entry is not None and now - entry[0] < _DNS_CACHE_TTL_SECONDS:
+            return entry[1]
+    try:
+        addresses = frozenset(
+            str(info[4][0]) for info in socket.getaddrinfo(host, port)
+        )
+    except OSError as exc:
+        raise SecurityError("provider hostname could not be resolved") from exc
+    with _DNS_CACHE_LOCK:
+        if len(_DNS_CACHE) >= _DNS_CACHE_MAX_ENTRIES:
+            # Correctness never depends on the cache, so dropping the oldest
+            # quarter on overflow is sufficient.
+            stale_count = max(1, len(_DNS_CACHE) // 4)
+            for stale_key, _ in sorted(_DNS_CACHE.items(), key=lambda item: item[1][0])[:stale_count]:
+                _DNS_CACHE.pop(stale_key, None)
+        _DNS_CACHE[key] = (now, addresses)
+    return addresses
+
+
 def validate_provider_url(
     url: str,
     *,
@@ -376,14 +415,9 @@ def validate_provider_url(
         ):
             raise SecurityError("ambiguous numeric provider hostname is not accepted")
         if resolve_dns:
-            try:
-                addresses = {
-                    info[4][0]
-                    for info in socket.getaddrinfo(host, port or (443 if parsed.scheme == "https" else 80))
-                }
-            except OSError as exc:
-                raise SecurityError("provider hostname could not be resolved") from exc
-            for value in addresses:
+            for value in _resolve_host_addresses(
+                host, port or (443 if parsed.scheme == "https" else 80)
+            ):
                 try:
                     address = ipaddress.ip_address(value)
                 except ValueError:
@@ -451,7 +485,7 @@ def validate_image_bytes(
     if not raw:
         raise UploadValidationError("empty image")
     try:
-        with Image.open(__import__("io").BytesIO(raw)) as image:
+        with Image.open(io.BytesIO(raw)) as image:
             width, height = image.size
             if width <= 0 or height <= 0 or width > max_edge or height > max_edge:
                 raise UploadValidationError("image dimensions exceed limit")

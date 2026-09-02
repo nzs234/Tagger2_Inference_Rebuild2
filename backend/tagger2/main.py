@@ -17,6 +17,7 @@ import shutil
 import threading
 import time
 import uuid
+from collections import OrderedDict
 from contextlib import asynccontextmanager
 from dataclasses import replace
 from datetime import datetime, timezone
@@ -480,9 +481,12 @@ class Runtime:
         self.workflow_resources = WorkflowResourceCatalog(workflow_dir / "resources")
         self.workflow_database = WorkflowDatabase(workflow_dir / "workflows.sqlite3")
         self.secrets = CompositeSecretStore()
-        self.providers: dict[str, Any] = {}
+        # Bounded LRU of live VisionProvider instances keyed by stable profile
+        # identity (see Runtime.provider). Evicted providers are closed.
+        self.providers: OrderedDict[str, Any] = OrderedDict()
         self.provider_configs: dict[str, dict[str, Any]] = {}
         self._provider_lock = threading.RLock()
+        self._provider_close_tasks: set[asyncio.Task[None]] = set()
         self.upload_index: dict[str, list[dict[str, Any]]] = {}
         self._upload_lock = threading.RLock()
         self._load_upload_index()
@@ -1675,14 +1679,19 @@ class Runtime:
     ):
         if not provider_id:
             raise ProviderError("未选择在线 provider", code="provider_required")
+        # Cache identity is the provider's STABLE profile only. Per-job
+        # snapshots freeze max_concurrency (the requested online_concurrency),
+        # which must not multiply cached instances: two jobs sharing a provider
+        # profile share one VisionProvider regardless of per-job concurrency.
         cache_key = (
             provider_id
             if profile_override is None
-            else f"{provider_id}:{config_digest(profile_override)[:20]}"
+            else f"{provider_id}:{config_digest(_stable_provider_profile(profile_override))[:20]}"
         )
         with self._provider_lock:
             existing = self.providers.get(cache_key)
             if existing is not None:
+                self.providers.move_to_end(cache_key)
                 return existing
             stored_profile = self.provider_configs.get(provider_id) or self.storage.get_provider_profile(provider_id)
             profile = dict(profile_override) if profile_override is not None else stored_profile
@@ -1698,6 +1707,18 @@ class Runtime:
             # Concurrency is a per-batch-task setting. Ignore the legacy
             # provider-level field so old profiles cannot constrain new jobs.
             cfg.pop("concurrency", None)
+            if profile_override is not None:
+                # Option (a): the snapshot's max_concurrency is a volatile
+                # per-job override, so it is excluded from the cache identity
+                # above AND from the built config. The provider profile's own
+                # max_concurrency governs the shared instance's semaphore;
+                # per-job parallelism is already enforced by the job manager's
+                # worker count (_worker_concurrency) and the hybrid batch
+                # semaphore, so nothing needs a per-job provider semaphore.
+                cfg.pop("max_concurrency", None)
+                stored_cfg = dict((stored_profile or {}).get("config") or {})
+                if "max_concurrency" in stored_cfg:
+                    cfg["max_concurrency"] = stored_cfg["max_concurrency"]
             cfg["max_concurrency"] = cfg.get("max_concurrency", 3)
             cfg["max_retries"] = cfg.pop("retries", cfg.get("max_retries", 2))
             # Image-generation routing is handled by its dedicated adapter;
@@ -1717,7 +1738,43 @@ class Runtime:
             except Exception as exc:
                 raise ProviderError(f"provider 配置无效: {exc}", code="provider_config_invalid") from exc
             self.providers[cache_key] = instance
+            self._evict_providers_locked()
             return instance
+
+    def _evict_providers_locked(self) -> None:
+        """Drop least-recently-used providers beyond the cache limit.
+
+        Caller must hold ``self._provider_lock``. Each evicted provider owns an
+        httpx connection pool, so schedule its ``aclose()`` instead of just
+        dropping the reference.
+        """
+
+        while len(self.providers) > _PROVIDER_CACHE_LIMIT:
+            _key, instance = self.providers.popitem(last=False)
+            self._schedule_provider_close(instance)
+
+    def _schedule_provider_close(self, instance: Any) -> None:
+        async def _close() -> None:
+            try:
+                await instance.aclose()
+            except Exception:
+                logger.exception("closing evicted provider client failed")
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+        if loop is None:
+            # No running loop (provider() is sync and may be called outside
+            # async contexts, e.g. from tests): close on a temporary loop.
+            try:
+                asyncio.run(_close())
+            except Exception:
+                logger.exception("closing evicted provider client failed")
+            return
+        task = loop.create_task(_close())
+        self._provider_close_tasks.add(task)
+        task.add_done_callback(self._provider_close_tasks.discard)
 
     async def invalidate_provider(self, provider_id: str) -> None:
         """Close live and snapshotted clients for a changed provider."""
@@ -1736,11 +1793,15 @@ class Runtime:
         await self.image_generation.close()
         await self.job_manager.shutdown()
         await self.model_downloads.close()
+        pending = [task for task in self._provider_close_tasks if not task.done()]
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
         for provider in list(self.providers.values()):
             try:
                 await provider.aclose()
             except Exception:
                 pass
+        self.providers.clear()
         for classifier in self.classifiers.values():
             classifier.unload()
         self.engine.close()
@@ -1798,6 +1859,79 @@ def _model_public(record: Any, engine: LocalInferenceEngine | None = None) -> di
         "classifiers": ["aesthetic"],
         "status": record.load_error,
     }
+
+
+def _run_directory_scan(
+    base: Path,
+    root_id: str,
+    *,
+    recursive: bool,
+    patterns: Sequence[str],
+    cursor: int,
+    page_size: int,
+    max_items: int,
+    image_extensions: frozenset[str] | set[str],
+    allowlist: PathAllowlist,
+    scan_id: str,
+) -> dict[str, Any]:
+    """Walk ``base`` and build one scan page. Blocking; run via to_thread."""
+    regexes: list[re.Pattern[str]] = []
+    for pattern in patterns:
+        if len(pattern) > 128:
+            raise _safe_error("过滤表达式过长", "invalid_pattern")
+        expression = "^" + re.escape(pattern).replace(r"\*", ".*").replace(r"\?", ".") + "$"
+        regexes.append(re.compile(expression, re.IGNORECASE))
+    page: list[dict[str, Any]] = []
+    total = 0
+    iterator = base.rglob("*") if recursive else base.glob("*")
+    for path in iterator:
+        if total >= max_items:
+            break
+        if not path.is_file() or path.suffix.casefold() not in image_extensions:
+            continue
+        if regexes and not any(regex.match(path.name) or regex.match(path.as_posix()) for regex in regexes):
+            continue
+        rel = allowlist.relative_path(root_id, path)
+        if cursor <= total < cursor + page_size:
+            stat = path.stat()
+            page.append({
+                "id": opaque_id(path, prefix="image"),
+                "relative_path": rel,
+                "file_name": path.name,
+                "size": stat.st_size,
+                "modified_at": datetime.fromtimestamp(
+                    stat.st_mtime, timezone.utc
+                ).isoformat(),
+            })
+        total += 1
+    end = min(cursor + len(page), total)
+    return {
+        "scan_id": scan_id,
+        "items": page,
+        "total": total,
+        "next_cursor": str(end) if end < total else None,
+    }
+
+
+# Per-job fields that must not multiply cached VisionProvider instances.
+# create_job freezes the requested ``online_concurrency`` into the snapshot's
+# ``max_concurrency``; it is a job-scoped override, not provider identity.
+_PROVIDER_VOLATILE_CONFIG_KEYS = ("max_concurrency", "concurrency")
+
+# Upper bound on live cached VisionProvider instances (each owns an
+# httpx.AsyncClient with a connection pool).
+_PROVIDER_CACHE_LIMIT = 8
+
+
+def _stable_provider_profile(profile: Mapping[str, Any]) -> dict[str, Any]:
+    """Return the durable parts of a provider profile for cache identity."""
+
+    stable = dict(profile)
+    config = dict(stable.get("config") or {})
+    for key in _PROVIDER_VOLATILE_CONFIG_KEYS:
+        config.pop(key, None)
+    stable["config"] = config
+    return stable
 
 
 def create_app(settings: AppConfig | None = None) -> FastAPI:
@@ -2129,48 +2263,26 @@ def create_app(settings: AppConfig | None = None) -> FastAPI:
     async def scan(payload: ScanPayload, _: None = Depends(authorize)):
         root_id = payload.root_id
         relative = payload.relative_path
-        recursive = payload.recursive
         patterns = [str(x).strip() for x in payload.patterns if str(x).strip()]
         page_size = min(runtime.settings.scan_page_size_max, payload.page_size)
         resolve_root(root_id, kind="input")
         base = runtime.allowlist.resolve(root_id, relative, must_exist=True, expect="dir")
-        regexes: list[re.Pattern[str]] = []
-        for pattern in patterns:
-            if len(pattern) > 128:
-                raise _safe_error("过滤表达式过长", "invalid_pattern")
-            expression = "^" + re.escape(pattern).replace(r"\*", ".*").replace(r"\?", ".") + "$"
-            regexes.append(re.compile(expression, re.IGNORECASE))
-        page: list[dict[str, Any]] = []
-        total = 0
-        iterator = base.rglob("*") if recursive else base.glob("*")
-        for path in iterator:
-            if total >= runtime.settings.max_batch_items:
-                break
-            if not path.is_file() or path.suffix.casefold() not in runtime.settings.image_extensions:
-                continue
-            if regexes and not any(regex.match(path.name) or regex.match(path.as_posix()) for regex in regexes):
-                continue
-            rel = runtime.allowlist.relative_path(root_id, path)
-            if payload.cursor <= total < payload.cursor + page_size:
-                stat = path.stat()
-                page.append({
-                    "id": opaque_id(path, prefix="image"),
-                    "relative_path": rel,
-                    "file_name": path.name,
-                    "size": stat.st_size,
-                    "modified_at": datetime.fromtimestamp(
-                        stat.st_mtime, timezone.utc
-                    ).isoformat(),
-                })
-            total += 1
-        scan_id = uuid.uuid4().hex
-        end = min(payload.cursor + len(page), total)
-        return {
-            "scan_id": scan_id,
-            "items": page,
-            "total": total,
-            "next_cursor": str(end) if end < total else None,
-        }
+        # The walk can touch tens of thousands of files with per-file stat
+        # calls; keep it off the event loop. Root/path validation above still
+        # raises the same HTTP errors from the async context.
+        return await asyncio.to_thread(
+            _run_directory_scan,
+            base,
+            root_id,
+            recursive=payload.recursive,
+            patterns=patterns,
+            cursor=payload.cursor,
+            page_size=page_size,
+            max_items=runtime.settings.max_batch_items,
+            image_extensions=runtime.settings.image_extensions,
+            allowlist=runtime.allowlist,
+            scan_id=uuid.uuid4().hex,
+        )
 
     @app.get("/api/v1/models")
     async def models(_: None = Depends(authorize)):
@@ -2667,35 +2779,44 @@ def create_app(settings: AppConfig | None = None) -> FastAPI:
                 runtime.settings.max_online_concurrency,
                 payload.online_concurrency,
             )
-        if payload.source.type == "scan":
-            iterator = iter(items)
-            try:
-                first = next(iterator)
-            except StopIteration:
-                raise _safe_error("没有找到可处理的图片", "no_images")
-            record = runtime.storage.create_job(
-                payload.mode,
-                config,
-                (),
-                source_root_id=source_root,
-                output_root_id=payload.output.root_id,
-            )
-            for chunk in _chunks(itertools.chain((first,), iterator)):
-                runtime.storage.add_items(record.id, chunk)
-            refreshed = runtime.storage.get_job(record.id)
-            if refreshed is not None:
-                record = refreshed
-        else:
+        # Building scan items walks the source directory and the chunked
+        # inserts hit SQLite; both block, so run the whole persistence step in
+        # a worker thread. Root/path validation and provider validation above
+        # already ran on the event loop and keep raising their HTTP errors
+        # from the async context; errors raised inside the thread propagate
+        # unchanged through the await below.
+        def _persist_job() -> JobRecord:
+            if payload.source.type == "scan":
+                iterator = iter(items)
+                try:
+                    first = next(iterator)
+                except StopIteration:
+                    raise _safe_error("没有找到可处理的图片", "no_images")
+                record = runtime.storage.create_job(
+                    payload.mode,
+                    config,
+                    (),
+                    source_root_id=source_root,
+                    output_root_id=payload.output.root_id,
+                )
+                for chunk in _chunks(itertools.chain((first,), iterator)):
+                    runtime.storage.add_items(record.id, chunk)
+                refreshed = runtime.storage.get_job(record.id)
+                if refreshed is not None:
+                    return refreshed
+                return record
             upload_items = list(items)
             if not upload_items:
                 raise _safe_error("没有找到可处理的图片", "no_images")
-            record = runtime.storage.create_job(
+            return runtime.storage.create_job(
                 payload.mode,
                 config,
                 upload_items,
                 source_root_id=source_root,
                 output_root_id=payload.output.root_id,
             )
+
+        record = await asyncio.to_thread(_persist_job)
         await runtime.job_manager.start(record.id)
         return _job_public(record)
 

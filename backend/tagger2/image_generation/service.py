@@ -261,7 +261,10 @@ class ImageGenerationService:
         try:
             self.storage.mark_deleting(job_id)
             if job_dir.exists():
-                shutil.rmtree(job_dir)
+                # A job directory holds every generated image of the job, so
+                # the recursive delete can be long-running; keep it off the
+                # event loop.
+                await asyncio.to_thread(shutil.rmtree, job_dir)
             self.storage.delete_job(job_id)
         except (OSError, ValueError, KeyError) as exc:
             raise ImageGenerationServiceError(
@@ -458,10 +461,16 @@ class ImageGenerationService:
             "allow_local": allow_local,
             "headers": snapshot.get("headers") or {},
         })
-        references = [
-            await asyncio.to_thread(self._load_reference, job_id, item)
-            for item in self.storage.get_references(job_id)
-        ]
+        # Reference images are independent file reads (plus a hash each), so
+        # load them concurrently. gather() without return_exceptions preserves
+        # the sequential behavior: the first failure propagates and the attempt
+        # fails; result order matches the stored reference order.
+        reference_items = self.storage.get_references(job_id)
+        references = list(
+            await asyncio.gather(
+                *(asyncio.to_thread(self._load_reference, job_id, item) for item in reference_items)
+            )
+        )
         request = self._client_request(config, attempt)
         style = str(snapshot.get("image_api_style") or "auto")
         client = ImageGenerationClient(

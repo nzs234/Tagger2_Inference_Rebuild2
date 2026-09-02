@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib
 import json
 import os
 import sys
@@ -105,6 +106,67 @@ def test_provider_url_requires_explicit_local_enablement(monkeypatch) -> None:
         allow_local=True,
         resolve_dns=True,
     ) == "https://provider.example/v1"
+
+
+def _clear_dns_cache() -> None:
+    security_module = importlib.import_module("tagger2.security")
+    with security_module._DNS_CACHE_LOCK:
+        security_module._DNS_CACHE.clear()
+
+
+def test_provider_url_dns_resolution_is_cached_within_ttl(monkeypatch) -> None:
+    importlib.import_module("tagger2.security")
+    _clear_dns_cache()
+    calls = []
+
+    def fake_getaddrinfo(host, port, *args, **kwargs):
+        calls.append((host, port))
+        return [(2, 1, 6, "", ("93.184.216.34", port))]
+
+    monkeypatch.setattr("tagger2.security.socket.getaddrinfo", fake_getaddrinfo)
+
+    first = validate_provider_url("https://cache-a.example/v1", resolve_dns=True)
+    second = validate_provider_url("https://cache-a.example/v1", resolve_dns=True)
+
+    assert first == second == "https://cache-a.example/v1"
+    assert len(calls) == 1
+    _clear_dns_cache()
+
+
+def test_provider_url_dns_failures_are_never_cached(monkeypatch) -> None:
+    _clear_dns_cache()
+    calls = []
+
+    def failing_getaddrinfo(host, port, *args, **kwargs):
+        calls.append(host)
+        raise OSError("temporary resolver failure")
+
+    monkeypatch.setattr("tagger2.security.socket.getaddrinfo", failing_getaddrinfo)
+
+    for _ in range(2):
+        with pytest.raises(SecurityError):
+            validate_provider_url("https://cache-b.example/v1", resolve_dns=True)
+
+    assert len(calls) == 2
+    _clear_dns_cache()
+
+
+def test_dns_cache_evicts_oldest_entries_on_overflow(monkeypatch) -> None:
+    security_module = importlib.import_module("tagger2.security")
+    _clear_cache = _clear_dns_cache
+    _clear_cache()
+    monkeypatch.setattr(security_module, "_DNS_CACHE_MAX_ENTRIES", 4)
+
+    def fake_getaddrinfo(host, port, *args, **kwargs):
+        return [(2, 1, 6, "", ("93.184.216.34", port))]
+
+    monkeypatch.setattr("tagger2.security.socket.getaddrinfo", fake_getaddrinfo)
+
+    for index in range(6):
+        validate_provider_url(f"https://overflow-{index}.example/v1", resolve_dns=True)
+
+    assert len(security_module._DNS_CACHE) <= 4
+    _clear_cache()
 
 
 def test_environment_secret_metadata_never_returns_secret() -> None:
