@@ -1,0 +1,55 @@
+{
+  "format": "tag-translations-v1",
+  "generated_at": "2026-09-02T13:34:20Z",
+  "profiles": {
+    "danbooru": {
+      "file": "danbooru-zh.csv.gz",
+      "entries": 310617,
+      "sha256": "c3d7077fc8dd98fb07ca5c127c31b773953bc1ade05425396f3074706e646dfa"
+    },
+    "e621": {
+      "file": "e621-zh.csv.gz",
+      "entries": 68399,
+      "sha256": "75b7d2cb7410da652dfb973d080cedbdda90af0641e8a5016b025f0440d33fb1",
+      "note": "Danbooru 词条与 e621 标签命名空间的交集"
+    }
+  },
+  "sources": [
+    {
+      "name": "amenorira/danbooru-tags-data-zh",
+      "url": "https://github.com/amenorira/danbooru-tags-data-zh",
+      "license": "MIT",
+      "license_url": "https://github.com/amenorira/danbooru-tags-data-zh/blob/main/LICENSE",
+      "entries_used": 23009,
+      "aliases_used": 27496,
+      "note": "人工整理，含别名；当前覆盖 artist/copyright/meta"
+    },
+    {
+      "name": "GuWuW/danbooru-dict",
+      "url": "https://github.com/GuWuW/danbooru-dict",
+      "license": "NOASSERTION",
+      "license_url": "https://github.com/GuWuW/danbooru-dict",
+      "entries_used": 79715,
+      "aliases_used": 23317,
+      "note": "社区词典，每日更新，覆盖常用标签；仓库未声明许可"
+    },
+    {
+      "name": "ffdkj/ffdkj-Danbooru_Tag-Chinese-English-Translation-Table",
+      "url": "https://github.com/ffdkj/ffdkj-Danbooru_Tag-Chinese-English-Translation-Table",
+      "license": "NOASSERTION",
+      "license_url": "https://github.com/ffdkj/ffdkj-Danbooru_Tag-Chinese-English-Translation-Table",
+      "entries_used": 158611,
+      "aliases_used": 0,
+      "note": "覆盖最广（post_count>=10），机器翻译后人工校对；仓库未声明许可"
+    },
+    {
+      "name": "resources/tag_translations/e621-supplement-zh.csv",
+      "url": "",
+      "license": "in-repo",
+      "license_url": "",
+      "entries_used": 297,
+      "aliases_used": 0,
+      "note": "仓库内维护的 e621 专有词汇表（物种/解剖/画幅），对 e621 优先生效"
+    }
+  ]
+}

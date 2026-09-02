@@ -182,6 +182,7 @@ try {
     "frontend/vite.config.ts",
     "frontend/vitest.config.ts",
     "scripts",
+    "resources/tag_translations",
     "config/app.toml",
     "config/app.example.toml",
     "pyproject.toml",
@@ -200,6 +201,8 @@ try {
     "README.md",
     "docs/V1.04_RELEASE_NOTES.md",
     "docs/V1.04.1_RELEASE_NOTES.md",
+    "docs/V1.05_RELEASE_NOTES.md",
+    "docs/tag_manager.md",
     "docs/release_package_contents.md",
     "docs/workflow_manual_paths.md",
     "docs/workflow_compatibility_report.md"

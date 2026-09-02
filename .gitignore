@@ -35,6 +35,9 @@ __pycache__/
 *.egg-info/
 .tmp-mig/
 .tmp-pytest/
+# Download cache for scripts/build_tag_translations.py; the generated
+# dictionaries under resources/tag_translations/ are committed.
+.tmp-tag-translations/
 
 # Frontend
 frontend/node_modules/
