@@ -626,6 +626,7 @@ Tagger2_Inference_Rebuild2/
 - [Dataset Workflow 路径操作说明](docs/workflow_manual_paths.md)
 - [固定上游兼容性报告](docs/workflow_compatibility_report.md)
 - [发行包内容与资源指纹](docs/release_package_contents.md)
+- [V1.06 发布说明](docs/V1.06_RELEASE_NOTES.md)
 - [V1.05 标签管理与优化说明](docs/V1.05_RELEASE_NOTES.md)
 - [V1.04.1 部署修复说明](docs/V1.04.1_RELEASE_NOTES.md)
 - [V1.04 图像生成功能说明](docs/V1.04_RELEASE_NOTES.md)
