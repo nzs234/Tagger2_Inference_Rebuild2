@@ -193,6 +193,26 @@ class NlTranslateRequest(BaseModel):
         return self
 
 
+class TagTranslateRequest(BaseModel):
+    """Translate tags missing from the offline dictionary with the online model."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    profile: TagManagerProfile = "e621"
+    tags: list[str] = Field(max_length=200)
+    provider_id: str | None = Field(default=None, max_length=128)
+    model: str | None = Field(default=None, max_length=256)
+
+    @model_validator(mode="after")
+    def _strip_tags(self) -> "TagTranslateRequest":
+        self.tags = [tag.strip() for tag in self.tags if tag.strip()]
+        if not self.tags:
+            raise ValueError("tags must contain at least one tag")
+        if any(len(tag) > 100 for tag in self.tags):
+            raise ValueError("each tag must be at most 100 characters")
+        return self
+
+
 __all__ = [
     "BatchOperationRequest",
     "COUNT_VALUES",
@@ -206,6 +226,7 @@ __all__ = [
     "StandardJsonContent",
     "TagEdit",
     "TagManagerProfile",
+    "TagTranslateRequest",
     "TagTxtContent",
     "TagsJsonContent",
     "TranslationLookupRequest",

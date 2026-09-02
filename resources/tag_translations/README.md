@@ -38,3 +38,10 @@ e621 没有公开的中文词库，`e621-zh.csv.gz` 由「Danbooru 合并结果 
 下载缓存默认位于 `.tmp-tag-translations/`（已被 `.gitignore` 忽略）。e621 词库的生成依赖已注册的 e621 分类快照资源；若没有注册，脚本会退回到完整的 Danbooru 表并打印告警。
 
 补充或纠正 e621 译名时直接编辑 `e621-supplement-zh.csv`（表头 `tag,zh`），然后重新运行脚本。
+
+## 用户词库（运行时生成）
+
+标签管理页的「在线翻译缺失标签」按钮会把在线模型补译的标签写到
+`<data_dir>/tag_manager/translations/{profile}-zh.csv`（默认 `data/tag_manager/translations/`，
+表头同为 `tag,zh`，原子写入）。加载时该文件与发行词库合并，用户条目优先，
+因此补译结果重启后依然可用、离线可命中；重新生成本目录的发行词库不会覆盖它。

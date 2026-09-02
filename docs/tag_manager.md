@@ -48,6 +48,12 @@ runtime\python.exe scripts\build_tag_translations.py --sources amenorira   :: �
 
 模型下拉只列出**已启用且已配置密钥**的 provider；没有任何可用模型时接口返回 409 `nl_translate_unavailable`，界面提示先到「Provider 配置」页添加并启用一个在线模型。翻译本身不落盘，只有保存整张图片时才写入 sidecar。
 
+## 在线补译缺失标签
+
+离线词库没有覆盖的标签会以纯英文显示，此时工具栏（图片面板上方）和编辑抽屉会出现「在线翻译缺失标签（N）」按钮：点击后把当前页面/当前图片上所有未翻译的标签发给 `POST /tag-manager/translations/translate`，由已配置的在线模型批量翻译（每次请求最多 200 个标签，模型调用按每批 40 个分片）。
+
+翻译结果立即在界面上生效，并**保存到本地用户词库** `data/tag_manager/translations/{profile}-zh.csv`：加载时合并进离线词库（用户条目优先），重启后依然可用，完全离线时也能命中，重建发行词库不会覆盖该文件。词库中已有的标签不会发起模型调用；模型返回的英文回显、超长结果会被丢弃。没有任何可用在线模型时返回 409 `tag_translate_unavailable`，模型调用失败返回 502 `tag_translate_failed`（可重试）。
+
 ## 支持的标注格式
 
 | 格式 | 判定 | 读写 |
@@ -98,10 +104,11 @@ GET    /datasets/{id}/images/{iid}/thumbnail?size=256   缩略图（JPEG，磁�
 GET    /tag-db?profile=&query=&limit=  标签库自动补全（含 translation）
 GET    /tag-db/info                    标签库快照 + 中文词库状态
 POST   /translations/lookup            批量查询中文译名（最多 500 个标签）
+POST   /translations/translate         在线模型补译缺失标签并保存到用户词库（最多 200 个）
 POST   /nl/translate                   用在线模型翻译 NL 段落（target=zh|en）
 ```
 
-错误统一为 `{"detail": {"code", "message", "retryable"}}`（应用的错误中间件会把它平铺到响应体并附加 `request_id`）；常见错误码：`sidecar_conflict`（mtime 过期，重新加载即可）、`sidecar_kind_mismatch`（编辑负载与 sidecar 格式不符）、`sidecar_read_only`（raw e621 只读）、`batch_too_large`（单批上限 2000 张）、`root_not_writable`（数据集根目录未开启可写）、`tag_db_unavailable`（该 profile 没有已注册的分类快照）、`nl_translate_unavailable`（没有已启用且已配置密钥的在线模型）、`nl_translate_failed`（在线模型调用失败，可重试）。
+错误统一为 `{"detail": {"code", "message", "retryable"}}`（应用的错误中间件会把它平铺到响应体并附加 `request_id`）；常见错误码：`sidecar_conflict`（mtime 过期，重新加载即可）、`sidecar_kind_mismatch`（编辑负载与 sidecar 格式不符）、`sidecar_read_only`（raw e621 只读）、`batch_too_large`（单批上限 2000 张）、`root_not_writable`（数据集根目录未开启可写）、`tag_db_unavailable`（该 profile 没有已注册的分类快照）、`nl_translate_unavailable`/`tag_translate_unavailable`（没有已启用且已配置密钥的在线模型）、`nl_translate_failed`/`tag_translate_failed`（在线模型调用失败，可重试）。
 
 ## 架构与数据存储
 

@@ -17,6 +17,7 @@ from tagger2.tag_manager.contracts import (
     CreateDatasetRequest,
     ImageFilter,
     NlTranslateRequest,
+    TagTranslateRequest,
     TranslationLookupRequest,
 )
 from tagger2.tag_manager.service import TagManagerError, TagManagerService
@@ -101,7 +102,7 @@ def test_normalize_lookup_key_folds_case_and_spaces():
 
 
 def test_translate_resolves_either_spelling(dictionary_dir: Path):
-    translations = TagTranslations(dictionary_dir)
+    translations = TagTranslations(dictionary_dir, dictionary_dir.parent / "user-translations")
 
     assert translations.translate("danbooru", "blue_eyes") == "蓝瞳"
     assert translations.translate("danbooru", "Blue Eyes") == "蓝瞳"
@@ -112,14 +113,14 @@ def test_translate_resolves_either_spelling(dictionary_dir: Path):
 
 
 def test_translate_rejects_unknown_profile(dictionary_dir: Path):
-    translations = TagTranslations(dictionary_dir)
+    translations = TagTranslations(dictionary_dir, dictionary_dir.parent / "user-translations")
 
     assert translations.translate("gelbooru", "blue_eyes") is None
     assert translations.translate_many("gelbooru", ["blue_eyes"]) == {}
 
 
 def test_translate_many_keys_on_the_input_spelling(dictionary_dir: Path):
-    translations = TagTranslations(dictionary_dir)
+    translations = TagTranslations(dictionary_dir, dictionary_dir.parent / "user-translations")
 
     result = translations.translate_many("danbooru", ["Blue Eyes", "long_hair", "nope"])
 
@@ -127,7 +128,7 @@ def test_translate_many_keys_on_the_input_spelling(dictionary_dir: Path):
 
 
 def test_info_reports_entry_counts_and_source(dictionary_dir: Path):
-    info = TagTranslations(dictionary_dir).info()
+    info = TagTranslations(dictionary_dir, dictionary_dir.parent / "user-translations").info()
 
     assert info["danbooru"]["entries"] == len(DANBOORU_ROWS)
     assert info["danbooru"]["source"] == "danbooru-zh.csv.gz"
@@ -136,15 +137,16 @@ def test_info_reports_entry_counts_and_source(dictionary_dir: Path):
 
 
 def test_missing_directory_degrades_to_english_only(tmp_path: Path):
-    translations = TagTranslations(tmp_path / "absent")
+    translations = TagTranslations(tmp_path / "absent", tmp_path / "user-translations")
 
     assert translations.translate("danbooru", "blue_eyes") is None
-    info = translations.info()
+    info = TagTranslations(tmp_path / "absent", tmp_path / "user-translations").info()
     assert info["danbooru"] == {
         "entries": 0,
         "loaded": True,
         "source": None,
         "updated": None,
+        "user_entries": 0,
     }
 
 
@@ -268,7 +270,7 @@ def workspace(tmp_path: Path, dictionary_dir: Path):
         allowlist=allowlist,
         thumbnails=FakeThumbnails(),
         tag_database=FakeTagDatabase(),
-        translations=TagTranslations(dictionary_dir),
+        translations=TagTranslations(dictionary_dir, dictionary_dir.parent / "user-translations"),
         provider_factory=lambda provider_id: provider,
         provider_ids=lambda: ["p-default", "p-second"],
     )
@@ -433,7 +435,7 @@ async def test_translate_nl_without_a_provider_is_a_setup_state(tmp_path: Path, 
         allowlist=PathAllowlist(),
         thumbnails=FakeThumbnails(),
         tag_database=FakeTagDatabase(),
-        translations=TagTranslations(dictionary_dir),
+        translations=TagTranslations(dictionary_dir, dictionary_dir.parent / "user-translations"),
     )
 
     with pytest.raises(TagManagerError) as excinfo:
@@ -450,7 +452,7 @@ async def test_translate_nl_maps_provider_failure_to_502(tmp_path: Path, diction
         allowlist=PathAllowlist(),
         thumbnails=FakeThumbnails(),
         tag_database=FakeTagDatabase(),
-        translations=TagTranslations(dictionary_dir),
+        translations=TagTranslations(dictionary_dir, dictionary_dir.parent / "user-translations"),
         provider_factory=lambda provider_id: provider,
         provider_ids=lambda: ["p-default"],
     )
@@ -470,7 +472,7 @@ async def test_translate_nl_rejects_an_empty_model_reply(tmp_path: Path, diction
         allowlist=PathAllowlist(),
         thumbnails=FakeThumbnails(),
         tag_database=FakeTagDatabase(),
-        translations=TagTranslations(dictionary_dir),
+        translations=TagTranslations(dictionary_dir, dictionary_dir.parent / "user-translations"),
         provider_factory=lambda provider_id: provider,
         provider_ids=lambda: ["p-default"],
     )
@@ -558,7 +560,7 @@ def test_route_nl_translate_reports_missing_provider(dictionary_dir: Path):
         allowlist=PathAllowlist(),
         thumbnails=FakeThumbnails(),
         tag_database=FakeTagDatabase(),
-        translations=TagTranslations(dictionary_dir),
+        translations=TagTranslations(dictionary_dir, dictionary_dir.parent / "user-translations"),
     )
     app = FastAPI()
     app.include_router(create_tag_manager_router(service))
@@ -576,6 +578,236 @@ def test_route_nl_translate_rejects_blank_and_oversized_text(client):
 
     blank = http.post("/api/v1/tag-manager/nl/translate", json={"text": "   "})
     oversized = http.post("/api/v1/tag-manager/nl/translate", json={"text": "a" * 8001})
+
+    assert blank.status_code == 422
+    assert oversized.status_code == 422
+
+
+# -- on-demand tag translation ----------------------------------------------
+
+
+def test_ingest_persists_to_the_user_dictionary(dictionary_dir: Path):
+    user_dir = dictionary_dir.parent / "user-translations"
+    translations = TagTranslations(dictionary_dir, user_dir)
+
+    saved = translations.ingest(
+        "e621",
+        {"bdsm": "束缚", "weird_tag": "weird_tag", "too_long": "长" * 80},
+    )
+
+    # The echo and the oversized value are dropped, so only bdsm is saved.
+    assert saved == 1
+    assert translations.translate("e621", "bdsm") == "束缚"
+    assert "bdsm,束缚" in (user_dir / "e621-zh.csv").read_text(encoding="utf-8")
+
+    # A fresh instance (cache reset ≈ server restart) resolves it offline.
+    reset_translation_cache()
+    assert TagTranslations(dictionary_dir, user_dir).translate("e621", "BDSM") == "束缚"
+
+
+def test_ingest_overrides_the_shipped_dictionary(dictionary_dir: Path):
+    translations = TagTranslations(dictionary_dir, dictionary_dir.parent / "user-translations")
+
+    assert translations.ingest("e621", {"wolf": "灰狼"}) == 1
+
+    assert translations.translate("e621", "wolf") == "灰狼"
+    assert translations.translate("e621", "solo") == "单人"
+
+
+def test_ingest_keeps_profiles_separate(dictionary_dir: Path):
+    translations = TagTranslations(dictionary_dir, dictionary_dir.parent / "user-translations")
+
+    assert translations.ingest("e621", {"bdsm": "束缚"}) == 1
+    assert translations.ingest("danbooru", {"bdsm": "绑缚"}) == 1
+
+    assert translations.translate("e621", "bdsm") == "束缚"
+    assert translations.translate("danbooru", "bdsm") == "绑缚"
+
+
+def test_damaged_user_file_degrades_like_the_shipped_one(dictionary_dir: Path):
+    user_dir = dictionary_dir.parent / "user-translations"
+    user_dir.mkdir(parents=True)
+    (user_dir / "e621-zh.csv").write_text("not,a,valid,header\n", encoding="utf-8")
+    translations = TagTranslations(dictionary_dir, user_dir)
+
+    assert translations.translate("e621", "wolf") == "狼"
+    assert translations.info()["e621"]["user_entries"] == 0
+
+
+async def test_translate_tags_saves_model_results(workspace):
+    service, _session_id, _dataset, provider = workspace
+    provider.reply = json.dumps({"bdsm": "束缚与调教", "unmapped_tag": "未映射"})
+
+    result = await service.translate_tags(
+        TagTranslateRequest(profile="e621", tags=["bdsm", "unmapped_tag", "wolf"])
+    )
+
+    assert result["from_dictionary"] == 1  # wolf ships with the dictionary
+    assert result["translated_now"] == 2
+    assert result["translations"] == {
+        "bdsm": "束缚与调教",
+        "unmapped_tag": "未映射",
+        "wolf": "狼",
+    }
+    assert result["provider_id"] == "p-default"
+    call = provider.calls[0]
+    assert call["image"] is None
+    assert "bdsm" in call["prompt"] and "wolf" not in call["prompt"]
+    assert "booru tags" in str(call["system_prompt"])
+    # Saved for offline reuse: visible immediately and after a "restart".
+    assert service.translations.translate("e621", "bdsm") == "束缚与调教"
+    reset_translation_cache()
+    fresh = TagTranslations(service.translations.directory, service.translations.user_dir)
+    assert fresh.translate("e621", "bdsm") == "束缚与调教"
+
+
+async def test_translate_tags_with_no_gaps_never_calls_the_model(workspace):
+    service, _session_id, _dataset, provider = workspace
+
+    result = await service.translate_tags(
+        TagTranslateRequest(profile="e621", tags=["wolf", "solo"])
+    )
+
+    assert result["translated_now"] == 0
+    assert result["from_dictionary"] == 2
+    assert result["provider_id"] == ""
+    assert result["model"] == ""
+    assert provider.calls == []
+
+
+async def test_translate_tags_without_a_provider_is_a_setup_state(tmp_path: Path, dictionary_dir: Path):
+    service = TagManagerService(
+        store=TagManagerStore(":memory:"),
+        allowlist=PathAllowlist(),
+        thumbnails=FakeThumbnails(),
+        tag_database=FakeTagDatabase(),
+        translations=TagTranslations(dictionary_dir, tmp_path / "user-translations"),
+    )
+
+    with pytest.raises(TagManagerError) as excinfo:
+        await service.translate_tags(TagTranslateRequest(profile="e621", tags=["bdsm"]))
+
+    assert excinfo.value.code == "tag_translate_unavailable"
+    assert excinfo.value.status_code == 409
+
+
+async def test_translate_tags_maps_provider_failure_to_502(tmp_path: Path, dictionary_dir: Path):
+    provider = FakeProvider(error=RuntimeError("upstream refused"))
+    user_dir = tmp_path / "user-translations"
+    service = TagManagerService(
+        store=TagManagerStore(":memory:"),
+        allowlist=PathAllowlist(),
+        thumbnails=FakeThumbnails(),
+        tag_database=FakeTagDatabase(),
+        translations=TagTranslations(dictionary_dir, user_dir),
+        provider_factory=lambda provider_id: provider,
+        provider_ids=lambda: ["p-default"],
+    )
+
+    with pytest.raises(TagManagerError) as excinfo:
+        await service.translate_tags(TagTranslateRequest(profile="e621", tags=["bdsm"]))
+
+    assert excinfo.value.code == "tag_translate_failed"
+    assert excinfo.value.status_code == 502
+    assert excinfo.value.retryable is True
+    assert not (user_dir / "e621-zh.csv").exists()  # nothing half-saved
+
+
+async def test_translate_tags_rejects_unusable_model_output(tmp_path: Path, dictionary_dir: Path):
+    provider = FakeProvider(reply="I am sorry, I cannot translate that.")
+    service = TagManagerService(
+        store=TagManagerStore(":memory:"),
+        allowlist=PathAllowlist(),
+        thumbnails=FakeThumbnails(),
+        tag_database=FakeTagDatabase(),
+        translations=TagTranslations(dictionary_dir, tmp_path / "user-translations"),
+        provider_factory=lambda provider_id: provider,
+        provider_ids=lambda: ["p-default"],
+    )
+
+    with pytest.raises(TagManagerError) as excinfo:
+        await service.translate_tags(TagTranslateRequest(profile="e621", tags=["bdsm"]))
+
+    assert excinfo.value.code == "tag_translate_failed"
+    assert excinfo.value.status_code == 502
+
+
+async def test_translate_tags_drops_echoes_and_oversized_results(workspace):
+    service, _session_id, _dataset, provider = workspace
+    provider.reply = json.dumps({"bdsm": "bdsm", "other_tag": "长" * 100, "ok_tag": "可以"})
+
+    result = await service.translate_tags(
+        TagTranslateRequest(profile="e621", tags=["bdsm", "other_tag", "ok_tag"])
+    )
+
+    assert result["translated_now"] == 1
+    assert result["translations"]["ok_tag"] == "可以"
+    assert "bdsm" not in result["translations"]
+    assert "other_tag" not in result["translations"]
+
+
+@pytest.fixture()
+def translate_client(workspace):
+    """Route client whose FakeProvider replies with a tag-translation JSON."""
+
+    service, session_id, _dataset, provider = workspace
+    provider.reply = json.dumps({"bdsm": "束缚", "unmapped_tag": "未映射"})
+    app = FastAPI()
+    app.include_router(create_tag_manager_router(service))
+    return TestClient(app), session_id
+
+
+def test_route_translations_translate_persists(translate_client):
+    http, _session_id = translate_client
+
+    response = http.post(
+        "/api/v1/tag-manager/translations/translate",
+        json={"profile": "e621", "tags": ["bdsm", "unmapped_tag", "wolf"]},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["translated_now"] == 2
+    assert body["from_dictionary"] == 1
+    assert body["translations"]["bdsm"] == "束缚"
+    assert body["translations"]["wolf"] == "狼"
+
+    # The lookup endpoint now serves the saved translation from disk.
+    lookup = http.post(
+        "/api/v1/tag-manager/translations/lookup",
+        json={"profile": "e621", "tags": ["bdsm"]},
+    )
+    assert lookup.json()["translations"] == {"bdsm": "束缚"}
+
+
+def test_route_translations_translate_reports_missing_provider(dictionary_dir: Path):
+    service = TagManagerService(
+        store=TagManagerStore(":memory:"),
+        allowlist=PathAllowlist(),
+        thumbnails=FakeThumbnails(),
+        tag_database=FakeTagDatabase(),
+        translations=TagTranslations(dictionary_dir, dictionary_dir.parent / "user-translations"),
+    )
+    app = FastAPI()
+    app.include_router(create_tag_manager_router(service))
+
+    response = TestClient(app).post(
+        "/api/v1/tag-manager/translations/translate",
+        json={"profile": "e621", "tags": ["bdsm"]},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "tag_translate_unavailable"
+
+
+def test_route_translations_translate_rejects_bad_batches(client):
+    http, _session_id = client
+
+    blank = http.post("/api/v1/tag-manager/translations/translate", json={"profile": "e621", "tags": ["   "]})
+    oversized = http.post(
+        "/api/v1/tag-manager/translations/translate",
+        json={"profile": "e621", "tags": [f"tag_{index}" for index in range(201)]},
+    )
 
     assert blank.status_code == 422
     assert oversized.status_code == 422

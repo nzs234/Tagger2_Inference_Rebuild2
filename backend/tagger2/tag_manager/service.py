@@ -9,6 +9,7 @@ shared ``PathAllowlist``; responses never contain absolute paths.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import re
@@ -27,6 +28,7 @@ from .contracts import (
     ImageEditRequest,
     ImageFilter,
     NlTranslateRequest,
+    TagTranslateRequest,
     TranslationLookupRequest,
 )
 from .sidecar_io import (
@@ -41,7 +43,7 @@ from .sidecar_io import (
 )
 from .storage import TagManagerStore
 from .tag_db import TagDatabaseError
-from .translations import TagTranslations
+from .translations import TagTranslations, normalize_lookup_key
 
 logger = logging.getLogger("tagger2.tag_manager")
 
@@ -71,6 +73,21 @@ NL_TRANSLATION_SYSTEM_PROMPT = {
         "series titles recognizable, and preserve the original level of detail."
     ),
 }
+
+# On-demand tag translation: how many tags go into one model call and how long
+# a saved translation may be (mirrors the build script's sanity cap).
+TAG_TRANSLATE_CHUNK_SIZE = 40
+TAG_TRANSLATION_MAX_LENGTH = 64
+TAG_TRANSLATION_SYSTEM_PROMPT = (
+    "You translate image-dataset booru tags into Simplified Chinese. "
+    "The user message is a JSON object like {\"tags\": [\"tag1\", \"tag2\"]}. "
+    "Return ONLY a JSON object mapping every input tag to its standard Chinese "
+    "name, like {\"tag1\": \"中文\"}. For well-known booru tags use the most "
+    "common Chinese community translation; otherwise give a concise literal "
+    "translation of at most 20 Chinese characters. Species and actions are "
+    "translated, artist names may stay recognizable. Do not add notes or "
+    "markdown, and never return anything outside the JSON object."
+)
 
 
 class TagManagerError(RuntimeError):
@@ -670,14 +687,14 @@ class TagManagerService:
             "translations": self.translations.translate_many(request.profile, request.tags),
         }
 
-    async def translate_nl(self, request: NlTranslateRequest) -> dict[str, Any]:
-        """Translate one NL caption with a configured online provider."""
+    def _resolve_provider(self, explicit_provider_id: str | None, unavailable_code: str) -> tuple[str, Any]:
+        """Resolve the online provider to use, or raise a 409 setup state."""
 
-        provider_id = (request.provider_id or "").strip() or self._first_provider_id()
+        provider_id = (explicit_provider_id or "").strip() or self._first_provider_id()
         if not provider_id or self._provider_factory is None:
             raise TagManagerError(
                 "没有可用的在线模型：请先在「Provider 配置」中添加并启用一个在线模型",
-                code="nl_translate_unavailable",
+                code=unavailable_code,
                 status_code=409,
             )
         try:
@@ -685,9 +702,15 @@ class TagManagerService:
         except Exception as exc:  # noqa: BLE001 - provider errors are sanitized below
             raise TagManagerError(
                 f"在线模型不可用：{exc}",
-                code="nl_translate_unavailable",
+                code=unavailable_code,
                 status_code=409,
             ) from exc
+        return provider_id, provider
+
+    async def translate_nl(self, request: NlTranslateRequest) -> dict[str, Any]:
+        """Translate one NL caption with a configured online provider."""
+
+        provider_id, provider = self._resolve_provider(request.provider_id, "nl_translate_unavailable")
         try:
             text = await provider.generate(
                 image=None,
@@ -716,6 +739,78 @@ class TagManagerService:
             "target": request.target,
             "provider_id": provider_id,
             "model": (request.model or "").strip() or str(getattr(provider, "model", "")),
+        }
+
+    async def translate_tags(self, request: TagTranslateRequest) -> dict[str, Any]:
+        """Translate tags the offline dictionary misses with the online model.
+
+        Dictionary hits are answered without a model call. Model results are
+        persisted into the profile's user dictionary, so the next lookup —
+        after a restart or fully offline — resolves them locally.
+        """
+
+        profile = str(request.profile)
+        unique: dict[str, str] = {}
+        for tag in request.tags:
+            unique.setdefault(normalize_lookup_key(tag), tag)
+        found = self.translations.translate_many(profile, list(unique.values()))
+        missing = [verbatim for verbatim in unique.values() if verbatim not in found]
+
+        translated_now: dict[str, str] = {}
+        provider_id = ""
+        provider_model = ""
+        if missing:
+            provider_id, provider = self._resolve_provider(request.provider_id, "tag_translate_unavailable")
+            requested_model = (request.model or "").strip()
+            try:
+                for start in range(0, len(missing), TAG_TRANSLATE_CHUNK_SIZE):
+                    chunk = missing[start:start + TAG_TRANSLATE_CHUNK_SIZE]
+                    reply = await provider.generate(
+                        image=None,
+                        prompt=json.dumps({"tags": chunk}, ensure_ascii=False),
+                        model=requested_model or None,
+                        system_prompt=TAG_TRANSLATION_SYSTEM_PROMPT,
+                    )
+                    for tag, zh in _parse_tag_translation_reply(reply).items():
+                        key = normalize_lookup_key(tag)
+                        value = str(zh).strip()
+                        if not key or not value or len(value) > TAG_TRANSLATION_MAX_LENGTH:
+                            continue
+                        if key == normalize_lookup_key(value):
+                            continue  # the model echoed the English tag back
+                        translated_now.setdefault(key, value)
+            except TagManagerError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - one failure mode for the UI
+                logger.warning("tag manager tag translation failed via %s: %s", provider_id, exc)
+                raise TagManagerError(
+                    f"翻译失败：{exc}",
+                    code="tag_translate_failed",
+                    status_code=502,
+                    retryable=True,
+                ) from exc
+            if not translated_now:
+                raise TagManagerError(
+                    "翻译失败：在线模型没有返回可用的翻译结果",
+                    code="tag_translate_failed",
+                    status_code=502,
+                    retryable=True,
+                )
+            self.translations.ingest(profile, translated_now)
+            provider_model = requested_model or str(getattr(provider, "model", ""))
+
+        translations = dict(found)
+        for key, verbatim in unique.items():
+            saved = translated_now.get(key)
+            if saved is not None and verbatim not in translations:
+                translations[verbatim] = saved
+        return {
+            "profile": profile,
+            "translations": translations,
+            "translated_now": len(translated_now),
+            "from_dictionary": len(found),
+            "provider_id": provider_id,
+            "model": provider_model,
         }
 
     def _first_provider_id(self) -> str:
@@ -910,6 +1005,34 @@ def _content_tag_strings(content: SidecarContent) -> list[str]:
                 values.extend(str(entry) for entry in entries)
         return values
     return list(content.tags)
+
+
+def _parse_tag_translation_reply(text: str) -> dict[str, str]:
+    """Parse the model's JSON tag->translation reply.
+
+    Tolerates markdown fences by extracting the outermost JSON object. Raises
+    ``ValueError`` when no JSON object can be recovered so the caller maps the
+    failure to a retryable 502.
+    """
+
+    raw = str(text or "").strip()
+    candidates: list[str] = []
+    start, end = raw.find("{"), raw.rfind("}")
+    if start != -1 and end > start:
+        candidates.append(raw[start:end + 1])
+    candidates.append(raw)
+    for candidate in candidates:
+        try:
+            parsed = json.loads(candidate)
+        except (ValueError, TypeError):
+            continue
+        if isinstance(parsed, dict):
+            return {
+                str(key): value
+                for key, value in parsed.items()
+                if isinstance(value, str) and value.strip()
+            }
+    raise ValueError("model reply was not a JSON object")
 
 
 def _content_payload(content: SidecarContent) -> dict[str, Any]:

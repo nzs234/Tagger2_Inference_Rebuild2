@@ -1,11 +1,12 @@
 import { LoaderCircle, RotateCcw, X } from 'lucide-react'
-import { useState } from 'react'
+import { useMemo, useState } from 'react'
 import { Button, DialogLayer, EmptyState, Field, IconButton, Notice } from '../ui'
 import { tagCategoryClass } from '../../lib/tagCategories'
 import {
   formatTagForDisplay,
   toWriteStyle,
   translationFor,
+  translationKey,
   type StandardJsonContent,
   type StandardJsonFields,
   type TagManagerEditableContent,
@@ -17,8 +18,10 @@ import {
   type TagStyle,
 } from '../../lib/tagManager'
 import { usePreferences } from '../../store/app'
+import { useTagTranslationMemory } from '../../store/tagTranslationMemory'
 import { NlTranslatePanel } from './NlTranslatePanel'
 import { TagPillEditor } from './TagPillEditor'
+import { TranslateMissingButton } from './TranslateMissingButton'
 
 const QUALITY_CHOICES = ['general', 'sensitive', 'questionable', 'explicit']
 
@@ -34,6 +37,34 @@ type Translations = Record<string, string>
 
 function isReadOnly(content: TagManagerImageContent): boolean {
   return content.kind === 'raw_e621_json' || content.kind === 'none'
+}
+
+/** Every tag-like text a sidecar kind renders; `nl` and single-value fields are excluded. */
+function contentTagTexts(content: TagManagerImageContent): string[] {
+  if (content.kind === 'tag_txt') return content.tags
+  if (content.kind === 'tags_json') return content.tags.map((entry) => entry.text)
+  if (content.kind === 'standard_json') {
+    return [
+      ...content.fields.quality,
+      ...content.fields.appearance,
+      ...content.fields.tags,
+      ...content.fields.environment,
+    ]
+  }
+  if (content.kind === 'raw_e621_json') return content.tags
+  return []
+}
+
+function missingTagTexts(content: TagManagerImageContent, translations: Translations): string[] {
+  const seen = new Set<string>()
+  const missing: string[] = []
+  for (const text of contentTagTexts(content)) {
+    const key = translationKey(text)
+    if (!key || seen.has(key) || translationFor(translations, text)) continue
+    seen.add(key)
+    missing.push(text)
+  }
+  return missing
 }
 
 /** Rewrite every tag-like value of an outgoing payload in the active style. */
@@ -80,6 +111,13 @@ export function EditorDrawer({ detail, profile, saving, conflict, onClose, onSav
   const [draft, setDraft] = useState<TagManagerImageContent>(() => detail.content)
   const tagStyle = usePreferences((state) => state.tagStyle)
   const readOnly = isReadOnly(draft)
+  // Server-provided translations merged with the session-local on-demand ones.
+  const memory = useTagTranslationMemory((state) => state.map)
+  const translations = useMemo(
+    () => ({ ...(detail.translations ?? {}), ...memory }),
+    [detail.translations, memory],
+  )
+  const missingTags = useMemo(() => missingTagTexts(draft, translations), [draft, translations])
 
   return <DialogLayer onClose={onClose}>
     <div className="tm-drawer drawer" role="dialog" aria-modal="true" aria-labelledby="tm-drawer-title">
@@ -95,6 +133,7 @@ export function EditorDrawer({ detail, profile, saving, conflict, onClose, onSav
           <span className="tm-badge">{detail.sidecar_kind === 'none' ? '无 sidecar' : detail.sidecar_kind}</span>
           <small className="mono" title={detail.relative_path}>{detail.relative_path}</small>
           {(detail.width != null || detail.height != null) && <small>{detail.width ?? '?'}×{detail.height ?? '?'}</small>}
+          {!readOnly && <TranslateMissingButton profile={profile} tags={missingTags} />}
         </div>
         {conflict && <Notice tone="warning">
           <span>sidecar 在编辑期间被外部修改，本次保存已被拒绝以避免覆盖他人改动。</span>
@@ -104,7 +143,7 @@ export function EditorDrawer({ detail, profile, saving, conflict, onClose, onSav
           draft={draft}
           profile={profile}
           readOnly={readOnly}
-          translations={detail.translations ?? {}}
+          translations={translations}
           onDraft={setDraft}
         />
       </div>

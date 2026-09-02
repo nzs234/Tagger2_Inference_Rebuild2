@@ -10,6 +10,7 @@ import {
 } from '../src/lib/tagManager'
 import type { TagManagerImageDetail, TagManagerImageSummary, TagManagerSession } from '../src/lib/tagManager'
 import { usePreferences } from '../src/store/app'
+import { useTagTranslationMemory } from '../src/store/tagTranslationMemory'
 
 const session: TagManagerSession = {
   id: 'ds-1',
@@ -87,6 +88,8 @@ interface HarnessState {
   batchBodies: Array<Record<string, unknown>>
   translateBodies: Array<Record<string, unknown>>
   translateStatus: number
+  tagTranslateBodies: Array<Record<string, unknown>>
+  tagTranslateStatus: number
   dictionaryEntries: number
 }
 
@@ -140,6 +143,28 @@ function setupFetch(state: HarnessState) {
         { name: 'longcat', category: 'general', post_count: 12, alias_of: null, translation: null },
       ].filter((entry) => entry.name.includes(query))
       return json({ profile: 'e621', items: matches })
+    }
+    if (path.endsWith('/translations/translate')) {
+      state.tagTranslateBodies.push(JSON.parse(init?.body as string) as Record<string, unknown>)
+      if (state.tagTranslateStatus !== 200) {
+        return json(
+          {
+            code: 'tag_translate_unavailable',
+            message: '没有可用的在线模型：请先在「Provider 配置」中添加并启用一个在线模型',
+            request_id: 'req-2',
+            retryable: false,
+          },
+          state.tagTranslateStatus,
+        )
+      }
+      return json({
+        profile: 'e621',
+        translations: { unmapped_tag: '已映射', blue_eyes: '蓝瞳' },
+        translated_now: 1,
+        from_dictionary: 1,
+        provider_id: 'p-1',
+        model: 'gemini-flash',
+      })
     }
     if (path.endsWith('/nl/translate')) {
       state.translateBodies.push(JSON.parse(init?.body as string) as Record<string, unknown>)
@@ -217,11 +242,14 @@ describe('TagManager bilingual display', () => {
       batchBodies: [],
       translateBodies: [],
       translateStatus: 200,
+      tagTranslateBodies: [],
+      tagTranslateStatus: 200,
       dictionaryEntries: 68_399,
     }
     // The preference store persists to localStorage, so reset it per test.
     window.localStorage.clear()
     usePreferences.setState({ bilingualTags: true, tagStyle: 'underscore' })
+    useTagTranslationMemory.getState().reset()
   })
 
   afterEach(() => {
@@ -293,6 +321,8 @@ describe('TagManager separator style', () => {
       batchBodies: [],
       translateBodies: [],
       translateStatus: 200,
+      tagTranslateBodies: [],
+      tagTranslateStatus: 200,
       dictionaryEntries: 68_399,
     }
     window.localStorage.clear()
@@ -399,6 +429,8 @@ describe('TagManager NL translation', () => {
       batchBodies: [],
       translateBodies: [],
       translateStatus: 200,
+      tagTranslateBodies: [],
+      tagTranslateStatus: 200,
       dictionaryEntries: 68_399,
     }
     window.localStorage.clear()
@@ -473,5 +505,97 @@ describe('TagManager NL translation', () => {
 
     expect(await within(dialog).findByText(/请先在「Provider 配置」页添加并启用一个在线模型/)).toBeInTheDocument()
     expect(within(dialog).queryByRole('button', { name: '替换 NL' })).not.toBeInTheDocument()
+  })
+})
+
+describe('on-demand tag translation', () => {
+  let state: HarnessState
+
+  beforeEach(() => {
+    state = {
+      patchBodies: [],
+      batchBodies: [],
+      translateBodies: [],
+      translateStatus: 200,
+      tagTranslateBodies: [],
+      tagTranslateStatus: 200,
+      dictionaryEntries: 68_399,
+    }
+    window.localStorage.clear()
+    usePreferences.setState({ bilingualTags: true, tagStyle: 'underscore' })
+    useTagTranslationMemory.getState().reset()
+  })
+
+  afterEach(() => {
+    cleanup()
+    vi.restoreAllMocks()
+  })
+
+  it('ingests on-demand translations into the session memory store', () => {
+    const memory = useTagTranslationMemory
+
+    memory.getState().ingest({ 'Blue Eyes': '蓝瞳' })
+    expect(memory.getState().map['blue_eyes']).toBe('蓝瞳')
+    memory.getState().ingest({ blue_eyes: '蓝瞳' }) // no-op when nothing changes
+    memory.getState().reset()
+    expect(memory.getState().map).toEqual({})
+  })
+
+  it('translates the page-missing tags from the display bar and shows them at once', async () => {
+    setupFetch(state)
+    renderPage()
+    await screen.findByAltText('a.png')
+
+    const button = screen.getByRole('button', { name: '在线翻译缺失标签（1）' })
+    fireEvent.click(button)
+
+    await waitFor(() => expect(state.tagTranslateBodies).toHaveLength(1))
+    expect(state.tagTranslateBodies[0]).toMatchObject({ profile: 'e621', tags: ['unmapped_tag'] })
+    // The card pill picks the translation up from the memory store without a refetch.
+    expect(await screen.findByTitle('unmapped_tag · 已映射')).toBeInTheDocument()
+    await waitFor(() =>
+      expect(screen.queryByRole('button', { name: /在线翻译缺失标签/ })).not.toBeInTheDocument(),
+    )
+  })
+
+  it('translates the open image tags from the editor drawer and saves them', async () => {
+    setupFetch(state)
+    renderPage()
+    await screen.findByAltText('a.png')
+
+    fireEvent.click(screen.getByTitle('a.png'))
+    const dialog = await screen.findByRole('dialog', { name: 'a.png' })
+    fireEvent.click(within(dialog).getByRole('button', { name: '在线翻译缺失标签（1）' }))
+
+    await waitFor(() => expect(state.tagTranslateBodies).toHaveLength(1))
+    // The pill now renders bilingually and the button disappears after saving.
+    const pill = await within(dialog).findByRole('button', { name: '移除 unmapped_tag' })
+    expect(pill).toHaveTextContent('已映射')
+    expect(await within(dialog).findByText(/已翻译 1 条并保存到本地词库/)).toBeInTheDocument()
+    expect(within(dialog).queryByRole('button', { name: /在线翻译缺失标签/ })).not.toBeInTheDocument()
+  })
+
+  it('offers no translate button when every tag already resolves', async () => {
+    setupFetch(state)
+    renderPage()
+    await screen.findByAltText('a.png')
+
+    fireEvent.click(screen.getByTitle('b.png'))
+    const dialog = await screen.findByRole('dialog', { name: 'b.png' })
+
+    expect(within(dialog).queryByRole('button', { name: /在线翻译缺失标签/ })).not.toBeInTheDocument()
+  })
+
+  it('explains how to fix a missing online provider', async () => {
+    state.tagTranslateStatus = 409
+    setupFetch(state)
+    renderPage()
+    await screen.findByAltText('a.png')
+
+    fireEvent.click(screen.getByRole('button', { name: '在线翻译缺失标签（1）' }))
+
+    expect(await screen.findByText(/请先在「Provider 配置」页添加并启用一个在线模型/)).toBeInTheDocument()
+    // Nothing was cached, so the button stays available for a retry.
+    expect(screen.getByRole('button', { name: '在线翻译缺失标签（1）' })).toBeInTheDocument()
   })
 })

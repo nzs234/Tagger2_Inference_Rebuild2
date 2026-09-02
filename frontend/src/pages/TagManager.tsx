@@ -14,12 +14,14 @@ import {
   emptyImageFilter,
   tagManagerApi,
   tagManagerThumbnailUrl,
+  translationKey,
   type ImageFilterState,
   type TagManagerBatchRequest,
   type TagManagerEditableContent,
   type TagManagerSession,
   type TagManagerSort,
 } from '../lib/tagManager'
+import { useTagTranslationMemory } from '../store/tagTranslationMemory'
 
 const PAGE_SIZE = 60
 
@@ -82,6 +84,21 @@ export function TagManager() {
   const images = useMemo(() => imagesQuery.data?.items ?? [], [imagesQuery.data])
   const total = imagesQuery.data?.total ?? 0
   const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE))
+
+  // Tags on this page the offline dictionary does not cover and no on-demand
+  // translation has been saved for yet; feeding the 在线翻译 button.
+  const translationMemory = useTagTranslationMemory((state) => state.map)
+  const missingTags = useMemo(() => {
+    const seen = new Set<string>()
+    for (const image of images) {
+      for (const entry of image.tags) {
+        if (entry.translation) continue
+        const key = translationKey(entry.tag)
+        if (key && !seen.has(key) && !translationMemory[key]) seen.add(key)
+      }
+    }
+    return [...seen]
+  }, [images, translationMemory])
 
   const detailQuery = useQuery({
     queryKey: ['tag-manager', 'image', activeId, editingId],
@@ -271,7 +288,7 @@ export function TagManager() {
       <div className="tm-main">
         <Panel title="筛选与排序" eyebrow="FILTER">
           <FilterBar filter={filter} sort={sort} disabled={!sessionReady} onChange={setFilter} onSortChange={changeSort} />
-          <TagDisplayBar profile={session?.profile ?? 'e621'} />
+          <TagDisplayBar profile={session?.profile ?? 'e621'} missingTags={missingTags} />
         </Panel>
         <Panel
           title="图片"

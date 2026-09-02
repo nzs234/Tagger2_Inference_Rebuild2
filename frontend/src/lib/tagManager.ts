@@ -188,6 +188,22 @@ export interface TagTranslationLookupResult {
   translations: Record<string, string>
 }
 
+export interface TagTranslateRequest {
+  profile: TagManagerProfile
+  tags: string[]
+  provider_id?: string
+  model?: string
+}
+
+export interface TagTranslateResult {
+  profile: TagManagerProfile
+  translations: Record<string, string>
+  translated_now: number
+  from_dictionary: number
+  provider_id: string
+  model: string
+}
+
 export interface NlTranslateRequest {
   text: string
   target?: 'zh' | 'en'
@@ -258,6 +274,13 @@ export const tagManagerApi = {
 
   lookupTranslations: (body: TagTranslationLookupRequest) =>
     request<TagTranslationLookupResult>('/tag-manager/translations/lookup', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+
+  /** Translate dictionary-missing tags with the online model; results are persisted server-side. */
+  translateTags: (body: TagTranslateRequest) =>
+    request<TagTranslateResult>('/tag-manager/translations/translate', {
       method: 'POST',
       body: JSON.stringify(body),
     }),

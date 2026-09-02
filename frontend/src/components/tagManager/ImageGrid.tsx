@@ -1,8 +1,9 @@
 import { ImageIcon } from 'lucide-react'
 import { useEffect, useRef, useState, type ReactNode, type RefObject } from 'react'
 import { tagCategoryClass } from '../../lib/tagCategories'
-import { formatTagForDisplay, type TagManagerImageSummary } from '../../lib/tagManager'
+import { formatTagForDisplay, translationKey, type TagManagerImageSummary } from '../../lib/tagManager'
 import { usePreferences } from '../../store/app'
+import { useTagTranslationMemory } from '../../store/tagTranslationMemory'
 
 const CARD_HEIGHT = 224
 const CARD_MIN_WIDTH = 150
@@ -99,11 +100,16 @@ function GridThumb({ url, name }: { url: string; name: string }) {
 function CardTags({ tags }: { tags: TagManagerImageSummary['tags'] }) {
   const bilingual = usePreferences((state) => state.bilingualTags)
   const tagStyle = usePreferences((state) => state.tagStyle)
+  // On-demand translations saved this session live in the memory store until
+  // the next server fetch annotates them natively.
+  const memory = useTagTranslationMemory((state) => state.map)
   if (tags.length === 0) return null
   return <div className="tm-card-tags">
     {tags.slice(0, CARD_TAG_LIMIT).map((entry) => {
       const display = formatTagForDisplay(entry.tag, tagStyle)
-      const translation = bilingual ? entry.translation : null
+      const translation = bilingual
+        ? entry.translation ?? memory[translationKey(entry.tag)] ?? null
+        : null
       return <span
         key={entry.tag}
         className={`tm-pill ${tagCategoryClass(entry.category)}`}

@@ -16,6 +16,7 @@ from .contracts import (
     StandardJsonContent,
     TagsJsonContent,
     TagEdit,
+    TagTranslateRequest,
     TranslationLookupRequest,
 )
 from .sidecar_io import (
@@ -31,7 +32,7 @@ from .storage import TagManagerStore, default_tag_manager_database_path
 from .service import TagManagerError, TagManagerService
 from .tag_db import TagDatabase, TagDatabaseError, TagInfo
 from .thumbnails import ThumbnailError, ThumbnailService
-from .translations import TagTranslations, default_translation_dir
+from .translations import TagTranslations, default_translation_dir, default_user_translation_dir
 
 __all__ = [
     "BatchOperationRequest",
@@ -52,6 +53,7 @@ __all__ = [
     "TagManagerService",
     "TagManagerStore",
     "TagTranslations",
+    "TagTranslateRequest",
     "TagsJsonContent",
     "ThumbnailError",
     "ThumbnailService",
@@ -59,6 +61,7 @@ __all__ = [
     "dedup_tags",
     "default_tag_manager_database_path",
     "default_translation_dir",
+    "default_user_translation_dir",
     "load_sidecar",
     "render_standard_json",
     "render_tag_txt",

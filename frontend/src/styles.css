@@ -1085,6 +1085,9 @@ button.tm-pill:disabled { cursor: default; }
 .tm-toolbar-hint { margin: 0; color: var(--subtle); font-size: 11px; }
 .tm-display-bar { display: grid; gap: 6px; margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--line); }
 .tm-toolbar-warning { display: flex; align-items: center; gap: 5px; color: var(--amber, #a15c00); }
+.tm-translate { display: inline-flex; align-items: center; gap: 8px; min-width: 0; }
+.tm-translate-hint { color: var(--subtle); font-size: 11px; }
+.tm-translate-error { color: var(--amber, #a15c00); }
 .tm-card-tags { display: flex; flex-wrap: wrap; gap: 3px; padding: 0 8px 8px; }
 .tm-card-tags .tm-pill { min-height: 18px; padding: 1px 6px; font-size: 10px; }
 .tm-card-tags-more { align-self: center; color: var(--subtle); font-size: 10px; }

@@ -11,6 +11,7 @@ from .contracts import (
     ImageEditRequest,
     ImageFilter,
     NlTranslateRequest,
+    TagTranslateRequest,
     TranslationLookupRequest,
 )
 from .service import TagManagerError, TagManagerService
@@ -182,6 +183,13 @@ def create_tag_manager_router(service: TagManagerService) -> APIRouter:
     @router.post("/translations/lookup")
     async def lookup_translations(request: TranslationLookupRequest):
         return service.lookup_translations(request)
+
+    @router.post("/translations/translate")
+    async def translate_tags(request: TagTranslateRequest):
+        try:
+            return await service.translate_tags(request)
+        except TagManagerError as exc:
+            raise _error(exc) from exc
 
     @router.post("/nl/translate")
     async def translate_nl(request: NlTranslateRequest):

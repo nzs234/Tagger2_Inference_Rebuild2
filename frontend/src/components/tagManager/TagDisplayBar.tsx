@@ -2,13 +2,17 @@ import { Languages } from 'lucide-react'
 import { tagManagerApi, type TagManagerProfile } from '../../lib/tagManager'
 import { useQuery } from '@tanstack/react-query'
 import { usePreferences } from '../../store/app'
+import { TranslateMissingButton } from './TranslateMissingButton'
 
 /**
  * Display preferences for booru tags. The separator switch is not cosmetic:
  * the active style is also the spelling written back to the sidecar on save,
  * which matches BooruDatasetTagManager's behaviour.
  */
-export function TagDisplayBar({ profile }: { profile: TagManagerProfile }) {
+export function TagDisplayBar({ profile, missingTags }: {
+  profile: TagManagerProfile
+  missingTags?: string[]
+}) {
   const bilingual = usePreferences((state) => state.bilingualTags)
   const setBilingual = usePreferences((state) => state.setBilingualTags)
   const tagStyle = usePreferences((state) => state.tagStyle)
@@ -53,6 +57,7 @@ export function TagDisplayBar({ profile }: { profile: TagManagerProfile }) {
           ? '空格模式下保存时标签以空格写入 sidecar'
           : '下划线模式下保存时标签以下划线写入 sidecar'}
       </span>
+      {missingTags != null && <TranslateMissingButton profile={profile} tags={missingTags} />}
     </div>
     {dictionaryMissing && <p className="tm-toolbar-hint tm-toolbar-warning">
       <Languages size={13} aria-hidden="true" />
