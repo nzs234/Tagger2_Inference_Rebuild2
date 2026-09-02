@@ -1,5 +1,5 @@
-"""LM Studio provider alias."""
+"""LM Studio provider alias (canonical module: ``lm_studio``)."""
 
-from .client import LMStudioProvider
+from .lm_studio import LMStudioProvider
 
 __all__ = ["LMStudioProvider"]

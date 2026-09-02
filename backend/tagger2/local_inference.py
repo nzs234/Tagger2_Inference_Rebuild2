@@ -18,6 +18,7 @@ from typing import Any, Callable, Iterable, Mapping, Protocol, Sequence
 import numpy as np
 from PIL import Image
 
+from .common import empty_cuda_cache, is_out_of_memory
 from .model_registry import ModelBackend, ModelRecord, ModelRegistry
 from .preprocessing import preprocess_batch, preprocess_image
 from .schemas import TagItem
@@ -609,7 +610,7 @@ class LocalInferenceEngine:
                 offset += len(chunk)
                 prefetched = next_prefetched
             except Exception as exc:
-                if not _is_out_of_memory(exc) or current_batch <= 1:
+                if not is_out_of_memory(exc) or current_batch <= 1:
                     raise
                 if prefetched is not None:
                     prefetched.cancel()
@@ -617,7 +618,7 @@ class LocalInferenceEngine:
                     next_prefetched.cancel()
                 prefetched = None
                 current_batch = max(1, current_batch // 2)
-                _empty_cuda_cache()
+                empty_cuda_cache()
         return output
 
     def predict_raw_batch(
@@ -660,7 +661,7 @@ class LocalInferenceEngine:
                 offset += len(chunk)
                 prefetched = next_prefetched
             except Exception as exc:
-                if not _is_out_of_memory(exc) or current_batch <= 1:
+                if not is_out_of_memory(exc) or current_batch <= 1:
                     raise
                 if prefetched is not None:
                     prefetched.cancel()
@@ -668,7 +669,7 @@ class LocalInferenceEngine:
                     next_prefetched.cancel()
                 prefetched = None
                 current_batch = max(1, current_batch // 2)
-                _empty_cuda_cache()
+                empty_cuda_cache()
         return np.concatenate(results, axis=0)
 
     def _submit_preprocess(self, images: Sequence[Any], record: ModelRecord):
@@ -736,12 +737,16 @@ class LocalInferenceEngine:
         shared = [image if isinstance(image, Image.Image) else _load_pil(image) for image in images]
         tag_batches = self.predict_batch(model_id, shared, **kwargs)
         loaded = self.ensure_loaded(model_id)
+        # Classifier batches fall back to 4, matching main.py's classifier path
+        # (``config.get("batch_size", 4)``); prediction batches keep their own
+        # larger default.
+        classifier_batch = max(1, int(kwargs.get("batch_size") or 4))
         classifier_batches = (
             _run_classifier_batch(
                 loaded.classifier,
                 shared,
                 tag_batches,
-                batch_size=max(1, int(kwargs.get("batch_size") or 16)),
+                batch_size=classifier_batch,
             )
             if run_classifier and loaded.classifier is not None
             else [{} for _ in shared]
@@ -793,11 +798,13 @@ class LocalInferenceEngine:
 
         classifier_batches: list[dict[str, Any]] = [{} for _ in shared]
         for hook, attached_models in classifier_groups.values():
+            # Same classifier fallback as predict_batch_results: 4, to match
+            # main.py's ``config.get("batch_size", 4)`` classifier default.
             values = _run_classifier_batch(
                 hook,
                 shared,
                 merged_batches,
-                batch_size=max(1, int(predict_kwargs.get("batch_size") or 16)),
+                batch_size=max(1, int(predict_kwargs.get("batch_size") or 4)),
             )
             for index, value in enumerate(values):
                 for model_id in attached_models:
@@ -872,7 +879,7 @@ class LocalInferenceEngine:
             del runtime
         self.registry.mark_loaded(model_id, False)
         gc.collect()
-        _empty_cuda_cache()
+        empty_cuda_cache()
         return True
 
     def unload_all(self) -> None:
@@ -1167,91 +1174,6 @@ def _is_pickle_restriction_error(exc: Exception) -> bool:
     )
 
 
-def _is_out_of_memory(exc: BaseException) -> bool:
-    return "out of memory" in str(exc).casefold()
-
-
-def _empty_cuda_cache() -> None:
-    try:
-        import torch
-
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-    except Exception:
-        pass
-
-
-class TaggerInference:
-    """Small compatibility facade for direct single-directory use.
-
-    New code should share a :class:`LocalInferenceEngine`; this facade exists
-    for scripts that previously instantiated one tagger per model directory.
-    """
-
-    def __init__(
-        self,
-        model_path: str | os.PathLike[str],
-        *,
-        device: str | None = None,
-        use_onnx: bool = False,
-        adapter_type: str = "none",
-        adapter_path: str | os.PathLike[str] | None = None,
-        adapter_scale: float = 1.0,
-        allow_unsafe_pickle: bool = False,
-        model_factory: Callable[[ModelRecord], Any] | None = None,
-    ):
-        path = Path(model_path).expanduser().resolve(strict=False)
-        root = path.parent if path.is_file() else path
-        self.registry = ModelRegistry([root])
-        backend = ModelBackend.ONNX if use_onnx else None
-        self.record = self.registry.register(path, backend=backend, trusted=allow_unsafe_pickle)
-        self.engine = LocalInferenceEngine(
-            self.registry,
-            device=device,
-            allow_unsafe_pickle=allow_unsafe_pickle,
-            max_loaded_models=1,
-            model_factory=model_factory,
-        )
-        self.engine.load(
-            self.record.model_id,
-            adapter_type=adapter_type,
-            adapter_path=adapter_path,
-            adapter_scale=adapter_scale,
-        )
-
-    @property
-    def thresholds(self) -> dict[str, float]:
-        return dict(self.record.thresholds)
-
-    @property
-    def tag_names(self) -> list[str]:
-        return list(self.record.tags)
-
-    def predict_items(self, image: Any, **kwargs: Any) -> list[TagItem]:
-        return self.engine.predict(self.record.model_id, image, **kwargs)
-
-    def predict_raw(self, image: Any) -> np.ndarray:
-        return self.engine.predict_raw(self.record.model_id, image)
-
-    def predict(self, image: Any, **kwargs: Any) -> dict[str, list[tuple[str, float]]]:
-        grouped: dict[str, list[tuple[str, float]]] = {}
-        for item in self.predict_items(image, **kwargs):
-            grouped.setdefault(item.category, []).append((item.text, float(item.score or 0.0)))
-        return grouped
-
-    def predict_batch(self, images: Sequence[Any], **kwargs: Any) -> list[dict[str, list[tuple[str, float]]]]:
-        output: list[dict[str, list[tuple[str, float]]]] = []
-        for items in self.engine.predict_batch(self.record.model_id, images, **kwargs):
-            grouped: dict[str, list[tuple[str, float]]] = {}
-            for item in items:
-                grouped.setdefault(item.category, []).append((item.text, float(item.score or 0.0)))
-            output.append(grouped)
-        return output
-
-    def unload(self) -> None:
-        self.engine.unload_all()
-
-
 __all__ = [
     "InferenceError",
     "UnsafeModelError",
@@ -1267,7 +1189,6 @@ __all__ = [
     "InferenceEngine",
     "normalize_tag_name",
     "merge_predictions",
-    "TaggerInference",
 ]
 
 

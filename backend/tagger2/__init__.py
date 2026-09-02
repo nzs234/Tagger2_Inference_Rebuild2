@@ -8,7 +8,6 @@ from .local_inference import (
     InferenceError,
     LocalInferenceEngine,
     ModelLoadError,
-    TaggerInference,
     UnsafeModelError,
     merge_predictions,
 )
@@ -38,7 +37,6 @@ __all__ = [
     "UnsafeModelError",
     "AdapterError",
     "LocalInferenceEngine",
-    "TaggerInference",
     "merge_predictions",
     "ModelBackend",
     "ModelRecord",

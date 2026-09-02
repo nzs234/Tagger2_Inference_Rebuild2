@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import tempfile
@@ -11,8 +10,10 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Mapping, Protocol, Sequence
 
 from .anima import ANIMA_SCHEMA_VERSION, AnimaPayload, anima_dict, normalize_anima_payload
+from .common import sha256_bytes as hash_bytes
 from .config import DEFAULT_IMAGE_EXTENSIONS
 from .schemas import TagItem
+from .security import sha256_file as hash_file
 from .storage import ArtifactRecord, config_digest
 
 
@@ -71,16 +72,9 @@ class ArtifactWriteResult:
     txt_hash: str | None
 
 
-def hash_file(path: str | Path, *, chunk_size: int = 1024 * 1024) -> str:
-    digest = hashlib.sha256()
-    with Path(path).open("rb") as stream:
-        while chunk := stream.read(chunk_size):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def hash_bytes(value: bytes) -> str:
-    return hashlib.sha256(value).hexdigest()
+# ``hash_file`` and ``hash_bytes`` are re-exports of the shared implementations
+# (security.sha256_file / common.sha256_bytes); both names remain part of this
+# module's public surface via ``__all__``.
 
 
 def hash_config(value: Mapping[str, Any]) -> str:

@@ -3,15 +3,14 @@
 from __future__ import annotations
 
 import contextlib
-import hashlib
 import json
 import sqlite3
 import threading
 import uuid
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator, Mapping, Sequence
 
+from ..common import sha256_bytes as hash_bytes, utc_now
 from ..storage import canonical_json, config_digest
 
 
@@ -19,14 +18,6 @@ JOB_STATES = frozenset({"queued", "running", "cancelling", "cancelled", "succeed
 ATTEMPT_STATES = frozenset({"pending", "running", "succeeded", "failed", "cancelled"})
 TERMINAL_STATES = frozenset({"cancelled", "succeeded", "partial", "failed"})
 IMAGE_GENERATION_SCHEMA_VERSION = 1
-
-
-def utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
-
-
-def hash_bytes(data: bytes) -> str:
-    return hashlib.sha256(data).hexdigest()
 
 
 def _json(value: str | None, default: Any = None) -> Any:

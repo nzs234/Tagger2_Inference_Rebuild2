@@ -13,6 +13,7 @@ from typing import Any, Literal, Protocol, TypedDict, cast
 
 from PIL import Image, ImageOps
 
+from .common import empty_cuda_cache, is_out_of_memory
 from .schemas import TagItem
 
 
@@ -282,10 +283,10 @@ class _Lse14Backend:
                     )
                 offset += len(chunk)
             except Exception as exc:
-                if not _is_out_of_memory(exc) or current_batch <= 1:
+                if not is_out_of_memory(exc) or current_batch <= 1:
                     raise
                 current_batch = max(1, current_batch // 2)
-                _empty_cuda_cache()
+                empty_cuda_cache()
         return output
 
     def _siglip_features(self, images: Sequence[Image.Image]) -> Any:
@@ -508,7 +509,7 @@ def _resolve_device(requested: str, torch: Any) -> str:
 def _inference_issue(exc: Exception) -> ClassifierError:
     if isinstance(exc, ClassifierError):
         return exc
-    if _is_out_of_memory(exc):
+    if is_out_of_memory(exc):
         return ClassifierError(
             "classifier_out_of_memory",
             "The LSE14 aesthetic scorer ran out of device memory.",
@@ -520,23 +521,9 @@ def _inference_issue(exc: Exception) -> ClassifierError:
     )
 
 
-def _is_out_of_memory(exc: BaseException) -> bool:
-    return "out of memory" in str(exc).casefold()
-
-
-def _empty_cuda_cache() -> None:
-    try:
-        import torch
-
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-    except Exception:
-        pass
-
-
 def _collect_model_memory() -> None:
     gc.collect()
-    _empty_cuda_cache()
+    empty_cuda_cache()
 
 
 __all__ = [

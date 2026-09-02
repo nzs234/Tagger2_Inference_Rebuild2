@@ -1,4 +1,4 @@
-﻿"""Classification snapshot resource: official e621/Danbooru tag data.
+"""Classification snapshot resource: official e621/Danbooru tag data.
 
 The Classify stage needs three official tables: the tag list with categories,
 the alias table and the implication table. The resource catalog is

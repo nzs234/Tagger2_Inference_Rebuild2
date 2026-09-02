@@ -9,9 +9,10 @@ import sqlite3
 import threading
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator, Mapping, Sequence
+
+from .common import canonical_json, utc_now
 
 
 JOB_STATES = frozenset(
@@ -31,14 +32,6 @@ VALID_TRANSITIONS: dict[str, set[str]] = {
     "failed": {"queued"},
     "interrupted": {"queued", "running", "cancelling", "cancelled", "failed"},
 }
-
-
-def utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
-
-
-def canonical_json(value: Any) -> str:
-    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
 
 
 def config_digest(value: Mapping[str, Any] | str) -> str:

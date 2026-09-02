@@ -1,4 +1,4 @@
-﻿"""
+"""
 OCR stage for Dataset Workflow.
 
 Ported from: Anima Dataset Workflow (source project)

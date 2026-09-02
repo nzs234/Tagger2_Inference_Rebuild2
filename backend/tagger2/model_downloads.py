@@ -7,23 +7,19 @@ import re
 import threading
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import unquote, urlsplit
 
 from huggingface_hub import snapshot_download
 
+from .common import utc_now
 from .model_registry import ModelRegistry, ModelRegistryError
 
 
 _REPO_PART = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$")
 _REVISION = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$")
 _TERMINAL = frozenset({"succeeded", "failed"})
-
-
-def utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
 
 
 def parse_huggingface_url(value: str) -> tuple[str, str | None]:
