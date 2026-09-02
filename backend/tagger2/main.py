@@ -497,6 +497,21 @@ class Runtime:
             provider_profiles=self.storage.get_provider_profile,
             secrets=self.secrets,
         )
+        from .tag_manager import (
+            TagDatabase,
+            TagManagerService,
+            TagManagerStore,
+            ThumbnailService,
+            default_tag_manager_database_path,
+        )
+
+        tag_manager_data_dir = settings.data_dir or settings.project_root / "data"
+        self.tag_manager = TagManagerService(
+            store=TagManagerStore(default_tag_manager_database_path()),
+            allowlist=self.allowlist,
+            thumbnails=ThumbnailService(tag_manager_data_dir / "tag_manager" / "thumbnails"),
+            tag_database=TagDatabase(),
+        )
         self.job_manager = JobManager(self.storage)
         self.job_manager.register_processor("local", self.local_processor)
         self.job_manager.register_batch_processor("local", self.local_batch_processor)
@@ -2942,6 +2957,14 @@ def create_app(settings: AppConfig | None = None) -> FastAPI:
     )
     app.include_router(
         create_image_generation_router(runtime.image_generation),
+        dependencies=[Depends(authorize)],
+    )
+    # Tag manager module.  Same mounting rules: before the SPA catch-all and
+    # behind the shared authorize dependency.
+    from .tag_manager.api import create_tag_manager_router
+
+    app.include_router(
+        create_tag_manager_router(runtime.tag_manager),
         dependencies=[Depends(authorize)],
     )
 

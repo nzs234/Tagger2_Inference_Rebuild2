@@ -126,6 +126,7 @@ class TagManagerStore:
 
     def _init_file_db(self) -> None:
         with self.connection() as conn:
+            conn.executescript(SCHEMA_SQL)
             row = conn.execute(
                 "SELECT version FROM schema_migrations ORDER BY version DESC LIMIT 1"
             ).fetchone()

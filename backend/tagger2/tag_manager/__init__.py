@@ -26,6 +26,9 @@ from .sidecar_io import (
     render_tags_json,
 )
 from .storage import TagManagerStore, default_tag_manager_database_path
+from .service import TagManagerError, TagManagerService
+from .tag_db import TagDatabase, TagDatabaseError, TagInfo
+from .thumbnails import ThumbnailError, ThumbnailService
 
 __all__ = [
     "BatchOperationRequest",
@@ -37,9 +40,16 @@ __all__ = [
     "SidecarContent",
     "SidecarKind",
     "StandardJsonContent",
+    "TagDatabase",
+    "TagDatabaseError",
     "TagEdit",
+    "TagInfo",
+    "TagManagerError",
+    "TagManagerService",
     "TagManagerStore",
     "TagsJsonContent",
+    "ThumbnailError",
+    "ThumbnailService",
     "dedup_tags",
     "default_tag_manager_database_path",
     "load_sidecar",

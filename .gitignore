@@ -48,3 +48,8 @@ test-results/
 .idea/
 Thumbs.db
 Desktop.ini
+
+# Local generated outputs / session data
+output_baihu_gen/
+generated_baihu/
+.zcode/
