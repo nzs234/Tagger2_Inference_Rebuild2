@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tagger2-inference-rebuild"
-version = "1.6.0"
+version = "1.6.1"
 description = "Local and online image tagging workspace"
 requires-python = ">=3.12"
 dependencies = [
