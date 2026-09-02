@@ -62,7 +62,9 @@ function authHeaders(): HeadersInit {
   return token ? { Authorization: `Bearer ${token}` } : {}
 }
 
-async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
+/** Shared JSON request helper. Feature modules (e.g. tagManager) reuse it so
+ * error-envelope handling stays in exactly one place. */
+export async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   const headers = new Headers(init.headers)
   if (!(init.body instanceof FormData) && init.body !== undefined) {
     headers.set('Content-Type', 'application/json')

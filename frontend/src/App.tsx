@@ -9,6 +9,7 @@ const ImageGeneration = lazy(() => import('./pages/ImageGeneration').then((modul
 const VideoPrompts = lazy(() => import('./pages/VideoPrompts').then((module) => ({ default: module.VideoPrompts })))
 const BatchJobs = lazy(() => import('./pages/BatchJobs').then((module) => ({ default: module.BatchJobs })))
 const DatasetWorkflow = lazy(() => import('./pages/DatasetWorkflow').then((module) => ({ default: module.DatasetWorkflow })))
+const TagManager = lazy(() => import('./pages/TagManager').then((module) => ({ default: module.TagManager })))
 const Providers = lazy(() => import('./pages/Providers').then((module) => ({ default: module.Providers })))
 const Models = lazy(() => import('./pages/Models').then((module) => ({ default: module.Models })))
 const Settings = lazy(() => import('./pages/Settings').then((module) => ({ default: module.Settings })))
@@ -21,6 +22,7 @@ export default function App() {
     {page === 'video-prompts' && <VideoPrompts />}
     {page === 'batch' && <BatchJobs />}
     {page === 'dataset-workflow' && <DatasetWorkflow />}
+    {page === 'tag-manager' && <TagManager />}
     {page === 'providers' && <Providers />}
     {page === 'models' && <Models />}
     {page === 'settings' && <Settings />}

@@ -1,7 +1,7 @@
 import { expect, test, type Page } from '@playwright/test'
 import path from 'node:path'
 
-const pages = ['工作台', '图像生成', '视频提示词', '批量任务', '数据集工作流', '在线模型', '本地模型', '设置'] as const
+const pages = ['工作台', '图像生成', '视频提示词', '批量任务', '数据集工作流', '标签管理', '在线模型', '本地模型', '设置'] as const
 
 test.beforeEach(async ({ page }) => {
   await mockApi(page)
@@ -1103,7 +1103,7 @@ function imageJob(state: string) {
 }
 
 function routeSlug(name: typeof pages[number]) {
-  return ({ 工作台: 'workbench', 图像生成: 'image-generation', 视频提示词: 'video-prompts', 批量任务: 'batch', 数据集工作流: 'dataset-workflow', 在线模型: 'providers', 本地模型: 'models', 设置: 'settings' })[name]
+  return ({ 工作台: 'workbench', 图像生成: 'image-generation', 视频提示词: 'video-prompts', 批量任务: 'batch', 数据集工作流: 'dataset-workflow', 标签管理: 'tag-manager', 在线模型: 'providers', 本地模型: 'models', 设置: 'settings' })[name]
 }
 
 function fl2vaPromptPackage() {

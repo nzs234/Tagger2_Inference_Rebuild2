@@ -1,4 +1,4 @@
-export type AppPage = 'workbench' | 'image-generation' | 'video-prompts' | 'batch' | 'dataset-workflow' | 'providers' | 'models' | 'settings'
+export type AppPage = 'workbench' | 'image-generation' | 'video-prompts' | 'batch' | 'dataset-workflow' | 'tag-manager' | 'providers' | 'models' | 'settings'
 export type ThemeMode = 'light' | 'dark' | 'system'
 export type JobMode = 'local' | 'online'
 export type JobState =
