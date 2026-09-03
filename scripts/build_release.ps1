@@ -327,9 +327,14 @@ try {
     '-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----'
   ) -join '|'
   # Bundled third-party package sources include intentionally token-shaped test
-  # fixtures. Scan every project-controlled release file, but not site-packages.
+  # fixtures. Scan every project-controlled release file, but not site-packages
+  # and not binary databases: the shipped wiki databases hold public-corpus
+  # content, and binary noise decoded as text would only produce false hits.
   $credentialFiles = Get-ChildItem -LiteralPath $stage -File -Recurse -Force |
-    Where-Object { $_.FullName -notlike (Join-Path $stage "runtime\Lib\site-packages\*") }
+    Where-Object {
+      $_.FullName -notlike (Join-Path $stage "runtime\Lib\site-packages\*") -and
+      $_.Extension -ne ".sqlite3"
+    }
   $credentialHits = $credentialFiles |
     Select-String -Pattern $credentialPattern -ErrorAction SilentlyContinue
   if ($credentialHits) {
