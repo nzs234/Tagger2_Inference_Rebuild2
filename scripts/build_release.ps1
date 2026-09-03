@@ -254,6 +254,12 @@ try {
     }
     $resourceFiles = Get-ChildItem -LiteralPath $sourceCategory -File |
       Where-Object { $_.Extension -ne ".csv" }
+    if ($category -in @("classify", "tokenizer")) {
+      # Model-class blobs download on first use (scripts/fetch_workflow_resources.py
+      # or the app itself); only their manifests ship so the fetcher knows the
+      # exact filename and fingerprint to verify.
+      $resourceFiles = $resourceFiles | Where-Object { $_.Name -like "*.manifest.json" }
+    }
     if (-not $resourceFiles) {
       throw "Required release resource category is empty: data/workflows/resources/$category"
     }

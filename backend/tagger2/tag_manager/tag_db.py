@@ -254,9 +254,17 @@ class TagDatabase:
 
         path = self._catalog.get_resource_path(resource_id)
         if path is None:
-            raise TagDatabaseError(
-                f"classification snapshot resource {resource_id!r} is not available"
-            )
+            # Model-class blobs are not packaged: the first consumer starts the
+            # background fetch and callers surface progress until it lands.
+            from ..workflow.resource_fetch import manager_for
+
+            state = manager_for(self._catalog).get_or_start(resource_id)
+            if state.state != "ready" or state.path is None:
+                raise TagDatabaseError(
+                    f"分类快照资源 {resource_id!r} 尚不可用（{state.progress_text()}）"
+                    "；下载完成后重试，或手动导入资源文件"
+                )
+            path = state.path
         try:
             raw = path.read_bytes()
         except OSError as exc:

@@ -96,7 +96,7 @@ Tagger2 Inference Rebuild 将本地 Caption 模型、在线视觉模型、多供
 5. 等待便携 Python 和锁定依赖安装完成，浏览器访问 `http://127.0.0.1:20000`。
 6. 以后启动只需双击 `start.bat`。
 
-发行包内置基础 Python 3.12 运行时和已经构建的前端，不要求目标电脑预装 Python 或 Node.js。首次安装机器学习依赖需要联网，下载量可能达到数 GB。
+发行包内置基础 Python 3.12 运行时和已经构建的前端，不要求目标电脑预装 Python 或 Node.js。首次安装机器学习依赖需要联网，下载量可能达到数 GB。模型类资源（嵌入模型、数据集分类快照等）一律不随包：按需在首次使用时自动下载并校验指纹；分类快照等数据集资源也可用 `runtime\python.exe scripts\fetch_workflow_resources.py` 预取。
 
 V1.04.1 起，`setup.bat` 会检查 pip 是否真正可用，并在基础运行时中自动执行随包附带的 pip 引导；`start.bat` 也提供相同兜底。首次部署不需要手动安装 pip。
 

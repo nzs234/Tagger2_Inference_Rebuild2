@@ -164,8 +164,15 @@ async def _execute_job_async(ctx: WorkflowRouteContext, job_id: str) -> None:
 
         def freeze_resource(resource_id: str) -> None:
             manifest = resource_catalog.get_manifest(resource_id)
-            if manifest is None or resource_catalog.get_resource_path(resource_id) is None:
+            path = resource_catalog.get_resource_path(resource_id)
+            if manifest is None:
                 raise ValueError(f"resource digest verification failed: {resource_id}")
+            if path is None:
+                # Model-class blobs download on first use; job threads can
+                # afford to wait so the pass simply takes longer on first run.
+                from .resource_fetch import manager_for
+
+                path = manager_for(resource_catalog).ensure(resource_id)
             resource_fingerprints[resource_id] = manifest.resource_fingerprint
             frozen_manifests[resource_id] = dict(manifest.__dict__)
 

@@ -239,8 +239,13 @@ def _token_counter_for_config(ctx: WorkflowRouteContext, config: WorkflowJobConf
         raise ValueError("token budget is enabled but no tokenizer resource is configured")
     manifest = resource_catalog.get_manifest(resource_id)
     path = resource_catalog.get_resource_path(resource_id)
-    if manifest is None or manifest.category != "tokenizer" or path is None:
+    if manifest is None or manifest.category != "tokenizer":
         raise ValueError(f"tokenizer resource is unavailable: {resource_id}")
+    if path is None:
+        # Tokenizer packs are not packaged either; fetch on first use.
+        from .resource_fetch import manager_for
+
+        path = manager_for(resource_catalog).ensure(resource_id)
     from .tokenizer_resource import load_tokenizer_counter
 
     return load_tokenizer_counter(path)

@@ -12,18 +12,21 @@
   xAI Grok Image 与兼容线路；图像任务数据库和产物目录在首次使用时创建。
 - `update.bat`：用于 Git 检出目录的安全 fast-forward；发行 ZIP 本身不包含 `.git`，
   ZIP 用户应从 GitHub Releases 下载新版并迁移本地配置、模型、缓存和数据目录。
-- e621 分类快照：`classify-e621-20260812-v1`
-  - fingerprint：`eccfdfacf3bcf1611a9ee3561f54bb81e946122f582f1f421c5e90689f2db49f`
-- e621 标签替换索引：
+- 数据集工作流资源 **manifests**（仅清单，模型类大文件不随包）：
+  - 分类快照：`classify-e621-20260812-v1`（e621）、`classify-danbooru-20260902-v1`（danbooru）
+  - Tokenizer：`tokenizer-qwen3-0-6b-tokenizer-v1`
+- e621 标签替换索引（数据表，随包）：
   - `e621-replacement-index-v1`（旧版，保留兼容性）
   - `replace-e621-index-v1`（旧版，保留兼容性）
   - `replace-e621-pass-drop-v2`（推荐；原 `pass` 全部转换为 `drop`）
     - fingerprint：`2e3c4af6cc93b7f2cc8e55e2eda024ee69942f08a3618b6c2f0dfe6d45991972`
     - 规则统计：keep 47,095、replace 3,171、drop 105,440、pass 0
-- Tokenizer：`tokenizer-qwen3-0-6b-tokenizer-v1`
-  - fingerprint：`aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4`
 
 资源位于 `data/workflows/resources/`，每个资源都带有独立 manifest 和内容指纹。
+分类快照与 tokenizer 属模型类大文件（合计约 131 MB），自 V1.10 起不随包发行：首次使用时应用自动从
+[resources-v1 发行页](https://github.com/nzs234/Tagger2_Inference_Rebuild2/releases/tag/resources-v1)
+按指纹下载校验（也可提前运行 `runtime\python.exe scripts\fetch_workflow_resources.py` 预取）。
+完全离线部署可手动把对应内容寻址文件放入 `data/workflows/resources/<category>/`。
 
 ## 未包含
 
