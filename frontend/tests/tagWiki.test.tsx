@@ -2,6 +2,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { TagCloud } from '../src/components/TagCloud'
+import { clampInt } from '../src/components/tagWiki/BuildPanel'
 import { TagWiki } from '../src/pages/TagWiki'
 import type {
   AskResult,
@@ -9,6 +10,8 @@ import type {
   SearchResult,
   TagWikiStatus,
 } from '../src/lib/tagWiki'
+import { describeWikiError } from '../src/lib/tagWiki'
+import { ApiError } from '../src/lib/api'
 import { usePreferences } from '../src/store/app'
 
 const mockStatus: TagWikiStatus = {
@@ -313,5 +316,83 @@ describe('TagWiki Page & WikiDrawer', () => {
     const drawer = await screen.findByRole('dialog', { name: /solo/ })
     expect(drawer).toBeInTheDocument()
     expect(await screen.findByText('画面中仅包含一个独立主体。')).toBeInTheDocument()
+  })
+})
+
+describe('TagWiki shared helpers', () => {
+  it('maps shared wiki error codes onto Chinese guidance', () => {
+    expect(
+      describeWikiError(new ApiError('busy', 409, 'wiki_busy'), 'fallback'),
+    ).toBe('已有构建或翻译任务正在进行中，请等待其完成后再试。')
+    expect(
+      describeWikiError(new ApiError('db', 409, 'wiki_tag_db_unavailable'), 'fallback'),
+    ).toContain('本地标签数据库缺失')
+    // Unknown codes surface the backend message; non-Api errors use the fallback.
+    expect(describeWikiError(new ApiError('boom', 500, 'wiki_build_failed'), 'fallback')).toBe('boom')
+    expect(describeWikiError(new Error('x'), 'fallback')).toBe('fallback')
+  })
+
+  it('clamps panel numeric inputs into the API-accepted range', () => {
+    expect(clampInt(Number(''), 1, 50_000)).toBe(1) // cleared input reads as 0
+    expect(clampInt(0, 1, 50_000)).toBe(1)
+    expect(clampInt(99_999, 1, 50_000)).toBe(50_000)
+    expect(clampInt(2.6, 0, 1_000_000)).toBe(3)
+    expect(clampInt(Number.NaN, 0, 1_000_000)).toBe(0)
+  })
+})
+
+describe('TagWiki lookup card section state', () => {
+  it('resets expanded sections when the lookup target changes', async () => {
+    const duoResult: LookupResult = {
+      query: 'duo',
+      resolved: true,
+      tag: {
+        name: 'duo',
+        category: 'general',
+        post_count: 900_000,
+        alias_of: null,
+        translation: '双人',
+      },
+      implications: [],
+      page: {
+        title: 'duo',
+        wiki_id: 102,
+        updated_at: '2026-09-01T12:00:00Z',
+        url: null,
+        summary: null,
+        sections: [
+          { heading: 'Overview', text: 'Two characters are present in the image.' },
+          { heading: 'Usage Guidelines', text: 'Use duo instead of duo_focus when only two characters exist.' },
+        ],
+        related_tags: ['group'],
+      },
+    }
+    const json = (body: unknown, status = 200) =>
+      new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } })
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input: RequestInfo | URL) => {
+      const url = new URL(String(input), 'http://localhost')
+      if (url.pathname.endsWith('/tag-wiki/status')) return json(mockStatus)
+      if (url.pathname.endsWith('/tag-wiki/lookup')) {
+        const tag = url.searchParams.get('tag')
+        return json(tag === 'duo' ? duoResult : mockLookupResult)
+      }
+      return json({})
+    })
+
+    renderTagWikiPage()
+
+    fireEvent.change(screen.getByLabelText('标签名称'), { target: { value: 'solo' } })
+    fireEvent.click(screen.getByRole('button', { name: '查询' }))
+    const soloUsage = await screen.findByRole('button', { name: 'Usage Guidelines' })
+    expect(soloUsage).toHaveAttribute('aria-expanded', 'false')
+
+    fireEvent.click(soloUsage)
+    expect(soloUsage).toHaveAttribute('aria-expanded', 'true')
+
+    // Following a related tag swaps the card; the new card must start with
+    // its sections collapsed instead of inheriting the previous state.
+    fireEvent.click(screen.getByRole('button', { name: 'duo' }))
+    const duoUsage = await screen.findByRole('button', { name: 'Usage Guidelines' })
+    await waitFor(() => expect(duoUsage).toHaveAttribute('aria-expanded', 'false'))
   })
 })

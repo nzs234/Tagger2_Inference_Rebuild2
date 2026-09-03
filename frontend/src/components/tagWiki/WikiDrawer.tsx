@@ -1,8 +1,7 @@
 import { useEffect, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { BookOpen, LoaderCircle, X } from 'lucide-react'
-import { ApiError } from '../../lib/api'
-import { tagWikiApi, type LookupResult } from '../../lib/tagWiki'
+import { describeWikiError, tagWikiApi, type LookupResult } from '../../lib/tagWiki'
 import { DialogLayer, IconButton, Notice } from '../ui'
 import { LookupResultCard } from './ResultCards'
 
@@ -35,14 +34,9 @@ export function WikiDrawer({
   const error = lookupQuery.error
   const result = lookupQuery.data
 
-  let errorMessage: string | null = null
-  if (error) {
-    if (error instanceof ApiError && error.code === 'wiki_not_built') {
-      errorMessage = 'Wiki 数据库尚未构建。请前往「Tag Wiki」页面先点击「下载/更新 Wiki 数据」。'
-    } else {
-      errorMessage = error instanceof ApiError ? error.message : '查询 Wiki 失败'
-    }
-  }
+  const errorMessage: string | null = error
+    ? describeWikiError(error, '查询 Wiki 失败')
+    : null
 
   return (
     <DialogLayer onClose={onClose}>
@@ -81,6 +75,7 @@ export function WikiDrawer({
 
           {result && (
             <LookupResultCard
+              key={result.query}
               result={result}
               compact
               onTagClick={(newTag) => setCurrentTag(newTag)}

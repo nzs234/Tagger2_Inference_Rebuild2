@@ -1347,4 +1347,6 @@ button.tm-pill:disabled, .tm-pill[role="button"][aria-disabled="true"] { cursor:
 .tm-wiki-lookup input:focus { border-color: var(--accent); outline: none; box-shadow: 0 0 0 3px rgb(var(--accent-rgb) / 12%); }
 .tm-wiki-lookup button { display: inline-flex; align-items: center; gap: 4px; height: 30px; padding: 0 10px; border: 1px solid var(--line-strong); border-radius: 6px; background: var(--surface); color: var(--ink); font-size: 12px; cursor: pointer; }
 .tm-wiki-lookup button:hover { background: var(--surface-2); border-color: var(--accent); }
+.tm-wiki-lookup button:disabled { opacity: 0.5; cursor: not-allowed; }
+.tm-wiki-lookup button:disabled:hover { background: var(--surface); border-color: var(--line-strong); }
 

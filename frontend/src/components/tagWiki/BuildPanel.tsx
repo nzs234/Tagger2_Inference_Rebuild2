@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   AlertTriangle,
@@ -10,8 +10,13 @@ import {
   LoaderCircle,
   RefreshCw,
 } from 'lucide-react'
-import { ApiError } from '../../lib/api'
-import { tagWikiApi, type TagWikiStatus, type TranslateRequest, type TranslateStatus } from '../../lib/tagWiki'
+import {
+  describeWikiError,
+  tagWikiApi,
+  type TagWikiStatus,
+  type TranslateRequest,
+  type TranslateStatus,
+} from '../../lib/tagWiki'
 import { Button, Notice, ProgressBar } from '../ui'
 
 const PHASE_LABELS: Record<string, string> = {
@@ -23,23 +28,9 @@ const PHASE_LABELS: Record<string, string> = {
   done: '构建完成',
 }
 
-/** Map the shared error envelope's 409 codes onto actionable Chinese guidance. */
-function describeWikiError(err: unknown, fallback: string): string {
-  if (err instanceof ApiError) {
-    switch (err.code) {
-      case 'wiki_busy':
-        return '已有构建或翻译任务正在进行中，请等待其完成后再试。'
-      case 'wiki_embed_model_unavailable':
-        return 'Embedding 向量模型尚未下载或不可用，无法构建索引。请检查网络连接后重试。'
-      case 'wiki_ask_unavailable':
-        return '未配置在线模型：批量翻译需要在线 LLM，请先前往「在线模型」页配置 Provider。'
-      case 'wiki_tag_db_unavailable':
-        return '本地标签数据库缺失，请先完成标签库构建后再执行该操作。'
-      default:
-        return err.message
-    }
-  }
-  return fallback
+export const clampInt = (value: number, min: number, max: number) => {
+  const base = Number.isFinite(value) ? value : min
+  return Math.min(max, Math.max(min, Math.round(base)))
 }
 
 export function BuildPanel() {
@@ -69,15 +60,35 @@ export function BuildPanel() {
   const status = statusQuery.data
   const isTranslating = status?.translate?.state === 'running'
 
+  // Adopt the server-configured default threshold (config [tag_wiki]) once it
+  // is known; the effect only re-runs when that configured value changes.
+  const configuredMinPostCount = status?.index?.min_post_count
+  useEffect(() => {
+    if (typeof configuredMinPostCount === 'number' && configuredMinPostCount >= 0) {
+      setMinPostCount(configuredMinPostCount)
+    }
+  }, [configuredMinPostCount])
+
   // Dedicated fine-grained progress poll for the translate job; the aggregate
   // /status response above already covers the build pipeline.
   const translateProgressQuery = useQuery<TranslateStatus>({
     queryKey: ['tag-wiki', 'translate-progress'],
     queryFn: tagWikiApi.translateProgress,
     enabled: Boolean(isTranslating),
-    refetchInterval: 2000,
+    // Stop as soon as this endpoint itself stops reporting a running job
+    // instead of hard-polling for up to a status-refresh interval.
+    refetchInterval: (query) => (query.state.data?.state === 'running' ? 2000 : false),
     retry: 1,
   })
+
+  // The moment the fine-grained poll sees the job finish, refresh the
+  // aggregate status so isTranslating flips and the poll stays disabled.
+  const progressState = translateProgressQuery.data?.state
+  useEffect(() => {
+    if (progressState && progressState !== 'running') {
+      void queryClient.invalidateQueries({ queryKey: ['tag-wiki', 'status'] })
+    }
+  }, [progressState, queryClient])
 
   const buildMutation = useMutation({
     mutationFn: () => tagWikiApi.build({ download_dump: downloadDump, reindex, force_reembed: forceReembed }),
@@ -95,7 +106,7 @@ export function BuildPanel() {
       tagWikiApi.translate({
         scope,
         min_post_count: scope === 'popular' ? minPostCount : undefined,
-        max_pages: maxPages > 0 ? maxPages : undefined,
+        max_pages: maxPages,
       }),
     onSuccess: (data) => {
       queryClient.setQueryData<TagWikiStatus>(['tag-wiki', 'status'], (old) => {
@@ -297,7 +308,7 @@ export function BuildPanel() {
                     step={100}
                     value={minPostCount}
                     disabled={isBuilding || isTranslating || translateMutation.isPending}
-                    onChange={(e) => setMinPostCount(Number(e.target.value))}
+                    onChange={(e) => setMinPostCount(clampInt(Number(e.target.value), 0, 1_000_000))}
                     style={{ width: '90px' }}
                   />
                 </label>
@@ -313,7 +324,7 @@ export function BuildPanel() {
                   step={100}
                   value={maxPages}
                   disabled={isBuilding || isTranslating || translateMutation.isPending}
-                  onChange={(e) => setMaxPages(Number(e.target.value))}
+                  onChange={(e) => setMaxPages(clampInt(Number(e.target.value), 1, 50_000))}
                 />
               </label>
 

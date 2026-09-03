@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useRef, useState } from 'react'
 import { useMutation } from '@tanstack/react-query'
 import {
   AlertCircle,
@@ -13,9 +13,10 @@ import {
 import { BuildPanel } from '../components/tagWiki/BuildPanel'
 import { ChunkHitCard, LookupResultCard, WikiTagPill } from '../components/tagWiki/ResultCards'
 import { Button, Notice, Panel } from '../components/ui'
-import { ApiError } from '../lib/api'
 import {
+  describeWikiError,
   tagWikiApi,
+  wikiErrorCode,
   type AskResult,
   type LookupResult,
   type SearchResult,
@@ -23,6 +24,8 @@ import {
 import { usePreferences } from '../store/app'
 
 type WikiMode = 'lookup' | 'search' | 'ask'
+
+const TAB_ORDER: WikiMode[] = ['lookup', 'search', 'ask']
 
 export function TagWiki() {
   const [mode, setMode] = useState<WikiMode>('lookup')
@@ -43,94 +46,34 @@ export function TagWiki() {
 
   const [generalError, setGeneralError] = useState<{ message: string; code?: string } | null>(null)
 
+  // Out-of-order response guard: a fast stale response must never overwrite a
+  // newer one when the user fires queries back to back. Only the request with
+  // the latest sequence number may land.
+  const lookupSeq = useRef(0)
+  const searchSeq = useRef(0)
+  const askSeq = useRef(0)
+
   const setPage = usePreferences((state) => state.setPage)
 
   /** Surface the shared error envelope: show the backend's Chinese message and
    * special-case the 409 wiki codes with actionable guidance. */
   const handleError = (err: unknown, defaultMsg: string) => {
-    if (err instanceof ApiError) {
-      switch (err.code) {
-        case 'wiki_not_built':
-          setGeneralError({
-            code: 'wiki_not_built',
-            message: 'Wiki 数据库尚未构建。请先在上方「构建面板」中点击「下载/更新 Wiki 数据」。',
-          })
-          return
-        case 'wiki_busy':
-          setGeneralError({
-            code: 'wiki_busy',
-            message: '已有构建或翻译任务正在进行中，请等待其完成后再试。',
-          })
-          return
-        case 'wiki_ask_unavailable':
-          setGeneralError({
-            code: 'wiki_ask_unavailable',
-            message: '未配置或启用在线模型：AI 问答需要在线 LLM Provider。请前往「在线模型」页面配置。',
-          })
-          return
-        case 'wiki_search_unavailable':
-          setGeneralError({
-            code: 'wiki_search_unavailable',
-            message: '检索未就绪：尚未生成向量索引。请在上方构建面板重新构建索引。',
-          })
-          return
-        case 'wiki_embed_model_unavailable':
-          setGeneralError({
-            code: 'wiki_embed_model_unavailable',
-            message: 'Embedding 向量模型不可用，请检查本地模型缓存或网络连接。',
-          })
-          return
-        case 'wiki_tag_db_unavailable':
-          setGeneralError({
-            code: 'wiki_tag_db_unavailable',
-            message: '本地标签数据库缺失，无法解析标签分类。请先完成标签库构建后再试。',
-          })
-          return
-        default:
-          setGeneralError({ code: err.code, message: err.message })
-      }
-    } else {
-      setGeneralError({ message: defaultMsg })
-    }
+    setGeneralError({ code: wikiErrorCode(err) ?? undefined, message: describeWikiError(err, defaultMsg) })
   }
 
   // Lookup mutation
   const lookupMutation = useMutation({
     mutationFn: (tag: string) => tagWikiApi.lookup(tag),
-    onSuccess: (data) => {
-      setLookupResult(data)
-      setGeneralError(null)
-    },
-    onError: (err) => {
-      setLookupResult(null)
-      handleError(err, '查询标签 Wiki 失败')
-    },
   })
 
   // Search mutation
   const searchMutation = useMutation({
     mutationFn: () => tagWikiApi.search({ query: searchQuery.trim(), top_k: searchTopK }),
-    onSuccess: (data) => {
-      setSearchResult(data)
-      setGeneralError(null)
-    },
-    onError: (err) => {
-      setSearchResult(null)
-      handleError(err, '语义搜索失败')
-    },
   })
 
   // Ask mutation
   const askMutation = useMutation({
     mutationFn: () => tagWikiApi.ask({ query: askQuery.trim(), top_k: askTopK }),
-    onSuccess: (data) => {
-      setAskResult(data)
-      setGeneralError(null)
-    },
-    onError: (err) => {
-      setAskResult(null)
-      handleError(err, 'AI 问答失败')
-    },
   })
 
   const runLookup = (tag: string) => {
@@ -139,12 +82,66 @@ export function TagWiki() {
     setLookupInput(trimmed)
     setMode('lookup')
     setGeneralError(null)
-    lookupMutation.mutate(trimmed)
+    const seq = ++lookupSeq.current
+    lookupMutation.mutate(trimmed, {
+      onSuccess: (data) => {
+        if (seq !== lookupSeq.current) return
+        setLookupResult(data)
+        setGeneralError(null)
+      },
+      onError: (err) => {
+        if (seq !== lookupSeq.current) return
+        setLookupResult(null)
+        handleError(err, '查询标签 Wiki 失败')
+      },
+    })
+  }
+
+  const runSearch = () => {
+    if (!searchQuery.trim() || searchMutation.isPending) return
+    const seq = ++searchSeq.current
+    searchMutation.mutate(undefined, {
+      onSuccess: (data) => {
+        if (seq !== searchSeq.current) return
+        setSearchResult(data)
+        setGeneralError(null)
+      },
+      onError: (err) => {
+        if (seq !== searchSeq.current) return
+        setSearchResult(null)
+        handleError(err, '语义搜索失败')
+      },
+    })
+  }
+
+  const runAsk = () => {
+    if (!askQuery.trim() || askMutation.isPending) return
+    const seq = ++askSeq.current
+    askMutation.mutate(undefined, {
+      onSuccess: (data) => {
+        if (seq !== askSeq.current) return
+        setAskResult(data)
+        setGeneralError(null)
+      },
+      onError: (err) => {
+        if (seq !== askSeq.current) return
+        setAskResult(null)
+        handleError(err, 'AI 问答失败')
+      },
+    })
   }
 
   const maxScore = searchResult?.items.length
     ? Math.max(...searchResult.items.map((it) => it.score), 0.001)
     : 1
+
+  const focusAdjacentTab = (delta: number) => {
+    const idx = TAB_ORDER.indexOf(mode)
+    const next = TAB_ORDER[(idx + delta + TAB_ORDER.length) % TAB_ORDER.length] ?? 'lookup'
+    setMode(next)
+    setGeneralError(null)
+    document.getElementById(`tw-tab-${next}`)?.focus()
+  }
 
   return (
     <div className="tag-wiki-page">
@@ -164,8 +161,14 @@ export function TagWiki() {
           <button
             type="button"
             role="tab"
+            id="tw-tab-lookup"
             aria-selected={mode === 'lookup'}
+            aria-controls="tw-pane-lookup"
             className={`tw-tab-btn ${mode === 'lookup' ? 'tw-tab-active' : ''}`}
+            onKeyDown={(e) => {
+              if (e.key === 'ArrowRight') focusAdjacentTab(1)
+              else if (e.key === 'ArrowLeft') focusAdjacentTab(-1)
+            }}
             onClick={() => {
               setMode('lookup')
               setGeneralError(null)
@@ -177,8 +180,14 @@ export function TagWiki() {
           <button
             type="button"
             role="tab"
+            id="tw-tab-search"
             aria-selected={mode === 'search'}
+            aria-controls="tw-pane-search"
             className={`tw-tab-btn ${mode === 'search' ? 'tw-tab-active' : ''}`}
+            onKeyDown={(e) => {
+              if (e.key === 'ArrowRight') focusAdjacentTab(1)
+              else if (e.key === 'ArrowLeft') focusAdjacentTab(-1)
+            }}
             onClick={() => {
               setMode('search')
               setGeneralError(null)
@@ -190,8 +199,14 @@ export function TagWiki() {
           <button
             type="button"
             role="tab"
+            id="tw-tab-ask"
             aria-selected={mode === 'ask'}
+            aria-controls="tw-pane-ask"
             className={`tw-tab-btn ${mode === 'ask' ? 'tw-tab-active' : ''}`}
+            onKeyDown={(e) => {
+              if (e.key === 'ArrowRight') focusAdjacentTab(1)
+              else if (e.key === 'ArrowLeft') focusAdjacentTab(-1)
+            }}
             onClick={() => {
               setMode('ask')
               setGeneralError(null)
@@ -225,7 +240,12 @@ export function TagWiki() {
 
         {/* Tab 1: 查含义 */}
         {mode === 'lookup' && (
-          <div className="tw-tab-pane">
+          <div
+            className="tw-tab-pane"
+            role="tabpanel"
+            id="tw-pane-lookup"
+            aria-labelledby="tw-tab-lookup"
+          >
             <form
               className="tw-lookup-form"
               onSubmit={(e) => {
@@ -261,6 +281,7 @@ export function TagWiki() {
 
             {lookupResult && !lookupMutation.isPending && (
               <LookupResultCard
+                key={lookupResult.query}
                 result={lookupResult}
                 onTagClick={(tag) => runLookup(tag)}
               />
@@ -277,12 +298,17 @@ export function TagWiki() {
 
         {/* Tab 2: 语义搜索 */}
         {mode === 'search' && (
-          <div className="tw-tab-pane">
+          <div
+            className="tw-tab-pane"
+            role="tabpanel"
+            id="tw-pane-search"
+            aria-labelledby="tw-tab-search"
+          >
             <form
               className="tw-search-form"
               onSubmit={(e) => {
                 e.preventDefault()
-                if (searchQuery.trim()) searchMutation.mutate()
+                runSearch()
               }}
             >
               <div className="tw-textarea-wrap">
@@ -380,12 +406,17 @@ export function TagWiki() {
 
         {/* Tab 3: AI 问答 */}
         {mode === 'ask' && (
-          <div className="tw-tab-pane">
+          <div
+            className="tw-tab-pane"
+            role="tabpanel"
+            id="tw-pane-ask"
+            aria-labelledby="tw-tab-ask"
+          >
             <form
               className="tw-ask-form"
               onSubmit={(e) => {
                 e.preventDefault()
-                if (askQuery.trim()) askMutation.mutate()
+                runAsk()
               }}
             >
               <div className="tw-textarea-wrap">

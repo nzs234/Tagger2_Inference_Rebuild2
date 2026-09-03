@@ -1,4 +1,4 @@
-import { request } from './api'
+import { ApiError, request } from './api'
 
 // --- Tag Wiki Types (mirrors backend/tagger2/tag_wiki/contracts.py) ---
 
@@ -113,6 +113,7 @@ export interface WikiIndexStatus {
   dimension: number | null
   fts_enabled: boolean
   search_ready: boolean
+  min_post_count?: number
 }
 
 export interface TagWikiStatus {
@@ -149,6 +150,32 @@ export interface AskRequest {
 }
 
 // --- Tag Wiki API Client ---
+
+/** Human-readable Chinese guidance per shared wiki error code. */
+const WIKI_ERROR_GUIDANCE: Record<string, string> = {
+  wiki_not_built: 'Wiki 数据库尚未构建。请前往「Tag Wiki」页面在构建面板中点击「下载/更新 Wiki 数据」。',
+  wiki_busy: '已有构建或翻译任务正在进行中，请等待其完成后再试。',
+  wiki_ask_unavailable: '未配置或启用在线模型：AI 问答需要在线 LLM Provider。请前往「在线模型」页面配置。',
+  wiki_search_unavailable: '检索未就绪：尚未生成向量索引。请在构建面板重新构建索引。',
+  wiki_embed_model_unavailable: 'Embedding 向量模型不可用，请检查本地模型缓存或网络连接。',
+  wiki_tag_db_unavailable: '本地标签数据库缺失，无法解析标签分类。请先完成标签库构建后再试。',
+  wiki_ask_failed: 'AI 生成失败，请稍后重试或更换在线模型。',
+  wiki_search_failed: '检索失败，请稍后重试。',
+  wiki_lookup_failed: '查询失败，请稍后重试。',
+}
+
+/** Map the shared error envelope's wiki codes onto actionable Chinese guidance. */
+export function describeWikiError(err: unknown, fallback: string): string {
+  if (err instanceof ApiError) {
+    return WIKI_ERROR_GUIDANCE[err.code] ?? err.message
+  }
+  return fallback
+}
+
+/** The backend error code, for callers that branch on it (e.g. setup hints). */
+export function wikiErrorCode(err: unknown): string | null {
+  return err instanceof ApiError ? err.code : null
+}
 
 export const tagWikiApi = {
   status: () => request<TagWikiStatus>('/tag-wiki/status'),
