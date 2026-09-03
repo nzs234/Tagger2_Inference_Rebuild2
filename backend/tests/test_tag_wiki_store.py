@@ -8,7 +8,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from tagger2.tag_wiki.wiki_store import WikiStore, normalize_title
+from tagger2.tag_wiki.wiki_store import WikiStore, is_link_soup, normalize_title
 
 
 def _page(title: str, **overrides: object) -> dict[str, object]:
@@ -87,6 +87,51 @@ def test_delete_chunks_for_pages_removes_and_invalidates(tmp_path: Path):
     ids, _matrix = store.load_embedding_matrix()
     assert len(ids) == 1
     store.close()
+
+
+def test_delete_link_soup_chunks_drops_link_lists(tmp_path: Path):
+    """Chunks that are nothing but links/placeholders go; prose chunks and pages stay."""
+
+    store = WikiStore(tmp_path / "wiki.sqlite3")
+    url_list = (
+        '* "FurAffinity":https://www.furaffinity.net/user/stub\n'
+        '* "Twitter":https://x.com/stub\n'
+        '* "Bluesky":https://bsky.app/profile/stub'
+    )
+    bare_url = "https://www.pixiv.net/member_illust.php"
+    thumbs = "thumb #5481584 thumb #5521572 thumb #5529707"
+    two_links = "Links: https://one.example/x and https://two.example/y only."
+    store.upsert_page(_page("stub_page", body_md=url_list, sections=[{"heading": "", "text": url_list}]))
+    store.upsert_page(_page("bare_url_page", body_md=bare_url, sections=[{"heading": "", "text": bare_url}]))
+    store.upsert_page(_page("thumbs_page", body_md=thumbs, sections=[{"heading": "", "text": thumbs}]))
+    store.upsert_page(_page("prose_page", sections=[{"heading": "", "text": "a hug between two characters"}]))
+    store.upsert_page(_page("few_links_page", sections=[{"heading": "", "text": two_links}]))
+
+    removed = store.delete_link_soup_chunks()
+    assert removed == 3
+    assert store.get_page("stub_page") is not None  # the page itself stays
+    assert store.get_page("stub_page")["sections"] == []
+    assert store.get_page("bare_url_page")["sections"] == []
+    assert store.get_page("thumbs_page")["sections"] == []
+    assert store.get_page("prose_page")["sections"] != []
+    assert store.get_page("few_links_page")["sections"] != []  # residual prose keeps it
+    assert [hit["text"] for hit in store.search_text("furaffinity", limit=5)] == []
+    # Idempotent.
+    assert store.delete_link_soup_chunks() == 0
+    store.close()
+
+
+def test_is_link_soup_classifies_shapes():
+    """Unit coverage for the shared link-soup predicate."""
+
+    assert is_link_soup("https://www.pixiv.net/member_illust.php")
+    assert is_link_soup('* "FA":https://a.example/1\n* "TW":https://b.example/2\n* "BS":https://c.example/3')
+    assert is_link_soup("thumb #5481584 thumb #5521572")
+    assert is_link_soup('"Deviantart":http://dementra369.deviantart.com/ "Tumblr":https://rezident369.tumblr.com/')
+    # Prose that merely mentions links stays.
+    assert not is_link_soup("A character hugs another character from behind them, torsos aligned.")
+    assert not is_link_soup("See the official thread at https://example.com/thread for details.")
+    assert not is_link_soup("Links: https://one.example/x and https://two.example/y only.")
 
 
 def test_normalize_title_casefolds_and_underscores():

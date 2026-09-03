@@ -32,7 +32,7 @@ import httpx
 
 from ..workflow.contracts import utc_now
 from .contracts import MAX_CHUNK_CHARS, MIN_CHUNK_CHARS, ERROR_WIKI_BUILD_FAILED
-from .wiki_store import WikiStore, normalize_title
+from .wiki_store import WikiStore, is_link_soup, normalize_title
 
 DUMP_LIST_URL = "https://e621.net/db_export/"
 
@@ -411,8 +411,9 @@ def parse_dtext_sections(
         text = strip_dtext(raw_text)
         for chunk in _split_paragraph_chunks(text, max_chunk_chars):
             stripped = chunk.strip()
-            if min_chunk_chars > 0 and not _is_substantive(stripped, min_chunk_chars):
-                continue
+            if min_chunk_chars > 0:
+                if not _is_substantive(stripped, min_chunk_chars) or is_link_soup(stripped):
+                    continue
             sections.append({"heading": section_heading, "text": stripped})
     return sections
 

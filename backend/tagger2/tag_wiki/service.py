@@ -74,7 +74,7 @@ _WIKI_PROFILE = "e621"
 # prose. Their chunks are removed at build time: e5 embeds URL soup into
 # vectors that crowd real action-tag prose out of every semantic query. The
 # pages themselves stay for exact lookup.
-EXCLUDED_SEARCH_CATEGORIES = frozenset({"artist", "character"})
+EXCLUDED_SEARCH_CATEGORIES = frozenset({"artist", "character", "contributor", "invalid"})
 
 # Ask-mode context budget: chunks are already short (MAX_CHUNK_CHARS), but a
 # wide top_k must not push the prompt past small local models.
@@ -382,10 +382,14 @@ class TagWikiService:
             raise TagWikiError(f"获取 wiki 数据失败：{exc}", code="wiki_build_failed", status_code=502, retryable=True) from exc
 
     def _prune_unsearchable_chunks_sync(self) -> int:
-        """Delete chunks of artist/character pages (link-list bodies).
+        """Delete chunks that are useless for semantic search.
 
-        Idempotent and cheap enough to run on every build. Silently skipped
-        when the tag database (category source) is unavailable.
+        Two idempotent sweeps, both cheap enough for every build: category
+        based (artist/character/contributor/invalid pages, per the tag
+        database) and shape based (chunks that are nothing but external-URL
+        lines, which also catches stub pages missing from the tag database).
+        The category sweep is skipped when the tag database is unavailable;
+        the shape sweep never needs it.
         """
 
         excluded: list[str] = []
@@ -393,12 +397,12 @@ class TagWikiService:
             try:
                 info = self.tag_database.lookup(_WIKI_PROFILE, title)
             except TagDatabaseError:
-                return 0
+                excluded = []
+                break
             if info is not None and str(info["category"]) in EXCLUDED_SEARCH_CATEGORIES:
                 excluded.append(title)
-        if not excluded:
-            return 0
-        return self.store.delete_chunks_for_pages(excluded)
+        pruned = self.store.delete_chunks_for_pages(excluded) if excluded else 0
+        return pruned + self.store.delete_link_soup_chunks()
 
     def _embed_pending_sync(self, force: bool) -> int:
         """Embed every chunk with a NULL embedding; returns the count."""
@@ -483,8 +487,12 @@ class TagWikiService:
         return {"query": request.query, "items": hits, "suggested_tags": suggested}
 
     async def _search_hits(self, query: str, top_k: int) -> list[dict[str, Any]]:
+        # Over-fetch so the category filter below still yields a full page of
+        # results when link-list stubs sneak into the raw ranking (pages
+        # missing from the tag database, categories drifting between builds).
+        fetch_k = min(top_k * 3, 150)
         try:
-            raw_hits = await asyncio.to_thread(self._get_searcher().search, query, top_k=top_k)
+            raw_hits = await asyncio.to_thread(self._get_searcher().search, query, top_k=fetch_k)
         except WikiSearchError as exc:
             raise TagWikiError(
                 str(exc),
@@ -504,7 +512,12 @@ class TagWikiService:
             hit["tag"] = self._ref_from_info(profile, info) if info is not None else None
             summary = self.store.get_summary(name)
             hit["summary"] = summary
-        return hits
+        hits = [
+            hit
+            for hit in hits
+            if not self._is_excluded_category(str(hit.get("page_title", "")))
+        ]
+        return hits[:top_k]
 
     async def ask(self, request: AskRequest) -> dict[str, Any]:
         self._require_data()

@@ -139,26 +139,76 @@ HUG_TAG_DB = FakeTagDatabase(
         "rare": _info("rare", post_count=50),
         "some_artist": _info("some_artist", category="artist", post_count=900),
         "some_char": _info("some_char", category="character", post_count=800),
+        "some_modeler": _info("some_modeler", category="contributor", post_count=700),
+        "dead_tag": _info("dead_tag", category="invalid", post_count=10),
     },
     implications={"hug": ["kiss"]},
 )
 
 
 async def test_prune_unsearchable_chunks(tmp_path: Path) -> None:
-    """Artist/character page chunks are dropped; general pages stay searchable."""
+    """Link-list category pages (artist/character/contributor/invalid) lose
+    their chunks; general pages stay searchable."""
 
     store = WikiStore(tmp_path / "tag_wiki.sqlite3")
     seed_page(store, "hug")
     seed_page(store, "kiss")
     seed_page(store, "some_artist")
     seed_page(store, "some_char")
+    seed_page(store, "some_modeler")
+    seed_page(store, "dead_tag")
     service = make_service(tmp_path, store=store, tag_database=HUG_TAG_DB)
     pruned = service._prune_unsearchable_chunks_sync()
-    assert pruned == 2
+    assert pruned == 4
     assert store.get_page("some_artist")["sections"] == []
+    assert store.get_page("some_modeler")["sections"] == []
+    assert store.get_page("dead_tag")["sections"] == []
     assert store.get_page("hug")["sections"] != []
     result = await service.search(SearchRequest(query="hugging", top_k=8))
     assert {hit["page_title"] for hit in result["items"]} <= {"hug", "kiss"}
+
+
+async def test_prune_drops_url_list_chunks(tmp_path: Path) -> None:
+    """Uncategorized stub pages whose bodies are pure link lists are pruned
+    by shape, without needing a tag-database category."""
+
+    store = WikiStore(tmp_path / "tag_wiki.sqlite3")
+    url_list = (
+        '* "FurAffinity":https://www.furaffinity.net/user/stub\n'
+        '* "Twitter":https://x.com/stub\n'
+        '* "Bluesky":https://bsky.app/profile/stub'
+    )
+    bare_url = "https://www.pixiv.net/member_illust.php"
+    two_links = "See the artist's https://example.com/a and https://example.com/b pages."
+    seed_page(store, "some_stub", heading="", text=url_list)
+    seed_page(store, "bare_url_stub", heading="", text=bare_url)
+    seed_page(store, "two_links", heading="", text=two_links)
+    seed_page(store, "hug")
+    service = make_service(tmp_path, store=store, tag_database=HUG_TAG_DB)
+    pruned = service._prune_unsearchable_chunks_sync()
+    assert pruned == 2
+    # The stub pages stay for exact lookup, but their link-soup chunks are gone.
+    assert store.get_page("some_stub")["sections"] == []
+    assert store.get_page("bare_url_stub")["sections"] == []
+    assert store.get_page("two_links")["sections"] != []
+    assert store.get_page("hug")["sections"] != []
+
+
+async def test_search_filters_excluded_categories(tmp_path: Path) -> None:
+    """Hits from excluded categories are dropped at query time even when
+    their chunks were not pruned (stale index, category drift)."""
+
+    store = WikiStore(tmp_path / "tag_wiki.sqlite3")
+    seed_page(store, "hug")
+    seed_page(store, "some_artist")
+    seed_page(store, "some_modeler")
+    service = make_service(tmp_path, store=store, tag_database=HUG_TAG_DB)
+    result = await service.search(SearchRequest(query="hugging", top_k=8))
+    titles = {hit["page_title"] for hit in result["items"]}
+    assert "some_artist" not in titles
+    assert "some_modeler" not in titles
+    assert "hug" in titles
+    assert {tag["name"] for tag in result["suggested_tags"]} <= {"hug"}
 
 
 async def test_translate_scope_excludes_link_list_pages(tmp_path: Path) -> None:

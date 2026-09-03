@@ -312,7 +312,7 @@ Count Review 确认后只叠加人工 count，再执行 Policy；Token Review �
 - **本地数据**：wiki 正文来自 e621 官方 `db_export` 的 `wiki_pages` 每日导出（约 17 MB），应用内一键下载、解析 DText 并增量入库到 `data/tag_wiki/tag_wiki.sqlite3`；tag 类别、post_count、别名与 implications 复用分类快照资源。
 - **三种查询模式**：
   - **查含义**：tag → 别名归一 → 中文摘要 + 英文原文 + implications 搭配提示 + 相关 tag。
-  - **语义搜索**：中文/自然语言描述 → multilingual-e5 跨语言向量检索与 FTS5 关键词检索做 RRF 融合，返回相关 tag 与 wiki 依据；画师/角色类纯链接页面在构建时剪枝，避免污染排序。
+  - **语义搜索**：中文/自然语言描述 → multilingual-e5 跨语言向量检索与 FTS5 关键词检索做 RRF 融合，返回相关 tag 与 wiki 依据；画师/角色/贡献者类链接列表页与"链接汤"章节在构建时剪枝，避免污染排序。
   - **AI 问答**：本地检索提供上下文，已配置的在线大模型生成带来源的中文回答（RAG），无可用 Provider 时给出引导。
 - **中文摘要预翻译**：为高频 tag（默认 post_count ≥ 1000，可切换模型词表/全部）批量生成结构化摘要（含义/用法/搭配/注意事项），支持在线 Provider 或本地 GPU LLM 两条路径，断点续跑。
 - **快捷入口**：标签管理器与工作台的标签药丸上有“查 Wiki”按钮，弹出抽屉直接查看该标签的中文释义与搭配。

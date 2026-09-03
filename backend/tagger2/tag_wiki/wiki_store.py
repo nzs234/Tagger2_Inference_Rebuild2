@@ -10,6 +10,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import json
+import re
 import sqlite3
 import threading
 from collections.abc import Iterator, Mapping, Sequence
@@ -21,6 +22,34 @@ import numpy as np
 from ..workflow.contracts import utc_now
 
 SCHEMA_VERSION = 1
+
+_URL_PATTERN = re.compile(r"https?://\S+")
+_THUMB_PATTERN = re.compile(r"\bthumb\s*#\d+\b")
+_WORD_PATTERN = re.compile(r"[A-Za-z0-9]{2,}")
+
+
+def is_link_soup(text: str, *, max_urls: int = 2, min_words: int = 3) -> bool:
+    """Whether a chunk carries nothing but external links and placeholders.
+
+    Wiki dumps are full of ``"Site":https://...`` link lists, bare page URLs
+    and e621 ``thumb #id`` reference lines. e5 embeds that soup into vectors
+    that sit closer to every query than real prose does, so such chunks are
+    excluded from the index. Text without any links or placeholders is never
+    soup; when links are present, the residual text left after stripping
+    them must still read like prose (``min_words`` word tokens) for the
+    chunk to be kept, and anything with more than ``max_urls`` URLs is soup
+    outright.
+    """
+
+    urls = _URL_PATTERN.findall(text)
+    thumbs = _THUMB_PATTERN.findall(text)
+    if len(urls) > max_urls:
+        return True
+    if not urls and not thumbs:
+        return False
+    residual = _THUMB_PATTERN.sub(" ", _URL_PATTERN.sub(" ", text))
+    return len(_WORD_PATTERN.findall(residual)) < min_words
+
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -523,9 +552,9 @@ class WikiStore:
         """Delete every chunk belonging to the given pages; return the count.
 
         Used by the build pipeline to drop chunks of pages that are useless
-        for semantic search (artist/character pages whose bodies are link
-        lists). The pages themselves stay; the FTS rows follow via trigger
-        and the embedding matrix cache is invalidated.
+        for semantic search (artist/character/contributor pages whose bodies
+        are link lists). The pages themselves stay; the FTS rows follow via
+        trigger and the embedding matrix cache is invalidated.
         """
 
         titles = [normalize_title(str(title)) for title in page_titles]
@@ -542,6 +571,33 @@ class WikiStore:
                 cursor = conn.execute(
                     f"DELETE FROM chunks WHERE page_title IN ({placeholders})",
                     batch,
+                )
+                affected += int(cursor.rowcount or 0)
+        self._embedding_matrix_cache = None
+        return affected
+
+    def delete_link_soup_chunks(self) -> int:
+        """Delete chunks whose body is nothing but links and placeholders.
+
+        Contributor pages, uncategorized stub pages and reference sections
+        keep nothing but ``"Site":https://...`` lines, bare URLs and
+        ``thumb #id`` tokens; e5 embeds that soup into vectors that crowd
+        real prose out of semantic search. Pages stay and FTS rows follow
+        via trigger. Idempotent; invalidates the embedding matrix cache.
+        """
+
+        with self.connection() as conn:
+            doomed = [
+                int(row["id"])
+                for row in conn.execute("SELECT id, body FROM chunks")
+                if is_link_soup(str(row["body"]))
+            ]
+            affected = 0
+            for start in range(0, len(doomed), 500):
+                batch = doomed[start : start + 500]
+                placeholders = ",".join("?" for _ in batch)
+                cursor = conn.execute(
+                    f"DELETE FROM chunks WHERE id IN ({placeholders})", batch
                 )
                 affected += int(cursor.rowcount or 0)
         self._embedding_matrix_cache = None

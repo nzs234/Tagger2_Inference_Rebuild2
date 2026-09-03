@@ -352,6 +352,28 @@ def test_parse_dtext_sections_drops_junk_fragments():
     assert len(parse_dtext_sections(body, min_chunk_chars=0)) == 4
 
 
+def test_parse_dtext_sections_drops_link_soup():
+    """URL lists, bare page URLs and thumb placeholders never become chunks;
+    prose that merely mentions a link survives."""
+
+    body = (
+        "h2. Links\n"
+        '* "FurAffinity":https://www.furaffinity.net/user/stub\n'
+        '* "Twitter":https://x.com/stub\n'
+        '* "Bluesky":https://bsky.app/profile/stub\n'
+        "h2. Bare\n"
+        "https://www.pixiv.net/member_illust.php\n"
+        "h2. Thumbs\n"
+        "thumb #5481584 thumb #5521572 thumb #5529707\n"
+        "h2. Real\n"
+        "References the official https://example.com/thread discussion."
+    )
+    sections = parse_dtext_sections(body)
+    assert sections == [
+        {"heading": "Real", "text": "References the official https://example.com/thread discussion."}
+    ]
+
+
 def test_parse_dtext_sections_splits_long_sections_by_paragraph():
     """Sections over the cap split at \\n\\n boundaries under the same heading."""
 
