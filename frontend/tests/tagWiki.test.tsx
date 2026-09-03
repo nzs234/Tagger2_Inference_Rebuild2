@@ -2,7 +2,6 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { TagCloud } from '../src/components/TagCloud'
-import { clampInt } from '../src/components/tagWiki/BuildPanel'
 import { TagWiki } from '../src/pages/TagWiki'
 import type {
   AskResult,
@@ -10,7 +9,7 @@ import type {
   SearchResult,
   TagWikiStatus,
 } from '../src/lib/tagWiki'
-import { describeWikiError } from '../src/lib/tagWiki'
+import { clampInt, describeWikiError } from '../src/lib/tagWiki'
 import { ApiError } from '../src/lib/api'
 import { usePreferences } from '../src/store/app'
 

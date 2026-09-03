@@ -11,6 +11,7 @@ import {
   RefreshCw,
 } from 'lucide-react'
 import {
+  clampInt,
   describeWikiError,
   tagWikiApi,
   type TagWikiStatus,
@@ -26,11 +27,6 @@ const PHASE_LABELS: Record<string, string> = {
   model: '正在准备 Embedding 向量模型…',
   embed: '正在生成向量索引…',
   done: '构建完成',
-}
-
-export const clampInt = (value: number, min: number, max: number) => {
-  const base = Number.isFinite(value) ? value : min
-  return Math.min(max, Math.max(min, Math.round(base)))
 }
 
 export function BuildPanel() {

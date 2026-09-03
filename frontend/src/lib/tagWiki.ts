@@ -172,6 +172,11 @@ export function describeWikiError(err: unknown, fallback: string): string {
   return fallback
 }
 
+export const clampInt = (value: number, min: number, max: number) => {
+  const base = Number.isFinite(value) ? value : min
+  return Math.min(max, Math.max(min, Math.round(base)))
+}
+
 /** The backend error code, for callers that branch on it (e.g. setup hints). */
 export function wikiErrorCode(err: unknown): string | null {
   return err instanceof ApiError ? err.code : null

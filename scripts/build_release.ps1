@@ -204,7 +204,9 @@ try {
     "docs/V1.05_RELEASE_NOTES.md",
     "docs/V1.06_RELEASE_NOTES.md",
     "docs/V1.06.1_RELEASE_NOTES.md",
+    "docs/V1.10_RELEASE_NOTES.md",
     "docs/tag_manager.md",
+    "docs/tag_wiki.md",
     "docs/release_package_contents.md",
     "docs/workflow_manual_paths.md",
     "docs/workflow_compatibility_report.md"
