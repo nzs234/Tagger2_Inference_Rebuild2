@@ -46,6 +46,21 @@ runtime\python.exe scripts\translate_tag_wiki_local.py --limit 2000 --batch-size
 
 它复用与在线任务完全相同的提示词、JSON 解析与入库逻辑（摘要记录 `provider_id=local-qwen3-4b`），按 post_count 降序覆盖高频 tag；可反复执行直至覆盖整个范围。在线与本地两条路径的译文可互相覆盖更新。
 
+## Danbooru wiki 语料（API 抓取，CLI 阶段）
+
+Danbooru 没有类似 e621 `db_export` 的打包导出，wiki 语料（全量约 23 万页）通过官方 JSON API 分页抓取（`GET /wiki_pages.json`，每页最多 1000 条）。抓取器刻意保守：请求间隔默认 2 秒、`429` 遵循 `Retry-After`、瞬时失败指数退避、`4xx` 直接失败；翻页不依赖结果排序，只用 `page=b<游标>`（id 下边界）并取每批最小 id 前进；每个批次实时追加进 JSONL 原始缓存并落盘断点，中断后重跑即从断点继续，导入永远幂等（未变化页面跳过、上游已删除页面从库中清除）。
+
+```bat
+runtime\python.exe scripts\fetch_danbooru_wiki.py                    :: 首次全量遍历，之后自动增量
+runtime\python.exe scripts\fetch_danbooru_wiki.py --max-requests 40  :: 每次只抓 40 个请求的预算，分多次跑
+runtime\python.exe scripts\fetch_danbooru_wiki.py --skip-import      :: 只抓取不导入（--skip-fetch 反之）
+runtime\python.exe scripts\fetch_danbooru_wiki.py --status
+```
+
+- **存储**：原始缓存与断点在 `data/tag_wiki/danbooru/`（`wiki_pages.jsonl` + `state.json`），页面与章节入库到独立数据库 `data/tag_wiki/tag_wiki_danbooru.sqlite3`（与 e621 库同 schema，互不影响）。
+- **增量**：全量遍历完成后记录水位（UTC 日期），后续运行只抓 `updated_at` 落在水位之后的页面；某窗口填满一页时自动按时间对半拆分，不会静默截断。需要强制重抓可传 `--since YYYY-MM-DD`。
+- **当前阶段**：仅抓取与结构化入库（页面 / 章节 / FTS5 关键词索引），e5 向量索引、中文摘要与 UI 查询（profile 切换）尚未接线；先把语料慢慢攒起来。
+
 ## 中文摘要（预翻译常用 tag）
 
 构建完成后点击「翻译中文摘要」。每个页面**一次**模型调用，生成结构化 JSON（含义 / 用法 / 搭配建议 / 注意事项 + 相关 tag 列表），存入 `summaries` 表：
@@ -79,12 +94,14 @@ runtime\python.exe scripts\translate_tag_wiki_local.py --limit 2000 --batch-size
 
 ```
 data/tag_wiki/
-├── tag_wiki.sqlite3      # pages / chunks(+向量) / page_links / summaries / FTS5
-├── downloads/            # wiki_pages-*.csv.gz 缓存（保留最新）
-└── models/               # intfloat__multilingual-e5-small 快照
+├── tag_wiki.sqlite3            # e621：pages / chunks(+向量) / page_links / summaries / FTS5
+├── tag_wiki_danbooru.sqlite3   # danbooru 镜像（同 schema，独立库）
+├── danbooru/                   # danbooru API 抓取的原始 JSONL 缓存 + state.json 断点
+├── downloads/                  # wiki_pages-*.csv.gz 缓存（保留最新）
+└── models/                     # intfloat__multilingual-e5-small 快照
 ```
 
-模块布局遵循 tag-manager 模板：`contracts.py`（pydantic 请求模型 + 响应 TypedDict）、`wiki_store.py`（SQLite，WAL + RLock + schema_migrations）、`importer.py`（下载 + DText 解析 + 增量导入）、`embedder.py`（ONNX/torch 双后端）、`searcher.py`（RRF 融合检索）、`translator.py`（摘要批任务）、`service.py`（编排 + 后台任务）、`api.py`（路由）。接线位于 `main.py` 的 `Runtime.__init__`（共享 tag 数据库与 provider 工厂，注入 `_tag_wiki_vocab`）与 `create_app`（SPA catch-all 之前挂载路由）。
+模块布局遵循 tag-manager 模板：`contracts.py`（pydantic 请求模型 + 响应 TypedDict）、`wiki_store.py`（SQLite，WAL + RLock + schema_migrations）、`importer.py`（e621 下载 + DText 解析 + 增量导入）、`danbooru_importer.py`（danbooru JSON API 分页抓取 + 增量导入）、`embedder.py`（ONNX/torch 双后端）、`searcher.py`（RRF 融合检索）、`translator.py`（摘要批任务）、`service.py`（编排 + 后台任务）、`api.py`（路由）。接线位于 `main.py` 的 `Runtime.__init__`（共享 tag 数据库与 provider 工厂，注入 `_tag_wiki_vocab`）与 `create_app`（SPA catch-all 之前挂载路由）。
 
 ## 运行参数
 
@@ -104,7 +121,7 @@ min_post_count = 1000
 ## 测试
 
 ```bash
-python -m pytest backend/tests/test_tag_wiki_store.py backend/tests/test_tag_wiki_importer.py backend/tests/test_tag_wiki_embedder.py backend/tests/test_tag_wiki_searcher.py backend/tests/test_tag_wiki_service.py -q
+python -m pytest backend/tests/test_tag_wiki_store.py backend/tests/test_tag_wiki_importer.py backend/tests/test_tag_wiki_danbooru.py backend/tests/test_tag_wiki_embedder.py backend/tests/test_tag_wiki_searcher.py backend/tests/test_tag_wiki_service.py -q
 npm --prefix frontend test -- --run
 ```
 

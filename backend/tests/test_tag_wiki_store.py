@@ -405,3 +405,44 @@ def test_close_memory_store_then_operations_raise():
 
     # Closing twice is safe (the connection handle is already cleared).
     store.close()
+
+
+def test_upsert_pages_bulk_matches_single_upsert(tmp_path: Path):
+    """The bulk path writes exactly the same rows as the per-page API."""
+
+    store = WikiStore(tmp_path / "wiki.sqlite3")
+    written = store.upsert_pages(
+        [
+            _page("hug", sections=[{"heading": "", "text": "two characters hugging"}], links=["kiss"]),
+            _page("kiss", sections=[{"heading": "", "text": "one character kissing"}]),
+        ]
+    )
+    assert written == ["hug", "kiss"]
+    assert store.page_count() == 2
+    assert store.chunk_count() == 2
+    assert store.get_page("hug")["related_tags"] == ["kiss"]  # type: ignore[index]
+
+    snapshot = store.get_pages_snapshot(["hug", "kiss", "missing_page"])
+    assert set(snapshot) == {"hug", "kiss"}
+    assert snapshot["hug"]["body_md"] == "body of hug"
+    assert store.get_pages_snapshot([]) == {}
+    store.close()
+
+
+def test_delete_page_removes_page_chunks_links_and_summary(tmp_path: Path):
+    """Deleting a page drops every dependent row and reports existence."""
+
+    store = WikiStore(tmp_path / "wiki.sqlite3")
+    store.upsert_page(_page("hug", sections=[{"heading": "", "text": "a hugging pose"}], links=["kiss"]))
+    store.upsert_summary("hug", {"meaning": "拥抱"})
+    assert store.page_count() == 1
+    assert store.chunk_count() == 1
+
+    assert store.delete_page("hug") is True
+    assert store.get_page("hug") is None
+    assert store.page_count() == 0
+    assert store.chunk_count() == 0
+    assert store.summary_count() == 0
+    assert store.delete_page("hug") is False
+    assert store.delete_page("") is False
+    store.close()

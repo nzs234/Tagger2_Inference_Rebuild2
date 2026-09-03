@@ -320,6 +320,28 @@ class WikiStore:
         Returns the normalized page title.
         """
 
+        with self.connection() as conn:
+            return self._upsert_page_on_conn(conn, page)
+
+    def upsert_pages(self, pages: Sequence[Mapping[str, Any]]) -> list[str]:
+        """Upsert many wiki pages in a single transaction; return their titles.
+
+        Bulk path for corpus-sized imports: one connection and one commit per
+        call instead of one connection per page. Every page goes through the
+        same rewrite as :meth:`upsert_page` (chunks and links replaced
+        wholesale). Returns one normalized title per input page, in order.
+        """
+
+        titles: list[str] = []
+        with self.connection() as conn:
+            for page in pages:
+                titles.append(self._upsert_page_on_conn(conn, page))
+        self._embedding_matrix_cache = None
+        return titles
+
+    def _upsert_page_on_conn(self, conn: sqlite3.Connection, page: Mapping[str, Any]) -> str:
+        """Write one page (and replace its chunks/links) on an open connection."""
+
         raw_title = str(page.get("title", ""))
         norm_title = normalize_title(raw_title)
         display_title = str(page.get("display_title", raw_title))
@@ -335,63 +357,59 @@ class WikiStore:
         sections = page.get("sections", ())
         links = page.get("links", ())
 
-        with self.connection() as conn:
+        conn.execute(
+            "INSERT INTO pages (title, display_title, body_md, wiki_id, updated_at, url, imported_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?)"
+            " ON CONFLICT(title) DO UPDATE SET"
+            "  display_title = excluded.display_title,"
+            "  body_md = excluded.body_md,"
+            "  wiki_id = excluded.wiki_id,"
+            "  updated_at = excluded.updated_at,"
+            "  url = excluded.url,"
+            "  imported_at = excluded.imported_at",
+            (
+                norm_title,
+                display_title,
+                body_md,
+                wiki_id,
+                updated_at,
+                url,
+                utc_now(),
+            ),
+        )
+
+        # Delete existing chunks and page links
+        conn.execute("DELETE FROM chunks WHERE page_title = ?", (norm_title,))
+        conn.execute("DELETE FROM page_links WHERE page_title = ?", (norm_title,))
+
+        # Insert chunks (skip empty text)
+        pos = 0
+        for sec in sections:
+            if not isinstance(sec, Mapping):
+                continue
+            heading = str(sec.get("heading", "")).strip()
+            text = str(sec.get("text", "")).strip()
+            if not text:
+                continue
+            chash = _content_hash(text)
             conn.execute(
-                "INSERT INTO pages (title, display_title, body_md, wiki_id, updated_at, url, imported_at)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?)"
-                " ON CONFLICT(title) DO UPDATE SET"
-                "  display_title = excluded.display_title,"
-                "  body_md = excluded.body_md,"
-                "  wiki_id = excluded.wiki_id,"
-                "  updated_at = excluded.updated_at,"
-                "  url = excluded.url,"
-                "  imported_at = excluded.imported_at",
-                (
-                    norm_title,
-                    display_title,
-                    body_md,
-                    wiki_id,
-                    updated_at,
-                    url,
-                    utc_now(),
-                ),
+                "INSERT INTO chunks (page_title, heading, body, position, content_hash, embedding)"
+                " VALUES (?, ?, ?, ?, ?, NULL)",
+                (norm_title, heading, text, pos, chash),
             )
+            pos += 1
 
-            # Delete existing chunks and page links
-            conn.execute("DELETE FROM chunks WHERE page_title = ?", (norm_title,))
-            conn.execute("DELETE FROM page_links WHERE page_title = ?", (norm_title,))
-
-            # Insert chunks (skip empty text)
-            pos = 0
-            for sec in sections:
-                if not isinstance(sec, Mapping):
-                    continue
-                heading = str(sec.get("heading", "")).strip()
-                text = str(sec.get("text", "")).strip()
-                if not text:
-                    continue
-                chash = _content_hash(text)
+        # Insert links
+        seen_links: set[str] = set()
+        for link in links:
+            target = normalize_title(str(link))
+            if target and target != norm_title and target not in seen_links:
+                seen_links.add(target)
                 conn.execute(
-                    "INSERT INTO chunks (page_title, heading, body, position, content_hash, embedding)"
-                    " VALUES (?, ?, ?, ?, ?, NULL)",
-                    (norm_title, heading, text, pos, chash),
+                    "INSERT OR IGNORE INTO page_links (page_title, link_title)"
+                    " VALUES (?, ?)",
+                    (norm_title, target),
                 )
-                pos += 1
-
-            # Insert links
-            seen_links: set[str] = set()
-            for link in links:
-                target = normalize_title(str(link))
-                if target and target != norm_title and target not in seen_links:
-                    seen_links.add(target)
-                    conn.execute(
-                        "INSERT OR IGNORE INTO page_links (page_title, link_title)"
-                        " VALUES (?, ?)",
-                        (norm_title, target),
-                    )
-
-        # Invalidate embedding matrix cache
-        self._embedding_matrix_cache = None
         return norm_title
 
     def get_page(self, title: str) -> dict[str, Any] | None:
@@ -437,6 +455,54 @@ class WikiStore:
             "sections": sections,
             "related_tags": related_tags,
         }
+
+    def get_pages_snapshot(self, titles: Sequence[str]) -> dict[str, dict[str, Any]]:
+        """Return ``{normalized_title: {updated_at, body_md}}`` for stored pages.
+
+        Bulk variant of the incremental-import unchanged check: one query per
+        500-title batch instead of one connection per page. Titles missing
+        from the store are absent from the result.
+        """
+
+        normalized = [normalize_title(str(title)) for title in titles]
+        normalized = [title for title in normalized if title]
+        snapshot: dict[str, dict[str, Any]] = {}
+        with self.connection() as conn:
+            for start in range(0, len(normalized), 500):
+                batch = normalized[start : start + 500]
+                placeholders = ",".join("?" for _ in batch)
+                rows = conn.execute(
+                    f"SELECT title, updated_at, body_md FROM pages WHERE title IN ({placeholders})",
+                    batch,
+                ).fetchall()
+                for row in rows:
+                    snapshot[str(row["title"])] = {
+                        "updated_at": row["updated_at"],
+                        "body_md": str(row["body_md"]),
+                    }
+        return snapshot
+
+    def delete_page(self, title: str) -> bool:
+        """Remove one page with its chunks, links and summary; return existence.
+
+        Used when an upstream wiki page is deleted (danbooru marks pages
+        ``is_deleted``). The FTS rows follow the chunk deletes via trigger and
+        the embedding matrix cache is invalidated.
+        """
+
+        norm_title = normalize_title(str(title))
+        if not norm_title:
+            return False
+        with self.connection() as conn:
+            row = conn.execute("SELECT 1 FROM pages WHERE title = ?", (norm_title,)).fetchone()
+            if row is None:
+                return False
+            conn.execute("DELETE FROM chunks WHERE page_title = ?", (norm_title,))
+            conn.execute("DELETE FROM page_links WHERE page_title = ?", (norm_title,))
+            conn.execute("DELETE FROM summaries WHERE page_title = ?", (norm_title,))
+            conn.execute("DELETE FROM pages WHERE title = ?", (norm_title,))
+        self._embedding_matrix_cache = None
+        return True
 
     # -- stats & counts -----------------------------------------------------
 
