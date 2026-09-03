@@ -7,6 +7,7 @@ pipeline test uses a synthesized dump plus a stubbed embedding model.
 
 from __future__ import annotations
 
+import asyncio
 import csv
 import gzip
 import json
@@ -209,6 +210,49 @@ async def test_search_filters_excluded_categories(tmp_path: Path) -> None:
     assert "some_modeler" not in titles
     assert "hug" in titles
     assert {tag["name"] for tag in result["suggested_tags"]} <= {"hug"}
+
+
+async def test_start_build_returns_409_while_running(tmp_path: Path) -> None:
+    """A second build while one runs is a 409 wiki_busy, not a queue."""
+
+    service = make_service(tmp_path)
+
+    async def slow_build(request: BuildRequest) -> None:
+        await asyncio.sleep(60)
+
+    service._run_build = slow_build  # type: ignore[method-assign]
+    await service.start_build(BuildRequest())
+    with pytest.raises(TagWikiError) as excinfo:
+        await service.start_build(BuildRequest())
+    assert excinfo.value.code == "wiki_busy"
+    assert excinfo.value.status_code == 409
+    await service.aclose()
+    assert service._build_task is not None
+    assert service._build_task.cancelled()
+
+
+async def test_start_translate_returns_409_while_running(tmp_path: Path) -> None:
+    """A second translate while one runs is a 409 wiki_busy."""
+
+    store = WikiStore(tmp_path / "tag_wiki.sqlite3")
+    seed_page(store, "hug")
+    provider = FakeProvider(reply=SUMMARY_REPLY)
+    service = make_service(tmp_path, store=store, tag_database=HUG_TAG_DB, provider=provider)
+
+    async def slow_translate(
+        provider: Any, provider_id: str, titles: list[str], model: str | None
+    ) -> None:
+        await asyncio.sleep(60)
+
+    service._run_translate = slow_translate  # type: ignore[method-assign]
+    await service.start_translate(TranslateRequest(scope="popular", min_post_count=0))
+    with pytest.raises(TagWikiError) as excinfo:
+        await service.start_translate(TranslateRequest(scope="popular", min_post_count=0))
+    assert excinfo.value.code == "wiki_busy"
+    assert excinfo.value.status_code == 409
+    await service.aclose()
+    assert service._translate_task is not None
+    assert service._translate_task.cancelled()
 
 
 async def test_translate_scope_excludes_link_list_pages(tmp_path: Path) -> None:

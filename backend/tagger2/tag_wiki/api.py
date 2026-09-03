@@ -48,7 +48,9 @@ def create_tag_wiki_router(service: TagWikiService) -> APIRouter:
     @router.get("/lookup")
     async def lookup(
         tag: str = Query(min_length=1, max_length=128),
-        profile: str = Query(default="e621", pattern="^(e621|danbooru)$"),
+        # The local wiki mirror is e621-only; danbooru pages would resolve in
+        # the tag database but never in the store.
+        profile: str = Query(default="e621", pattern="^e621$"),
     ):
         try:
             return await service.lookup(tag, profile=profile)

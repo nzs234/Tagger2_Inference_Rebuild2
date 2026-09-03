@@ -50,6 +50,7 @@ def _read_toml_config(config_path: Path, project_root: Path) -> dict[str, Any]:
         ("paths", paths),
         ("limits", limits),
         ("runtime", runtime),
+        ("tag_wiki", document.get("tag_wiki", {})),
     ):
         if not isinstance(section, Mapping):
             raise ValueError(f"configuration section [{name}] must be a table")
@@ -137,6 +138,17 @@ def _read_toml_config(config_path: Path, project_root: Path) -> dict[str, Any]:
     for source_name, field_name in runtime_fields.items():
         if source_name in runtime:
             values[field_name] = runtime[source_name]
+
+    tag_wiki = document.get("tag_wiki", {})
+    if not isinstance(tag_wiki, Mapping):
+        raise ValueError("configuration section [tag_wiki] must be a table")
+    tag_wiki_fields = {
+        "embed_model_repo": "tag_wiki_embed_repo",
+        "min_post_count": "tag_wiki_min_post_count",
+    }
+    for source_name, field_name in tag_wiki_fields.items():
+        if source_name in tag_wiki:
+            values[field_name] = tag_wiki[source_name]
     return values
 
 
@@ -197,6 +209,12 @@ class AppConfig(BaseModel):
     allow_unsafe_pickle: bool = False
     image_extensions: frozenset[str] = DEFAULT_IMAGE_EXTENSIONS
     roots: list[RootSettings] = Field(default_factory=list)
+
+    # [tag_wiki] — local e621 wiki mirror. The literal mirrors the feature
+    # default (tag_wiki.contracts.DEFAULT_EMBED_MODEL_REPO); config.py must
+    # not import feature modules.
+    tag_wiki_embed_repo: str = "intfloat/multilingual-e5-small"
+    tag_wiki_min_post_count: int = Field(default=1000, ge=0)
 
     @model_validator(mode="before")
     @classmethod

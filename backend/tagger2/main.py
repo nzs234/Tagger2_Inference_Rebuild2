@@ -389,9 +389,12 @@ class Runtime:
 
         self.tag_wiki = TagWikiService(
             tag_database=self.tag_manager.tag_database,
+            translations=self.tag_manager.translations,
             provider_factory=self.provider,
             provider_ids=self._enabled_provider_ids,
             vocab_provider=self._tag_wiki_vocab,
+            embed_repo=self.settings.tag_wiki_embed_repo,
+            default_min_post_count=self.settings.tag_wiki_min_post_count,
         )
         self.processors = ProcessorHost(self)
         self.job_manager = JobManager(self.storage)

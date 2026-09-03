@@ -88,7 +88,18 @@ data/tag_wiki/
 
 ## 运行参数
 
-当前为代码内默认值（`contracts.py` / 各模块常量），未引入 `config/app.toml` 新段：章节上限 `MAX_CHUNK_CHARS=1200`、嵌入模型 `DEFAULT_EMBED_MODEL_REPO`、ask 上下文预算 6000 字符/12 章节、摘要字段上限 400 字符。如需调整，修改对应常量或通过 `TagWikiService(embed_repo=...)` 注入。
+`config/app.toml`（参考 `app.example.toml`）支持可选的 `[tag_wiki]` 段：
+
+```toml
+[tag_wiki]
+# 跨语言嵌入模型的 Hugging Face repo（首次构建自动下载，约 470 MB）；
+# 无法直连 Hugging Face 时可改为镜像 repo 或本地 repo id。
+embed_model_repo = "intfloat/multilingual-e5-small"
+# 「高频标签」翻译范围 post_count 阈值的默认值（经 /status 下发，作为 UI 初始值）。
+min_post_count = 1000
+```
+
+`embed_model_repo` 通过 `TagWikiService(embed_repo=...)` 注入；`min_post_count` 经 `GET /status` 的 `index.min_post_count` 下发给前端作为初始值。其余为代码内默认值（`contracts.py` / 各模块常量）：章节上限 `MAX_CHUNK_CHARS=1200`、ask 上下文预算 6000 字符/12 章节、摘要字段上限 400 字符。
 
 ## 测试
 

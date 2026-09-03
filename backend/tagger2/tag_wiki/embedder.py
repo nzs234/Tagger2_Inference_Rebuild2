@@ -387,6 +387,10 @@ class TorchEmbedder:
     def close(self) -> None:
         self._model = None
         self._tokenizer = None
+        # A CUDA context holds freed tensors until the cache is emptied.
+        cuda = getattr(self._torch, "cuda", None)
+        if cuda is not None and cuda.is_available():
+            cuda.empty_cache()
 
 
 def create_embedder(

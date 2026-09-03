@@ -126,7 +126,20 @@ def main() -> None:
     args = parser.parse_args()
     if not (args.status or args.build or args.translate):
         parser.error("nothing to do: pass --status, --build and/or --translate")
-    raise SystemExit(asyncio.run(_main(args)))
+    try:
+        raise SystemExit(asyncio.run(_main(args)))
+    except KeyboardInterrupt:
+        # Cancel the in-process build/translate task instead of leaving it
+        # running in a dead interpreter's event loop.
+        asyncio.run(_cancel_background_tasks())
+        raise SystemExit(130) from None
+
+
+async def _cancel_background_tasks() -> None:
+    from tagger2.tag_wiki.service import TagWikiService
+
+    service: TagWikiService = app.state.runtime.tag_wiki
+    await service.aclose()
 
 
 if __name__ == "__main__":

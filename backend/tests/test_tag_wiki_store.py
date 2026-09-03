@@ -134,6 +134,30 @@ def test_is_link_soup_classifies_shapes():
     assert not is_link_soup("Links: https://one.example/x and https://two.example/y only.")
 
 
+def test_batch_summaries_and_missing_limit(tmp_path: Path):
+    """get_summaries_by_titles batches and normalizes; missing_summary_titles
+    honors the early-exit limit."""
+
+    store = WikiStore(tmp_path / "wiki.sqlite3")
+    store.upsert_page(_page("hug"))
+    store.upsert_page(_page("kiss"))
+    store.upsert_page(_page("rare"))
+    store.upsert_summary("hug", {"meaning": "拥抱", "tags": ["couple"]})
+    store.upsert_summary("KISS", {"meaning": "亲吻", "tags": []})
+
+    got = store.get_summaries_by_titles(["Hug", "KISS", "rare", "missing_page"])
+    assert set(got) == {"hug", "kiss"}
+    assert got["hug"]["meaning"] == "拥抱"
+    assert got["kiss"]["meaning"] == "亲吻"
+    assert store.get_summaries_by_titles([]) == {}
+
+    missing = store.missing_summary_titles(["Hug", "KISS", "rare"], limit=1)
+    assert missing == ["rare"]
+    assert store.missing_summary_titles(["hug"], limit=2) == []
+    assert store.missing_summary_titles(["hug", "rare"], limit=0) == []
+    store.close()
+
+
 def test_normalize_title_casefolds_and_underscores():
     """Whitespace collapses to single underscores and case is folded."""
 

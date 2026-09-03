@@ -788,10 +788,43 @@ class WikiStore:
             ).fetchone()
         return _summary_dict(row) if row is not None else None
 
-    def missing_summary_titles(self, titles: Sequence[str]) -> list[str]:
-        """Filter the input list of titles to those that do NOT have a summary yet."""
+    def get_summaries_by_titles(self, titles: Sequence[str]) -> dict[str, dict[str, Any]]:
+        """Batch variant of :meth:`get_summary` keyed by normalized title.
+
+        Used by search-hit enrichment so one query round-trip replaces one
+        connection per hit.
+        """
+
+        norm_titles = [normalize_title(str(title)) for title in titles]
+        norm_titles = [title for title in norm_titles if title]
+        if not norm_titles:
+            return {}
+        unique_titles = list(dict.fromkeys(norm_titles))
+        result: dict[str, dict[str, Any]] = {}
+        with self.connection() as conn:
+            for start in range(0, len(unique_titles), 500):
+                batch = unique_titles[start : start + 500]
+                placeholders = ",".join("?" for _ in batch)
+                rows = conn.execute(
+                    f"SELECT * FROM summaries WHERE page_title IN ({placeholders})",
+                    batch,
+                ).fetchall()
+                for row in rows:
+                    result[str(row["page_title"])] = _summary_dict(row)
+        return result
+
+    def missing_summary_titles(
+        self, titles: Sequence[str], limit: int | None = None
+    ) -> list[str]:
+        """Filter the input list of titles to those that do NOT have a summary.
+
+        With ``limit`` set, stops as soon as that many missing titles are
+        collected instead of scanning the whole input.
+        """
 
         if not titles:
+            return []
+        if limit is not None and limit <= 0:
             return []
         norm_map = {normalize_title(t): t for t in titles}
         norm_keys = list(norm_map.keys())
@@ -811,6 +844,8 @@ class WikiStore:
                 for k in batch:
                     if k not in found:
                         missing.append(norm_map[k])
+                        if limit is not None and len(missing) >= limit:
+                            return missing
         return missing
 
     def close(self) -> None:

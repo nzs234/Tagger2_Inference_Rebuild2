@@ -27,3 +27,11 @@ gpu_concurrency = 1
 # Set a concrete MiB limit to enable model LRU eviction by memory budget.
 # model_memory_budget_mb = 16384
 allow_unsafe_pickle = false
+
+[tag_wiki]
+# Local e621 wiki mirror. embed_model_repo is the Hugging Face repo of the
+# cross-lingual embedding model downloaded on first build (~470 MB); point it
+# at a mirror/local repo id if Hugging Face is unreachable.
+embed_model_repo = "intfloat/multilingual-e5-small"
+# Default post_count threshold for the "popular tags" translation scope.
+min_post_count = 1000

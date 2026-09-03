@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import csv
 import gzip
+import logging
 import os
 import re
 import time
@@ -33,6 +34,8 @@ import httpx
 from ..workflow.contracts import utc_now
 from .contracts import MAX_CHUNK_CHARS, MIN_CHUNK_CHARS, ERROR_WIKI_BUILD_FAILED
 from .wiki_store import WikiStore, is_link_soup, normalize_title
+
+logger = logging.getLogger("tagger2.tag_wiki.importer")
 
 DUMP_LIST_URL = "https://e621.net/db_export/"
 
@@ -226,9 +229,14 @@ def download_dump(
 
     os.replace(part_path, final_path)
 
+    # Best-effort cleanup of superseded dumps; a file held open by another
+    # process (Windows locks) must not fail the download that just finished.
     for old_path in target_dir.glob("wiki_pages*.csv.gz"):
         if old_path != final_path and old_path.is_file():
-            old_path.unlink()
+            try:
+                old_path.unlink()
+            except OSError:
+                logger.warning("could not remove superseded wiki dump %s", old_path)
     return final_path
 
 
