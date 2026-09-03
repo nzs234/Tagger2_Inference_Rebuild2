@@ -104,6 +104,9 @@ class TranslateRequest(BaseModel):
     # Upper bound on pages translated by one run; the run is resumable, so a
     # large scope is simply continued by starting the job again.
     max_pages: int = Field(default=2000, ge=1, le=50_000)
+    # How many pages to summarize in parallel. Upstream providers (and their
+    # rate limits) decide what is safe; 1 restores strictly sequential calls.
+    concurrency: int = Field(default=4, ge=1, le=12)
     provider_id: str | None = Field(default=None, max_length=128)
     model: str | None = Field(default=None, max_length=256)
 

@@ -706,7 +706,7 @@ class TagWikiService:
             self._translate_state.update(state="idle", message="范围内页面均已有中文摘要")
             return self.translate_progress()
         self._translate_task = asyncio.create_task(
-            self._run_translate(provider, provider_id, pending, request.model, request.profile)
+            self._run_translate(provider, provider_id, pending, request.model, request.profile, request.concurrency)
         )
         return self.translate_progress()
 
@@ -750,7 +750,7 @@ class TagWikiService:
         return info is not None and str(info["category"]) in EXCLUDED_SEARCH_CATEGORIES
 
     async def _run_translate(
-        self, provider: Any, provider_id: str, titles: list[str], model: str | None, profile: str
+        self, provider: Any, provider_id: str, titles: list[str], model: str | None, profile: str, concurrency: int = 1
     ) -> None:
         def on_progress(done: int, failed: int) -> None:
             self._translate_state.update(done=done, failed=failed, updated_at=_now())
@@ -763,6 +763,7 @@ class TagWikiService:
                 model=model,
                 provider_id=provider_id,
                 on_progress=on_progress,
+                concurrency=concurrency,
             )
             self._translate_state.update(
                 state="idle",

@@ -34,9 +34,10 @@ runtime\python.exe scripts\build_tag_wiki.py --status
 runtime\python.exe scripts\build_tag_wiki.py --build
 runtime\python.exe scripts\build_tag_wiki.py --translate --scope popular --min-post-count 1000 --max-pages 2000
 runtime\python.exe scripts\build_tag_wiki.py --translate --scope model_vocab --provider <id>
+runtime\python.exe scripts\build_tag_wiki.py --translate --profile danbooru --scope popular --min-post-count 1000 --provider cpa --concurrency 8
 ```
 
-`--build` 与 UI 按钮完全同管线；`--translate` 可反复执行直到覆盖目标范围（已翻译页面自动跳过）。
+`--build` 与 UI 按钮完全同管线；`--translate` 可反复执行直到覆盖目标范围（已翻译页面自动跳过）。`--concurrency` 控制并行翻译页数（默认 4，上限 12；上游限流时调回 1）。
 
 **本地 LLM 翻译**（不需要任何在线 Provider，用本机 GPU 跑 Qwen3-4B-Instruct）：
 
@@ -69,6 +70,7 @@ runtime\python.exe scripts\fetch_danbooru_wiki.py --status
 - 范围：`model_vocab`（默认，本地打标模型词表内的 tag，由 Runtime 注入） / `popular`（post_count ≥ 阈值） / `all`。
 - 断点续跑：已翻译页面自动跳过，单次受 `max_pages` 限制，可反复启动直至覆盖全范围。
 - Provider：请求可显式指定 `provider_id`/`model`，否则用第一个启用且已配置密钥的 Provider（与标签管理器翻译一致）；无可用 Provider 返回 409 `wiki_ask_unavailable`。
+- 并发：默认 4 路并行（`concurrency` 可调 1-12），汇总进度实时可见；中断后重跑自动续传。
 
 ## API 一览（`/api/v1/tag-wiki`，同全局 authorize 依赖）
 
@@ -76,7 +78,7 @@ runtime\python.exe scripts\fetch_danbooru_wiki.py --status
 | --- | --- | --- |
 | GET | `/status` | 数据库/索引/构建/翻译四组状态 |
 | POST | `/build` (202) | 启动构建 `{download_dump, reindex, force_reembed}` |
-| POST | `/translate` (202) | 启动翻译 `{scope, min_post_count, max_pages, provider_id?, model?}` |
+| POST | `/translate` (202) | 启动翻译 `{scope, min_post_count, max_pages, concurrency, provider_id?, model?}` |
 | GET | `/translate/progress` | 翻译进度 |
 | GET | `/lookup?tag=&profile=` | tag → 别名归一 + TagRef + implications + wiki 页（含中文摘要） |
 | POST | `/search` | `{query, top_k}` → 章节命中（向量+关键词 RRF 融合）+ `suggested_tags` |

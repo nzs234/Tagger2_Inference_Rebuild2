@@ -153,6 +153,8 @@ export interface TranslateRequest {
   scope: 'model_vocab' | 'popular' | 'all'
   min_post_count?: number
   max_pages?: number
+  /** Parallel summary calls; backend clamps to 1-12. */
+  concurrency?: number
   provider_id?: string
   model?: string
 }

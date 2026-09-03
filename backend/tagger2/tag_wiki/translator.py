@@ -11,6 +11,7 @@ the UI with ``retryable=True``.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -143,49 +144,80 @@ async def translate_pages(
     model: str | None = None,
     provider_id: str = "",
     on_progress: Callable[[int, int], None] | None = None,
+    concurrency: int = 1,
 ) -> dict[str, int]:
-    """Summarize ``titles`` one by one, persisting each summary as it lands.
+    """Summarize ``titles`` with a small worker pool, persisting as they land.
 
-    The loop is deliberately resumable: pages that already carry a summary are
+    The job is deliberately resumable: pages that already carry a summary are
     skipped by the caller, and pages whose model call fails are counted and
-    left for a later run. Returns ``{"done", "failed"}``.
+    left for a later run. ``concurrency`` caps how many model calls run in
+    parallel (1 = strictly sequential, the historical behavior); every summary
+    is persisted the moment it lands, so an interrupted run keeps its progress.
+    Returns ``{"done", "failed", "skipped"}``.
     """
 
     done = 0
     failed = 0
     skipped = 0
     resolved_model = model or str(getattr(provider, "model", "") or "")
+    workers = max(1, min(int(concurrency), len(titles) or 1))
+    queue: asyncio.Queue[str | None] = asyncio.Queue()
     for title in titles:
-        page = store.get_page(title)
-        if page is None:
-            continue
-        text = page_context_text(page)
-        if not text:
-            # Nothing readable to summarize (e.g. a page whose only content
-            # was filtered as chunk junk); not a translation failure.
-            skipped += 1
-            continue
-        try:
-            summary = await summarize_page(
-                provider,
-                tag=str(page.get("title", title)),
-                title=str(page.get("display_title") or page.get("title", title)),
-                text=text,
-                model=model,
-            )
-        except Exception as exc:  # noqa: BLE001 - one failure mode for the UI
-            logger.warning("tag wiki summary failed for %s: %s", title, exc)
-            summary = None
-        if summary is None:
-            failed += 1
-        else:
-            store.upsert_summary(
-                title,
-                {**summary, "provider_id": provider_id, "model": resolved_model},
-            )
-            done += 1
-        if on_progress is not None:
-            on_progress(done, failed)
+        queue.put_nowait(title)
+    for _ in range(workers):
+        queue.put_nowait(None)
+    progress_lock = asyncio.Lock()
+
+    async def _worker() -> None:
+        nonlocal done, failed, skipped
+        while True:
+            title = await queue.get()
+            if title is None:
+                return
+            summary: dict[str, Any] | None
+            try:
+                page = store.get_page(title)
+                if page is None:
+                    continue
+                text = page_context_text(page)
+                if not text:
+                    # Nothing readable to summarize (e.g. a page whose only
+                    # content was filtered as chunk junk); not a failure.
+                    async with progress_lock:
+                        skipped += 1
+                        if on_progress is not None:
+                            on_progress(done, failed)
+                    continue
+                try:
+                    summary = await summarize_page(
+                        provider,
+                        tag=str(page.get("title", title)),
+                        title=str(page.get("display_title") or page.get("title", title)),
+                        text=text,
+                        model=model,
+                    )
+                except Exception as exc:  # noqa: BLE001 - one failure mode for the UI
+                    logger.warning("tag wiki summary failed for %s: %s", title, exc)
+                    summary = None
+            except Exception as exc:  # noqa: BLE001 - one worker must not kill the pool
+                logger.warning("tag wiki summary job error for %s: %s", title, exc)
+                summary = None
+            async with progress_lock:
+                if summary is None:
+                    failed += 1
+                else:
+                    store.upsert_summary(
+                        title,
+                        {**summary, "provider_id": provider_id, "model": resolved_model},
+                    )
+                    done += 1
+                if on_progress is not None:
+                    on_progress(done, failed)
+
+    results = await asyncio.gather(*(_worker() for _ in range(workers)), return_exceptions=True)
+    for result in results:
+        if isinstance(result, BaseException):  # pragma: no cover - defensive
+            logger.error("tag wiki summary worker crashed: %s", result)
     return {"done": done, "failed": failed, "skipped": skipped}
 
 

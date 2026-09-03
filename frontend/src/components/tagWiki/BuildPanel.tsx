@@ -39,6 +39,7 @@ export function BuildPanel({ profile }: { profile: TagWikiProfile }) {
   const [scope, setScope] = useState<TranslateRequest['scope']>('model_vocab')
   const [minPostCount, setMinPostCount] = useState<number>(1000)
   const [maxPages, setMaxPages] = useState<number>(2000)
+  const [concurrency, setConcurrency] = useState<number>(4)
   const [localError, setLocalError] = useState<string | null>(null)
 
   const queryClient = useQueryClient()
@@ -120,6 +121,7 @@ export function BuildPanel({ profile }: { profile: TagWikiProfile }) {
         scope,
         min_post_count: scope === 'popular' ? minPostCount : undefined,
         max_pages: maxPages,
+        concurrency,
       }),
     onSuccess: (data) => {
       queryClient.setQueryData<TagWikiStatus>(['tag-wiki', 'status'], (old) => {
@@ -343,6 +345,20 @@ export function BuildPanel({ profile }: { profile: TagWikiProfile }) {
                   value={maxPages}
                   disabled={isBuilding || isTranslating || translateMutation.isPending}
                   onChange={(e) => setMaxPages(clampInt(Number(e.target.value), 1, 50_000))}
+                />
+              </label>
+
+              <label className="tw-inline-label">
+                <span>并行数</span>
+                <input
+                  type="number"
+                  min={1}
+                  max={12}
+                  step={1}
+                  value={concurrency}
+                  disabled={isBuilding || isTranslating || translateMutation.isPending}
+                  onChange={(e) => setConcurrency(clampInt(Number(e.target.value), 1, 12))}
+                  style={{ width: '64px' }}
                 />
               </label>
 

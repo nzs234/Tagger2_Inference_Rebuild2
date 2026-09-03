@@ -12,7 +12,7 @@ Usage::
     .\\runtime\\python.exe scripts/build_tag_wiki.py --build
     .\\runtime\\python.exe scripts/build_tag_wiki.py --build --force-reembed
     .\\runtime\\python.exe scripts\\build_tag_wiki.py --translate --scope popular \\
-        --min-post-count 1000 --max-pages 2000 --provider cpa
+        --min-post-count 1000 --max-pages 2000 --provider cpa --concurrency 8
 
 ``--translate`` requires a configured online provider (same resolution as the
 UI: explicit --provider, else the first enabled provider holding a key).
@@ -74,6 +74,7 @@ async def _run_translate(args: argparse.Namespace) -> int:
             scope=args.scope,
             min_post_count=args.min_post_count,
             max_pages=args.max_pages,
+            concurrency=args.concurrency,
             provider_id=args.provider,
             model=args.model,
         )
@@ -129,6 +130,12 @@ def main() -> None:
     parser.add_argument("--scope", choices=["model_vocab", "popular", "all"], default="model_vocab")
     parser.add_argument("--min-post-count", type=int, default=1000)
     parser.add_argument("--max-pages", type=int, default=2000)
+    parser.add_argument(
+        "--concurrency",
+        type=int,
+        default=4,
+        help="how many pages to summarize in parallel (1 = sequential)",
+    )
     parser.add_argument("--provider", default=None, help="explicit provider id (default: first enabled with a key)")
     parser.add_argument("--model", default=None, help="override the provider's primary model")
     args = parser.parse_args()

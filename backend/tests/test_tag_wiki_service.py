@@ -240,7 +240,7 @@ async def test_start_translate_returns_409_while_running(tmp_path: Path) -> None
     service = make_service(tmp_path, store=store, tag_database=HUG_TAG_DB, provider=provider)
 
     async def slow_translate(
-        provider: Any, provider_id: str, titles: list[str], model: str | None, profile: str
+        provider: Any, provider_id: str, titles: list[str], model: str | None, profile: str, concurrency: int
     ) -> None:
         await asyncio.sleep(60)
 
@@ -485,6 +485,51 @@ async def test_translate_counts_failures(tmp_path: Path) -> None:
     assert final["done"] == 0
     assert final["failed"] == 1
     assert store.get_summary("hug") is None
+
+
+class OverlapTrackingProvider(FakeProvider):
+    """FakeProvider that records how many generate calls overlap in time."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.in_flight = 0
+        self.max_in_flight = 0
+
+    async def generate(self, *args: Any, **kwargs: Any) -> str:
+        self.in_flight += 1
+        self.max_in_flight = max(self.max_in_flight, self.in_flight)
+        try:
+            await asyncio.sleep(0.02)
+            return await super().generate(*args, **kwargs)
+        finally:
+            self.in_flight -= 1
+
+
+async def test_translate_runs_pages_in_parallel(tmp_path: Path) -> None:
+    """Concurrency workers overlap model calls and still persist every summary."""
+
+    store = WikiStore(tmp_path / "tag_wiki.sqlite3")
+    titles = [f"tag_{i}" for i in range(6)]
+    for title in titles:
+        seed_page(store, title)
+    tag_db = FakeTagDatabase(tags={name: _info(name, post_count=500) for name in titles})
+    provider = OverlapTrackingProvider(reply=SUMMARY_REPLY)
+    service = make_service(tmp_path, store=store, tag_database=tag_db, provider=provider)
+    progress = await service.start_translate(
+        TranslateRequest(scope="popular", min_post_count=0, concurrency=3)
+    )
+    assert progress["total"] == 6
+    assert service._translate_task is not None
+    await service._translate_task
+    final = service.translate_progress()
+    assert final["done"] == 6
+    assert final["failed"] == 0
+    # The pool ran 3 calls at once — and never more than requested.
+    assert provider.max_in_flight == 3
+    for title in titles:
+        summary = store.get_summary(title)
+        assert summary is not None
+        assert summary["meaning"].startswith("角色之间")
 
 
 # -- build pipeline ----------------------------------------------------------
