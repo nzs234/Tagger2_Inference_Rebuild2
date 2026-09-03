@@ -22,6 +22,14 @@
     - fingerprint：`2e3c4af6cc93b7f2cc8e55e2eda024ee69942f08a3618b6c2f0dfe6d45991972`
     - 规则统计：keep 47,095、replace 3,171、drop 105,440、pass 0
 
+自 V1.10.1 起，构建完成的 **Tag Wiki 数据库随包发行**（`data/tag_wiki/`）：
+
+- `tag_wiki.sqlite3`（e621 镜像：页面 / 章节 / 向量 / 中文摘要）
+- `tag_wiki_danbooru.sqlite3`（danbooru 镜像，同 schema）
+
+打包时通过 SQLite `VACUUM INTO` 生成干净紧凑的快照（scripts/snapshot_wiki_databases.py），
+解压即用、无需重建语料；跨语言嵌入模型本身仍属模型类大文件，首次构建时按需下载。
+
 资源位于 `data/workflows/resources/`，每个资源都带有独立 manifest 和内容指纹。
 分类快照与 tokenizer 属模型类大文件（合计约 131 MB），自 V1.10 起不随包发行：首次使用时应用自动从
 [resources-v1 发行页](https://github.com/nzs234/Tagger2_Inference_Rebuild2/releases/tag/resources-v1)

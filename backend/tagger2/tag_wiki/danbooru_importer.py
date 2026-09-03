@@ -105,8 +105,12 @@ class DanbooruWikiClient:
         self._next_allowed = 0.0
         self.requests = 0
 
-    def fetch_page(self, params: Mapping[str, Any]) -> list[dict[str, Any]]:
-        """Issue one paced, retried GET and return the JSON record list."""
+    def fetch_page(self, params: Mapping[str, Any], *, endpoint: str = WIKI_PAGES_URL) -> list[dict[str, Any]]:
+        """Issue one paced, retried GET and return the JSON record list.
+
+        ``endpoint`` defaults to the wiki pages index; other danbooru indexes
+        (tags, aliases, implications) reuse the same paced client.
+        """
 
         last_error: Exception | None = None
         for attempt in range(self._attempts):
@@ -115,7 +119,7 @@ class DanbooruWikiClient:
                 self._sleep(delay)
             try:
                 response = self._client.get(
-                    WIKI_PAGES_URL,
+                    endpoint,
                     params=dict(params),
                     headers={"User-Agent": USER_AGENT},
                 )
@@ -130,12 +134,10 @@ class DanbooruWikiClient:
                 except ValueError:
                     wait = 2.0**attempt
                 self._sleep(min(_MAX_RETRY_AFTER, max(1.0, wait)))
-                last_error = DanbooruWikiFetchError("danbooru wiki API rate limited (HTTP 429)")
+                last_error = DanbooruWikiFetchError("danbooru API rate limited (HTTP 429)")
                 continue
             if 400 <= response.status_code < 500:
-                raise DanbooruWikiFetchError(
-                    f"danbooru wiki API returned HTTP {response.status_code}"
-                )
+                raise DanbooruWikiFetchError(f"danbooru API returned HTTP {response.status_code}")
             try:
                 response.raise_for_status()
                 payload = response.json()
@@ -146,10 +148,10 @@ class DanbooruWikiClient:
             self.requests += 1
             self._next_allowed = self._monotonic() + self._min_interval
             if not isinstance(payload, list):
-                raise DanbooruWikiFetchError("danbooru wiki API returned a non-list payload")
+                raise DanbooruWikiFetchError("danbooru API returned a non-list payload")
             return [item for item in payload if isinstance(item, dict)]
         raise DanbooruWikiFetchError(
-            f"danbooru wiki API did not answer after {self._attempts} attempts: {last_error}"
+            f"danbooru API did not answer after {self._attempts} attempts: {last_error}"
         ) from last_error
 
 

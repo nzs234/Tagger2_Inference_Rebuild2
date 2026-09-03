@@ -59,7 +59,8 @@ runtime\python.exe scripts\fetch_danbooru_wiki.py --status
 
 - **存储**：原始缓存与断点在 `data/tag_wiki/danbooru/`（`wiki_pages.jsonl` + `state.json`），页面与章节入库到独立数据库 `data/tag_wiki/tag_wiki_danbooru.sqlite3`（与 e621 库同 schema，互不影响）。
 - **增量**：全量遍历完成后记录水位（UTC 日期），后续运行只抓 `updated_at` 落在水位之后的页面；某窗口填满一页时自动按时间对半拆分，不会静默截断。需要强制重抓可传 `--since YYYY-MM-DD`。
-- **当前阶段**：仅抓取与结构化入库（页面 / 章节 / FTS5 关键词索引），e5 向量索引、中文摘要与 UI 查询（profile 切换）尚未接线；先把语料慢慢攒起来。
+- **UI 与检索**：自 V1.10.1 起 Tag Wiki 页面右上角可切换 e621 / Danbooru 语料库，查含义、语义搜索与 AI 问答均按 profile 走各自的库；标签管理器的「查 Wiki」抽屉跟随当前会话的语料库。`build_tag_wiki.py --profile danbooru --build` 只刷新剪枝与向量索引（无需重新抓取）。
+- **随包发行**：两个构建完成的数据库自 V1.10.1 起随发行包分发（`VACUUM INTO` 快照），解压即用，无需重建语料。
 
 ## 中文摘要（预翻译常用 tag）
 

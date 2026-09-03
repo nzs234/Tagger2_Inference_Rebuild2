@@ -212,6 +212,7 @@ try {
     "docs/V1.06_RELEASE_NOTES.md",
     "docs/V1.06.1_RELEASE_NOTES.md",
     "docs/V1.10_RELEASE_NOTES.md",
+    "docs/V1.10.1_RELEASE_NOTES.md",
     "docs/tag_manager.md",
     "docs/tag_wiki.md",
     "docs/release_package_contents.md",
@@ -274,6 +275,18 @@ try {
     New-Item -ItemType Directory -Force -Path $destinationCategory | Out-Null
     $resourceFiles | Copy-Item -Destination $destinationCategory -Force
   }
+
+  # Ship the fully built wiki databases (pages, chunks, embeddings and the
+  # generated Chinese summaries) so end users never rebuild the corpus.
+  # VACUUM INTO produces self-contained, compact copies even when the app
+  # currently holds the databases open; the embedding model itself stays
+  # external (model-class, downloaded on first use).
+  $wikiDbStage = Join-Path $stage "data\tag_wiki"
+  New-Item -ItemType Directory -Force -Path $wikiDbStage | Out-Null
+  & $gatePython (Join-Path $root "scripts\snapshot_wiki_databases.py") `
+    --data-dir (Join-Path $root "data") `
+    --dest $wikiDbStage
+  if ($LASTEXITCODE -ne 0) { throw "Could not snapshot the wiki databases" }
 
   # Keep the embedded interpreter portable. The startup script will later
   # replace this relative entry with the actual extracted package path.
