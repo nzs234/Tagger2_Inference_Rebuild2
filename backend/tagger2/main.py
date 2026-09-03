@@ -382,6 +382,17 @@ class Runtime:
             provider_factory=self.provider,
             provider_ids=self._enabled_provider_ids,
         )
+        # Tag wiki: shares the tag database (alias/implication lookups) and the
+        # online providers; its SQLite db and embedding model live under
+        # data/tag_wiki/.
+        from .tag_wiki import TagWikiService
+
+        self.tag_wiki = TagWikiService(
+            tag_database=self.tag_manager.tag_database,
+            provider_factory=self.provider,
+            provider_ids=self._enabled_provider_ids,
+            vocab_provider=self._tag_wiki_vocab,
+        )
         self.processors = ProcessorHost(self)
         self.job_manager = JobManager(self.storage)
         self.job_manager.register_processor("local", self.processors.local)
@@ -671,6 +682,19 @@ class Runtime:
             ready.append(str(provider_id))
         return ready
 
+    def _tag_wiki_vocab(self) -> list[str]:
+        """Tag names from every registered tagger model's vocabulary.
+
+        The tag wiki's ``model_vocab`` translation scope covers the tags the
+        local models actually output, so their wiki pages get Chinese
+        summaries first.
+        """
+
+        names: list[str] = []
+        for record in self.registry.list():
+            names.extend(str(tag) for tag in (record.tags or []))
+        return names
+
     def provider(
         self,
         provider_id: str,
@@ -793,6 +817,7 @@ class Runtime:
         await self.image_generation.close()
         await self.job_manager.shutdown()
         await self.model_downloads.close()
+        await self.tag_wiki.aclose()
         pending = [task for task in self._provider_close_tasks if not task.done()]
         if pending:
             await asyncio.gather(*pending, return_exceptions=True)
@@ -1888,6 +1913,13 @@ def create_app(settings: AppConfig | None = None) -> FastAPI:
 
     app.include_router(
         create_tag_manager_router(runtime.tag_manager),
+        dependencies=[Depends(authorize)],
+    )
+    # Tag wiki module (local e621 wiki mirror + retrieval). Same rules again.
+    from .tag_wiki.api import create_tag_wiki_router
+
+    app.include_router(
+        create_tag_wiki_router(runtime.tag_wiki),
         dependencies=[Depends(authorize)],
     )
 

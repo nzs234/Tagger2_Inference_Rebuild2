@@ -314,3 +314,64 @@ def test_loads_snapshot_through_the_real_catalog(tmp_path: Path):
         "horse",
         "house",
     ]
+
+
+def test_implications_of_forward_and_reverse(tmp_path: Path):
+    """implications_of returns resolved implied or implying tags ordered by post_count."""
+
+    doc = _document()
+    doc["tags"].extend([
+        {"name": "canine", "category": "species", "post_count": 2000},
+        {"name": "dog", "category": "species", "post_count": 800},
+        {"name": "corgi", "category": "species", "post_count": 150},
+        {"name": "mammal", "category": "species", "post_count": 5000},
+    ])
+    doc["aliases"].append({"antecedent_name": "puppy", "consequent_name": "dog"})
+    doc["implications"] = [
+        {"antecedent_name": "corgi", "consequent_name": "puppy"},  # implies alias -> dog
+        {"antecedent_name": "dog", "consequent_name": "canine"},
+        {"antecedent_name": "canine", "consequent_name": "mammal"},
+        {"antecedent_name": "corgi", "consequent_name": "corgi"},  # self-implication skipped
+    ]
+
+    db = _memory_db(tmp_path, doc, scope="implications")
+    db.ensure_loaded("e621", resource_id="test-snapshot-v1")
+
+    # Forward: corgi implies dog (via puppy alias)
+    corgi_imp = db.implications_of("e621", "corgi")
+    assert [t["name"] for t in corgi_imp] == ["dog"]
+
+    # Reverse: dog is implied by corgi (via puppy alias)
+    dog_rev = db.implications_of("e621", "dog", reverse=True)
+    assert [t["name"] for t in dog_rev] == ["corgi"]
+
+    # Reverse with alias antecedent: looking up puppy in reverse resolves to dog
+    puppy_rev = db.implications_of("e621", "puppy", reverse=True)
+    assert [t["name"] for t in puppy_rev] == ["corgi"]
+
+    # Unknown tag returns []
+    assert db.implications_of("e621", "unknown_tag") == []
+
+
+def test_top_tags(tmp_path: Path):
+    """top_tags returns canonical tags filtered by min_post_count and sorted by post_count desc."""
+
+    doc = _document()
+    db = _memory_db(tmp_path, doc, scope="top_tags")
+    db.ensure_loaded("e621", resource_id="test-snapshot-v1")
+
+    # min_post_count=100
+    top = db.top_tags("e621", min_post_count=100)
+    assert [(t["name"], t["post_count"]) for t in top] == [
+        ("hot_dog", 900),
+        ("horn", 500),
+        ("horse", 500),
+        ("solo", 100),
+    ]
+
+    # limit=2
+    top_limit = db.top_tags("e621", min_post_count=0, limit=2)
+    assert len(top_limit) == 2
+    assert top_limit[0]["name"] == "hot_dog"
+    assert top_limit[1]["name"] == "horn"
+

@@ -49,18 +49,21 @@ class TagInfo(TypedDict):
 class _ProfileIndex:
     """Immutable lookup structures for one loaded snapshot."""
 
-    __slots__ = ("aliases", "resource_id", "sorted_names", "tags")
+    __slots__ = ("aliases", "implications", "resource_id", "sorted_names", "tags")
 
     def __init__(
         self,
         resource_id: str,
         tags: dict[str, TagInfo],
         aliases: dict[str, tuple[str, str]],
+        implications: tuple[dict[str, tuple[str, ...]], dict[str, tuple[str, ...]]] = ({}, {}),
     ) -> None:
         # casefolded canonical name -> TagInfo (``alias_of`` is always None here).
         self.tags = tags
         # casefolded alias antecedent -> (display antecedent, casefolded canonical).
         self.aliases = aliases
+        # (forward, reverse) maps of implications between canonical keys.
+        self.implications = implications
         # Sorted casefolded canonical names; bisects the autocomplete range.
         self.sorted_names = tuple(sorted(tags))
         self.resource_id = resource_id
@@ -189,6 +192,51 @@ class TagDatabase:
         matches.sort(key=_autocomplete_order)
         return [_copy_tag_info(entry) for entry in matches[:limit]]
 
+    def implications_of(
+        self, profile: str, tag: str, *, reverse: bool = False
+    ) -> list[TagInfo]:
+        """Resolve the tag through aliases, returning implied or implying tags.
+
+        Resolves ``tag`` through aliases (casefold), returning the :class:`TagInfo`
+        for each mapped key (skipping keys not present in canonical tags;
+        sorted by post_count desc, then name). ``reverse=True`` answers
+        which tags imply this one. Unknown tags return an empty list.
+        """
+
+        self.ensure_loaded(profile)
+        index = _CACHE[self._cache_key(profile)]
+        key = tag.casefold()
+        alias = index.aliases.get(key)
+        canonical_key = alias[1] if alias is not None else key
+
+        forward_map, reverse_map = index.implications
+        target_map = reverse_map if reverse else forward_map
+        mapped_keys = target_map.get(canonical_key, ())
+        results: list[TagInfo] = []
+        for target_key in mapped_keys:
+            entry = index.tags.get(target_key)
+            if entry is not None:
+                results.append(entry)
+        results.sort(key=_autocomplete_order)
+        return [_copy_tag_info(entry) for entry in results]
+
+    def top_tags(
+        self, profile: str, *, min_post_count: int = 0, limit: int | None = None
+    ) -> list[TagInfo]:
+        """All canonical tags with post_count >= min_post_count sorted by post_count desc then name."""
+
+        self.ensure_loaded(profile)
+        index = _CACHE[self._cache_key(profile)]
+        matches: list[TagInfo] = []
+        for entry in index.tags.values():
+            count = entry["post_count"] or 0
+            if count >= min_post_count:
+                matches.append(entry)
+        matches.sort(key=_autocomplete_order)
+        if limit is not None and limit >= 0:
+            matches = matches[:limit]
+        return [_copy_tag_info(entry) for entry in matches]
+
     # -- loading ------------------------------------------------------------
 
     def _cache_key(self, profile: str) -> tuple[str, str]:
@@ -288,7 +336,42 @@ def _build_index(resource_id: str, document: dict[str, Any]) -> _ProfileIndex:
             current = nxt[1]
         aliases[antecedent_key] = (display, current)
 
-    return _ProfileIndex(resource_id, tags, aliases)
+    # Implications: antecedent_name -> consequent_name.
+    # Resolve both antecedent and consequent through aliases if needed,
+    # mapping canonical antecedent -> tuple of canonical consequents,
+    # and canonical consequent -> tuple of canonical antecedents.
+    forward_implications: dict[str, list[str]] = {}
+    reverse_implications: dict[str, list[str]] = {}
+
+    def _resolve_canonical(key: str) -> str:
+        alias_entry = aliases.get(key)
+        return alias_entry[1] if alias_entry is not None else key
+
+    for row in document.get("implications", ()):
+        if not isinstance(row, dict):
+            continue
+        antecedent = row.get("antecedent_name")
+        consequent = row.get("consequent_name")
+        if not isinstance(antecedent, str) or not isinstance(consequent, str):
+            continue
+        ant_key = antecedent.casefold()
+        con_key = consequent.casefold()
+        ant_canonical = _resolve_canonical(ant_key)
+        con_canonical = _resolve_canonical(con_key)
+        if ant_canonical == con_canonical:
+            continue
+        # Only record if canonical antecedent and consequent are valid / distinct
+        forward_list = forward_implications.setdefault(ant_canonical, [])
+        if con_canonical not in forward_list:
+            forward_list.append(con_canonical)
+        reverse_list = reverse_implications.setdefault(con_canonical, [])
+        if ant_canonical not in reverse_list:
+            reverse_list.append(ant_canonical)
+
+    frozen_forward = {k: tuple(v) for k, v in forward_implications.items()}
+    frozen_reverse = {k: tuple(v) for k, v in reverse_implications.items()}
+
+    return _ProfileIndex(resource_id, tags, aliases, (frozen_forward, frozen_reverse))
 
 
 def _copy_tag_info(entry: TagInfo, *, alias_of: str | None = None) -> TagInfo:
