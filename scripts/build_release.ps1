@@ -1,6 +1,6 @@
 param(
   [string]$OutputDir = "dist",
-  [string]$Version = "V1.04.1",
+  [string]$Version = "",
   [string]$UpstreamSourceRoot = $env:TAGGER2_UPSTREAM_SOURCE_ROOT,
   [switch]$SkipRuntime,
   [switch]$BaseRuntimeOnly,
@@ -11,7 +11,14 @@ $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
 $stamp = Get-Date -Format "yyyyMMdd_HHmmss"
 $safeVersion = if ([string]::IsNullOrWhiteSpace($Version)) {
-  ""
+  $versionMatch = Select-String -LiteralPath (Join-Path $root "pyproject.toml") -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1
+  if (-not $versionMatch) {
+    throw "Unable to read the project version from pyproject.toml; pass -Version explicitly."
+  }
+  $pyprojectVersion = $versionMatch.Matches[0].Groups[1].Value
+  # 1.10.0 -> V1.10；其他版本号保持原样（如 1.06.1 -> V1.06.1）
+  $displayVersion = if ($pyprojectVersion -match '^\d+\.\d+\.0$') { $pyprojectVersion -replace '\.0$', '' } else { $pyprojectVersion }
+  ("V" + $displayVersion) -replace "[^A-Za-z0-9._-]", "-"
 } else {
   ($Version.Trim() -replace "[^A-Za-z0-9._-]", "-")
 }
