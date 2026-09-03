@@ -2,7 +2,15 @@ import { ApiError, request } from './api'
 
 // --- Tag Wiki Types (mirrors backend/tagger2/tag_wiki/contracts.py) ---
 
-export type TagWikiProfile = 'e621'
+export type TagWikiProfile = 'e621' | 'danbooru'
+
+/** Every wiki mirror the backend serves, in UI order. */
+export const WIKI_PROFILES: TagWikiProfile[] = ['e621', 'danbooru']
+
+export const WIKI_PROFILE_LABELS: Record<TagWikiProfile, string> = {
+  e621: 'e621',
+  danbooru: 'Danbooru',
+}
 
 export interface TagRef {
   name: string
@@ -81,6 +89,7 @@ export interface BuildStatus {
   started_at?: string | null
   updated_at?: string | null
   error?: string | null
+  profile?: TagWikiProfile
 }
 
 export type TranslateState = 'idle' | 'running' | 'error'
@@ -96,6 +105,7 @@ export interface TranslateStatus {
   started_at?: string | null
   updated_at?: string | null
   error?: string | null
+  profile?: TagWikiProfile
 }
 
 export interface WikiDatabaseStatus {
@@ -116,7 +126,15 @@ export interface WikiIndexStatus {
   min_post_count?: number
 }
 
+export interface TagWikiProfileStatus {
+  database: WikiDatabaseStatus
+  index: WikiIndexStatus
+}
+
 export interface TagWikiStatus {
+  /** Per-mirror database/index documents; keys follow TagWikiProfile. */
+  profiles?: Partial<Record<TagWikiProfile, TagWikiProfileStatus>>
+  /** Backward-compatible top-level view of the e621 profile. */
   database: WikiDatabaseStatus
   index: WikiIndexStatus
   build: BuildStatus
@@ -124,12 +142,14 @@ export interface TagWikiStatus {
 }
 
 export interface BuildRequest {
+  profile?: TagWikiProfile
   download_dump?: boolean
   reindex?: boolean
   force_reembed?: boolean
 }
 
 export interface TranslateRequest {
+  profile?: TagWikiProfile
   scope: 'model_vocab' | 'popular' | 'all'
   min_post_count?: number
   max_pages?: number
@@ -140,6 +160,7 @@ export interface TranslateRequest {
 export interface SearchRequest {
   query: string
   top_k?: number
+  profile?: TagWikiProfile
 }
 
 export interface AskRequest {
@@ -147,6 +168,7 @@ export interface AskRequest {
   top_k?: number
   provider_id?: string
   model?: string
+  profile?: TagWikiProfile
 }
 
 // --- Tag Wiki API Client ---
@@ -218,5 +240,9 @@ export const tagWikiApi = {
       body: JSON.stringify(body),
     }),
 
-  page: (title: string) => request<WikiPageInfo>(`/tag-wiki/page/${encodeURIComponent(title)}`),
+  page: (title: string, profile: TagWikiProfile = 'e621') => {
+    const search = new URLSearchParams()
+    search.set('profile', profile)
+    return request<WikiPageInfo>(`/tag-wiki/page/${encodeURIComponent(title)}?${search.toString()}`)
+  },
 }

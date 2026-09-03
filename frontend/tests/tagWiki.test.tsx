@@ -14,6 +14,42 @@ import { ApiError } from '../src/lib/api'
 import { usePreferences } from '../src/store/app'
 
 const mockStatus: TagWikiStatus = {
+  profiles: {
+    e621: {
+      database: {
+        exists: true,
+        pages: 1250,
+        chunks: 3500,
+        embedded_chunks: 3400,
+        translated_pages: 500,
+        dump_date: '2026-09-01',
+      },
+      index: {
+        embedding_model: 'intfloat/multilingual-e5-small',
+        embedding_model_ready: true,
+        dimension: 384,
+        fts_enabled: true,
+        search_ready: true,
+      },
+    },
+    danbooru: {
+      database: {
+        exists: true,
+        pages: 216356,
+        chunks: 320390,
+        embedded_chunks: 320390,
+        translated_pages: 0,
+        dump_date: null,
+      },
+      index: {
+        embedding_model: 'intfloat/multilingual-e5-small',
+        embedding_model_ready: true,
+        dimension: 384,
+        fts_enabled: true,
+        search_ready: true,
+      },
+    },
+  },
   database: {
     exists: true,
     pages: 1250,
@@ -258,7 +294,7 @@ describe('TagWiki Page & WikiDrawer', () => {
     fireEvent.click(screen.getByRole('button', { name: '检索 Wiki 章节' }))
 
     await waitFor(() => expect(state.searchBodies).toHaveLength(1))
-    expect(state.searchBodies[0]).toEqual({ query: 'solo character', top_k: 8 })
+    expect(state.searchBodies[0]).toEqual({ query: 'solo character', top_k: 8, profile: 'e621' })
 
     expect(await screen.findByText('推荐候选标签')).toBeInTheDocument()
     expect(screen.getByText(/The solo tag is applied when only one character is present/)).toBeInTheDocument()
@@ -279,6 +315,24 @@ describe('TagWiki Page & WikiDrawer', () => {
     expect(await screen.findByText(/solo 标签用于表示画面中只有一名角色。/)).toBeInTheDocument()
     expect(screen.getByText('提及标签')).toBeInTheDocument()
     expect(screen.getByText('参考来源')).toBeInTheDocument()
+  })
+
+  it('switches the wiki profile and threads it into queries', async () => {
+    setupFetch(state)
+    renderTagWikiPage()
+
+    // Switch to the danbooru mirror: its own status chips appear and the
+    // build panel title follows the active profile.
+    fireEvent.click(screen.getByRole('button', { name: 'Danbooru' }))
+    expect(await screen.findByText(/216,356/)).toBeInTheDocument()
+    expect(screen.getByText('Danbooru Wiki 数据库与翻译构建')).toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('tab', { name: /语义搜索/ }))
+    const textarea = screen.getByLabelText('语义搜索内容')
+    fireEvent.change(textarea, { target: { value: 'twintails pose' } })
+    fireEvent.click(screen.getByRole('button', { name: '检索 Wiki 章节' }))
+    await waitFor(() => expect(state.searchBodies).toHaveLength(1))
+    expect(state.searchBodies[0]).toMatchObject({ query: 'twintails pose', profile: 'danbooru' })
   })
 
   it('shows guidance and navigation button when 409 wiki_ask_unavailable occurs', async () => {

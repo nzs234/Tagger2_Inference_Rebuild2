@@ -81,6 +81,6 @@ export function TagPillEditor({ entries, profile, addLabel, onAdd, onRemove, dis
       })}
     </div> : <p className="tm-pill-empty">暂无标签</p>}
     <TagInput profile={profile} label={addLabel} onAdd={onAdd} disabled={disabled} />
-    {wikiTag && <WikiDrawer tag={wikiTag} onClose={() => setWikiTag(null)} />}
+    {wikiTag && <WikiDrawer tag={wikiTag} onClose={() => setWikiTag(null)} profile={profile} />}
   </div>
 }

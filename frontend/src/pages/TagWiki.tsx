@@ -17,9 +17,12 @@ import {
   describeWikiError,
   tagWikiApi,
   wikiErrorCode,
+  WIKI_PROFILES,
+  WIKI_PROFILE_LABELS,
   type AskResult,
   type LookupResult,
   type SearchResult,
+  type TagWikiProfile,
 } from '../lib/tagWiki'
 import { usePreferences } from '../store/app'
 
@@ -29,6 +32,7 @@ const TAB_ORDER: WikiMode[] = ['lookup', 'search', 'ask']
 
 export function TagWiki() {
   const [mode, setMode] = useState<WikiMode>('lookup')
+  const [profile, setProfile] = useState<TagWikiProfile>('e621')
 
   // Lookup state
   const [lookupInput, setLookupInput] = useState('')
@@ -63,17 +67,18 @@ export function TagWiki() {
 
   // Lookup mutation
   const lookupMutation = useMutation({
-    mutationFn: (tag: string) => tagWikiApi.lookup(tag),
+    mutationFn: (tag: string) => tagWikiApi.lookup(tag, profile),
   })
 
   // Search mutation
   const searchMutation = useMutation({
-    mutationFn: () => tagWikiApi.search({ query: searchQuery.trim(), top_k: searchTopK }),
+    mutationFn: () =>
+      tagWikiApi.search({ query: searchQuery.trim(), top_k: searchTopK, profile }),
   })
 
   // Ask mutation
   const askMutation = useMutation({
-    mutationFn: () => tagWikiApi.ask({ query: askQuery.trim(), top_k: askTopK }),
+    mutationFn: () => tagWikiApi.ask({ query: askQuery.trim(), top_k: askTopK, profile }),
   })
 
   const runLookup = (tag: string) => {
@@ -148,12 +153,28 @@ export function TagWiki() {
       <header className="page-header">
         <div className="page-title-group">
           <h1 className="page-title">Tag Wiki</h1>
-          <p className="page-subtitle">本地 E621 标签百科与语义检索 · 查含义 / 语义检索 / AI 问答</p>
+          <p className="page-subtitle">本地标签百科与语义检索 · 查含义 / 语义检索 / AI 问答</p>
+        </div>
+        <div className="tw-profile-switch" role="group" aria-label="Wiki 语料库">
+          {WIKI_PROFILES.map((name) => (
+            <button
+              key={name}
+              type="button"
+              className={`tw-profile-btn ${profile === name ? 'tw-profile-active' : ''}`}
+              aria-pressed={profile === name}
+              onClick={() => {
+                setProfile(name)
+                setGeneralError(null)
+              }}
+            >
+              {WIKI_PROFILE_LABELS[name]}
+            </button>
+          ))}
         </div>
       </header>
 
       {/* Top collapsible Build Panel */}
-      <BuildPanel />
+      <BuildPanel profile={profile} />
 
       {/* Main Mode Tabs */}
       <Panel className="tw-main-panel">
@@ -290,7 +311,7 @@ export function TagWiki() {
             {!lookupResult && !lookupMutation.isPending && !generalError && (
               <div className="tw-empty-pane">
                 <BookOpen size={36} className="muted" />
-                <p>输入任意 E621 标签名称，即刻查询其官方百科条目、隐含关联以及 AI 提炼的中文用法指南。</p>
+                <p>输入任意 {WIKI_PROFILE_LABELS[profile]} 标签名称，即刻查询其官方百科条目、隐含关联以及 AI 提炼的中文用法指南。</p>
               </div>
             )}
           </div>
@@ -526,7 +547,7 @@ export function TagWiki() {
             {!askResult && !askMutation.isPending && !generalError && (
               <div className="tw-empty-pane">
                 <HelpCircle size={36} className="muted" />
-                <p>基于本地 E621 Wiki 数据库的 RAG 知识问答。解答标签含义对比、搭配规则与打标建议。</p>
+                <p>基于本地 {WIKI_PROFILE_LABELS[profile]} Wiki 数据库的 RAG 知识问答。解答标签含义对比、搭配规则与打标建议。</p>
               </div>
             )}
           </div>

@@ -38,6 +38,7 @@ async def _run_build(args: argparse.Namespace) -> int:
     service = app.state.runtime.tag_wiki
     status = await service.start_build(
         BuildRequest(
+            profile=args.profile,
             download_dump=not args.no_download,
             reindex=not args.skip_reindex,
             force_reembed=args.force_reembed,
@@ -69,6 +70,7 @@ async def _run_translate(args: argparse.Namespace) -> int:
     service = app.state.runtime.tag_wiki
     progress = await service.start_translate(
         TranslateRequest(
+            profile=args.profile,
             scope=args.scope,
             min_post_count=args.min_post_count,
             max_pages=args.max_pages,
@@ -114,6 +116,12 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--status", action="store_true", help="print the wiki status document and exit")
     parser.add_argument("--build", action="store_true", help="download/import the wiki dump and build the vector index")
+    parser.add_argument(
+        "--profile",
+        choices=["e621", "danbooru"],
+        default="e621",
+        help="which wiki mirror to build/translate (danbooru corpus ships pre-imported)",
+    )
     parser.add_argument("--no-download", action="store_true", help="reuse the newest cached dump instead of re-checking e621")
     parser.add_argument("--skip-reindex", action="store_true", help="skip dump parsing (embedding model download + vector pass still run)")
     parser.add_argument("--force-reembed", action="store_true", help="re-embed every chunk even when unchanged")

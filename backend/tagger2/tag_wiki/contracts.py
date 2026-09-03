@@ -37,7 +37,7 @@ from typing import Any, Literal, TypedDict
 
 from pydantic import BaseModel, ConfigDict, Field
 
-TagWikiProfile = Literal["e621"]
+TagWikiProfile = Literal["e621", "danbooru"]
 
 # The embedding model is downloaded through the Hugging Face Hub into
 # ``data/tag_wiki/models/<repo>``; see embedder.py for the onnx/torch fallback.
@@ -74,6 +74,10 @@ class BuildRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
+    # Which mirror to build. The danbooru corpus ships pre-imported (see
+    # scripts/fetch_danbooru_wiki.py), so its build only refreshes pruning and
+    # the vector index; download_dump/reindex are e621-only and ignored.
+    profile: TagWikiProfile = "e621"
     # Re-check e621 db_export for a newer wiki_pages dump. When False the
     # build reuses the newest dump file already cached under
     # ``data/tag_wiki/downloads/`` (if any).
@@ -90,6 +94,8 @@ class TranslateRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
+    # Which mirror's pages to summarize.
+    profile: TagWikiProfile = "e621"
     # ``model_vocab``: pages for tags that appear in any local tagger model's
     # vocabulary. ``popular``: pages whose tag post_count >= min_post_count.
     # ``all``: every page that resolves to a known tag.
@@ -109,6 +115,7 @@ class SearchRequest(BaseModel):
 
     query: str = Field(min_length=1, max_length=2000)
     top_k: int = Field(default=8, ge=1, le=50)
+    profile: TagWikiProfile = "e621"
 
 
 class AskRequest(BaseModel):
@@ -120,6 +127,7 @@ class AskRequest(BaseModel):
     top_k: int = Field(default=8, ge=1, le=50)
     provider_id: str | None = Field(default=None, max_length=128)
     model: str | None = Field(default=None, max_length=256)
+    profile: TagWikiProfile = "e621"
 
 
 # -- shared response shapes -------------------------------------------------
@@ -233,8 +241,14 @@ class TranslateStatusDict(TypedDict, total=False):
 
 
 class StatusDict(TypedDict, total=False):
-    """Response of ``GET /status``."""
+    """Response of ``GET /status``.
 
+    ``profiles`` carries the per-mirror ``database``/``index`` documents; the
+    top-level ``database``/``index`` keys mirror the e621 profile for
+    backward compatibility with older clients.
+    """
+
+    profiles: dict[str, Any]
     database: dict[str, Any]
     index: dict[str, Any]
     build: BuildStatusDict

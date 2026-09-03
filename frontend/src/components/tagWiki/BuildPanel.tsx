@@ -14,6 +14,8 @@ import {
   clampInt,
   describeWikiError,
   tagWikiApi,
+  WIKI_PROFILE_LABELS,
+  type TagWikiProfile,
   type TagWikiStatus,
   type TranslateRequest,
   type TranslateStatus,
@@ -29,7 +31,7 @@ const PHASE_LABELS: Record<string, string> = {
   done: '构建完成',
 }
 
-export function BuildPanel() {
+export function BuildPanel({ profile }: { profile: TagWikiProfile }) {
   const [collapsed, setCollapsed] = useState(false)
   const [downloadDump, setDownloadDump] = useState(true)
   const [reindex, setReindex] = useState(true)
@@ -56,9 +58,15 @@ export function BuildPanel() {
   const status = statusQuery.data
   const isTranslating = status?.translate?.state === 'running'
 
+  // Per-mirror database/index view; the top-level keys mirror e621 for
+  // older backends.
+  const profileStatus = status?.profiles?.[profile]
+  const db = profileStatus?.database ?? status?.database
+  const idx = profileStatus?.index ?? status?.index
+
   // Adopt the server-configured default threshold (config [tag_wiki]) once it
   // is known; the effect only re-runs when that configured value changes.
-  const configuredMinPostCount = status?.index?.min_post_count
+  const configuredMinPostCount = idx?.min_post_count
   useEffect(() => {
     if (typeof configuredMinPostCount === 'number' && configuredMinPostCount >= 0) {
       setMinPostCount(configuredMinPostCount)
@@ -87,7 +95,15 @@ export function BuildPanel() {
   }, [progressState, queryClient])
 
   const buildMutation = useMutation({
-    mutationFn: () => tagWikiApi.build({ download_dump: downloadDump, reindex, force_reembed: forceReembed }),
+    mutationFn: () =>
+      tagWikiApi.build({
+        profile,
+        // dump download / re-import are e621-only; the backend ignores them
+        // for the pre-imported danbooru corpus.
+        download_dump: profile === 'e621' ? downloadDump : undefined,
+        reindex: profile === 'e621' ? reindex : undefined,
+        force_reembed: forceReembed,
+      }),
     onSuccess: (data) => {
       queryClient.setQueryData(['tag-wiki', 'status'], data)
       setLocalError(null)
@@ -100,6 +116,7 @@ export function BuildPanel() {
   const translateMutation = useMutation({
     mutationFn: () =>
       tagWikiApi.translate({
+        profile,
         scope,
         min_post_count: scope === 'popular' ? minPostCount : undefined,
         max_pages: maxPages,
@@ -120,8 +137,6 @@ export function BuildPanel() {
 
   const build = status?.build
   const translate = status?.translate
-  const db = status?.database
-  const idx = status?.index
 
   const isBuilding = build?.state === 'running'
   const buildError = build?.error || (build?.state === 'error' ? build?.message : null)
@@ -139,9 +154,11 @@ export function BuildPanel() {
   return (
     <div className="tw-build-panel">
       <div className="tw-build-panel-header">
-        <div className="tw-build-title-row">
+          <div className="tw-build-title-row">
           <Database size={16} aria-hidden="true" />
-          <h2 className="tw-build-title">Wiki 数据库与翻译构建</h2>
+          <h2 className="tw-build-title">
+            {WIKI_PROFILE_LABELS[profile]} Wiki 数据库与翻译构建
+          </h2>
           {isBuilding && (
             <span className="tw-running-tag">
               <LoaderCircle size={12} className="spin" />
@@ -236,26 +253,31 @@ export function BuildPanel() {
             </Notice>
           )}
 
-          {/* Build options */}
+          {/* Build options — dump download / re-import only exist for e621;
+              the danbooru corpus ships pre-imported. */}
           <div className="tw-build-flags">
-            <label>
-              <input
-                type="checkbox"
-                checked={downloadDump}
-                disabled={isBuilding || isTranslating || buildMutation.isPending}
-                onChange={(e) => setDownloadDump(e.target.checked)}
-              />
-              下载最新 Dump
-            </label>
-            <label>
-              <input
-                type="checkbox"
-                checked={reindex}
-                disabled={isBuilding || isTranslating || buildMutation.isPending}
-                onChange={(e) => setReindex(e.target.checked)}
-              />
-              重建索引
-            </label>
+            {profile === 'e621' && (
+              <label>
+                <input
+                  type="checkbox"
+                  checked={downloadDump}
+                  disabled={isBuilding || isTranslating || buildMutation.isPending}
+                  onChange={(e) => setDownloadDump(e.target.checked)}
+                />
+                下载最新 Dump
+              </label>
+            )}
+            {profile === 'e621' && (
+              <label>
+                <input
+                  type="checkbox"
+                  checked={reindex}
+                  disabled={isBuilding || isTranslating || buildMutation.isPending}
+                  onChange={(e) => setReindex(e.target.checked)}
+                />
+                重建索引
+              </label>
+            )}
             <label>
               <input
                 type="checkbox"
@@ -277,7 +299,7 @@ export function BuildPanel() {
                 disabled={isBuilding || isTranslating || buildMutation.isPending}
                 onClick={() => buildMutation.mutate()}
               >
-                {isBuilding ? '正在构建 Wiki…' : '下载/更新 Wiki 数据'}
+                {isBuilding ? '正在构建 Wiki…' : profile === 'e621' ? '下载/更新 Wiki 数据' : '重建向量索引'}
               </Button>
             </div>
 

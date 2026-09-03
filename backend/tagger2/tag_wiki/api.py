@@ -48,9 +48,7 @@ def create_tag_wiki_router(service: TagWikiService) -> APIRouter:
     @router.get("/lookup")
     async def lookup(
         tag: str = Query(min_length=1, max_length=128),
-        # The local wiki mirror is e621-only; danbooru pages would resolve in
-        # the tag database but never in the store.
-        profile: str = Query(default="e621", pattern="^e621$"),
+        profile: str = Query(default="e621", pattern="^(e621|danbooru)$"),
     ):
         try:
             return await service.lookup(tag, profile=profile)
@@ -72,9 +70,12 @@ def create_tag_wiki_router(service: TagWikiService) -> APIRouter:
             raise _error(exc) from exc
 
     @router.get("/page/{title}")
-    async def page(title: str):
+    async def page(
+        title: str,
+        profile: str = Query(default="e621", pattern="^(e621|danbooru)$"),
+    ):
         try:
-            return await service.page(title)
+            return await service.page(title, profile=profile)
         except TagWikiError as exc:
             raise _error(exc) from exc
 

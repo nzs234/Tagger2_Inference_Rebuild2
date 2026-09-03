@@ -97,6 +97,6 @@ export function TagDisplayBar({ profile, missingTags }: {
       {profile} 离线词库：{dictionary.entries.toLocaleString('zh-CN')} 条
       {dictionary.updated ? ` · 生成于 ${dictionary.updated.slice(0, 10)}` : ''}
     </p>}
-    {wikiTag && <WikiDrawer tag={wikiTag} onClose={() => setWikiTag(null)} />}
+    {wikiTag && <WikiDrawer tag={wikiTag} onClose={() => setWikiTag(null)} profile={profile} />}
   </div>
 }

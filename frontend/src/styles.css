@@ -1237,6 +1237,11 @@ button.tm-pill:disabled, .tm-pill[role="button"][aria-disabled="true"] { cursor:
 .tw-main-panel { padding: 0; overflow: hidden; }
 .tw-tab-nav { display: flex; border-bottom: 1px solid var(--line); background: var(--surface-2); }
 .tw-tab-btn { display: inline-flex; align-items: center; gap: 6px; padding: 12px 20px; border: 0; border-bottom: 2px solid transparent; background: transparent; color: var(--muted); font-size: 13px; font-weight: 600; cursor: pointer; transition: all .15s ease; }
+.tw-profile-switch { display: inline-flex; align-items: center; gap: 4px; padding: 3px; border: 1px solid var(--border); border-radius: 999px; background: var(--surface-2, transparent); }
+.tw-profile-btn { padding: 5px 14px; border: 0; border-radius: 999px; background: transparent; color: var(--muted); font-size: 12px; font-weight: 600; cursor: pointer; transition: all .15s ease; }
+.tw-profile-btn:hover { color: var(--text); }
+.tw-profile-btn.tw-profile-active { background: var(--accent); color: #fff; }
+
 .tw-tab-btn:hover { color: var(--ink); background: var(--surface-3); }
 .tw-tab-active { color: var(--accent-strong); border-bottom-color: var(--accent); background: var(--surface); }
 .tw-error-container { padding: 14px 18px 0; }

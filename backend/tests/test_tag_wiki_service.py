@@ -240,7 +240,7 @@ async def test_start_translate_returns_409_while_running(tmp_path: Path) -> None
     service = make_service(tmp_path, store=store, tag_database=HUG_TAG_DB, provider=provider)
 
     async def slow_translate(
-        provider: Any, provider_id: str, titles: list[str], model: str | None
+        provider: Any, provider_id: str, titles: list[str], model: str | None, profile: str
     ) -> None:
         await asyncio.sleep(60)
 
@@ -613,3 +613,107 @@ def test_api_translate_and_validation(tmp_path: Path) -> None:
     progress = client.get("/api/v1/tag-wiki/translate/progress")
     assert progress.status_code == 200
     assert progress.json()["state"] == "idle"
+
+
+# -- danbooru profile ---------------------------------------------------------
+
+
+async def test_danbooru_profile_lookup_and_search(tmp_path: Path) -> None:
+    """The danbooru mirror resolves through its own store; profiles stay apart."""
+
+    e621_store = WikiStore(tmp_path / "tag_wiki.sqlite3")
+    seed_page(e621_store, "hug")
+    danbooru_store = WikiStore(tmp_path / "tag_wiki_danbooru.sqlite3")
+    seed_page(danbooru_store, "hug")
+    seed_page(danbooru_store, "straight_hair")
+    tag_database = FakeTagDatabase(
+        {
+            "hug": _info("hug", post_count=500),
+            "straight_hair": _info("straight_hair", post_count=900),
+        }
+    )
+    service = TagWikiService(
+        store=e621_store,
+        danbooru_store=danbooru_store,
+        tag_database=tag_database,
+        translations=FakeTranslations(),
+        data_dir=tmp_path,
+    )
+
+    status = service.status()
+    assert status["profiles"]["e621"]["database"]["pages"] == 1
+    assert status["profiles"]["danbooru"]["database"]["pages"] == 2
+    assert status["database"]["pages"] == 1  # backward-compatible e621 view
+
+    lookup = await service.lookup("hug", profile="danbooru")
+    assert lookup["resolved"] is True
+    assert lookup["page"] is not None
+    assert lookup["tag"] is not None and lookup["tag"]["name"] == "hug"
+
+    result = await service.search(SearchRequest(query="hugging", top_k=4, profile="danbooru"))
+    assert {hit["page_title"] for hit in result["items"]} <= {"hug", "straight_hair"}
+    e621_result = await service.search(SearchRequest(query="hugging", top_k=4))
+    assert all(hit["page_title"] != "straight_hair" for hit in e621_result["items"])
+    await service.aclose()
+
+
+async def test_danbooru_ask_uses_profile_prompt(tmp_path: Path) -> None:
+    """Ask over the danbooru mirror grounds in danbooru pages and wording."""
+
+    store = WikiStore(tmp_path / "tag_wiki_danbooru.sqlite3")
+    seed_page(store, "hug")
+    provider = FakeProvider(reply=json.dumps({"answer": "拥抱动作。", "tags": ["couple"]}, ensure_ascii=False))
+    service = TagWikiService(
+        danbooru_store=store,
+        tag_database=FakeTagDatabase({"hug": _info("hug")}),
+        translations=FakeTranslations(),
+        provider_factory=lambda pid: provider,
+        provider_ids=lambda: ["fake"],
+        data_dir=tmp_path,
+    )
+    result = await service.ask(AskRequest(query="拥抱", top_k=4, profile="danbooru"))
+    assert result["answer"] == "拥抱动作。"
+    assert "danbooru" in provider.calls[0]["system_prompt"]
+    await service.aclose()
+
+
+async def test_danbooru_build_skips_dump_and_embeds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A danbooru build never touches the e621 dump: prune + vector pass only."""
+
+    danbooru_store = WikiStore(tmp_path / "tag_wiki_danbooru.sqlite3")
+    seed_page(danbooru_store, "hug")
+    seed_page(danbooru_store, "some_artist")
+    service = TagWikiService(
+        danbooru_store=danbooru_store,
+        tag_database=FakeTagDatabase(
+            {"hug": _info("hug"), "some_artist": _info("some_artist", category="artist")}
+        ),
+        translations=FakeTranslations(),
+        data_dir=tmp_path,
+    )
+
+    def fake_ensure(repo_id: str, models_root: Path, **_: Any) -> Path:
+        target = models_root / repo_id.replace("/", "__")
+        target.mkdir(parents=True, exist_ok=True)
+        return target
+
+    from tagger2.tag_wiki import service as service_module
+
+    monkeypatch.setattr(service_module, "ensure_model_downloaded", fake_ensure)
+    monkeypatch.setattr(service, "_get_embedder", lambda: (FakeEmbedder(), ""))
+
+    await service.start_build(BuildRequest(profile="danbooru"))
+    assert service._build_task is not None
+    await service._build_task
+
+    final = service.status()
+    assert final["build"]["phase"] == "done"
+    assert final["build"]["state"] == "idle"
+    # The artist page was pruned, the general page embedded.
+    assert final["profiles"]["danbooru"]["database"]["pages"] == 2
+    assert final["profiles"]["danbooru"]["database"]["embedded_chunks"] == 1
+    # The e621 store was never created: the dump pipeline stayed untouched.
+    assert not (tmp_path / "tag_wiki.sqlite3").exists()
+    await service.aclose()

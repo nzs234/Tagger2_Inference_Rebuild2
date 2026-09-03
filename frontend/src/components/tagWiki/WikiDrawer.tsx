@@ -1,16 +1,23 @@
 import { useEffect, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { BookOpen, LoaderCircle, X } from 'lucide-react'
-import { describeWikiError, tagWikiApi, type LookupResult } from '../../lib/tagWiki'
+import {
+  describeWikiError,
+  tagWikiApi,
+  type LookupResult,
+  type TagWikiProfile,
+} from '../../lib/tagWiki'
 import { DialogLayer, IconButton, Notice } from '../ui'
 import { LookupResultCard } from './ResultCards'
 
 export function WikiDrawer({
   tag,
   onClose,
+  profile = 'e621',
 }: {
   tag: string | null
   onClose: () => void
+  profile?: TagWikiProfile
 }) {
   const [currentTag, setCurrentTag] = useState<string | null>(tag)
   const activeTag = currentTag ?? tag
@@ -22,8 +29,8 @@ export function WikiDrawer({
   }, [tag])
 
   const lookupQuery = useQuery<LookupResult>({
-    queryKey: ['tag-wiki', 'lookup', activeTag],
-    queryFn: () => tagWikiApi.lookup(activeTag!),
+    queryKey: ['tag-wiki', 'lookup', profile, activeTag],
+    queryFn: () => tagWikiApi.lookup(activeTag!, profile),
     enabled: Boolean(activeTag),
     retry: 1,
   })
