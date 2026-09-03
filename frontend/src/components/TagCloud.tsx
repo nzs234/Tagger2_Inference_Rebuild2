@@ -1,5 +1,8 @@
+import { useState } from 'react'
+import { BookOpen } from 'lucide-react'
 import { mergeTags } from '../lib/anima'
 import type { TagItem } from '../types'
+import { WikiDrawer } from './tagWiki/WikiDrawer'
 
 const categoryNames: Record<string, string> = {
   quality: '质量',
@@ -21,6 +24,7 @@ const categoryOrder: Record<string, number> = {
 }
 
 export function TagCloud({ tags }: { tags: TagItem[] }) {
+  const [wikiTag, setWikiTag] = useState<string | null>(null)
   const groups = new Map<string, TagItem[]>()
   for (const tag of mergeTags(tags)) groups.set(tag.category, [...(groups.get(tag.category) ?? []), tag])
   if (!groups.size) return <p className="muted">暂无标签</p>
@@ -30,10 +34,25 @@ export function TagCloud({ tags }: { tags: TagItem[] }) {
         <div className="tag-group-title"><span>{categoryNames[category] ?? category}</span><small>{values.length}</small></div>
         <div className="tag-pills">
           {values.map((tag) => <span className="tag-pill" title={tag.score == null ? tag.source : `${tag.source} · ${Math.round(tag.score * 100)}%`} key={`${category}:${tag.text}`}>
-            {tag.text}{tag.score != null && <small>{Math.round(tag.score * 100)}%</small>}
+            <span>{tag.text}</span>
+            {tag.score != null && <small>{Math.round(tag.score * 100)}%</small>}
+            <button
+              type="button"
+              className="tag-pill-wiki-btn"
+              title={`查看 ${tag.text} 的 Wiki`}
+              aria-label={`查看 ${tag.text} 的 Wiki`}
+              onClick={(e) => {
+                e.stopPropagation()
+                setWikiTag(tag.text)
+              }}
+            >
+              <BookOpen size={12} aria-hidden="true" />
+            </button>
           </span>)}
         </div>
       </div>
     ))}
+    {wikiTag && <WikiDrawer tag={wikiTag} onClose={() => setWikiTag(null)} />}
   </div>
 }
+

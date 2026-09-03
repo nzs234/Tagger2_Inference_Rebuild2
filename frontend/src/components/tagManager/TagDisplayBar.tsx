@@ -1,7 +1,9 @@
-import { Languages } from 'lucide-react'
+import { useState } from 'react'
+import { BookOpen, Languages } from 'lucide-react'
 import { tagManagerApi, type TagManagerProfile } from '../../lib/tagManager'
 import { useQuery } from '@tanstack/react-query'
 import { usePreferences } from '../../store/app'
+import { WikiDrawer } from '../tagWiki/WikiDrawer'
 import { TranslateMissingButton } from './TranslateMissingButton'
 
 /**
@@ -13,10 +15,19 @@ export function TagDisplayBar({ profile, missingTags }: {
   profile: TagManagerProfile
   missingTags?: string[]
 }) {
+  const [wikiTag, setWikiTag] = useState<string | null>(null)
+  const [wikiInput, setWikiInput] = useState('')
   const bilingual = usePreferences((state) => state.bilingualTags)
   const setBilingual = usePreferences((state) => state.setBilingualTags)
   const tagStyle = usePreferences((state) => state.tagStyle)
   const setTagStyle = usePreferences((state) => state.setTagStyle)
+
+  const openWiki = () => {
+    const tag = wikiInput.trim()
+    if (!tag) return
+    setWikiTag(tag)
+    setWikiInput('')
+  }
 
   const info = useQuery({
     queryKey: ['tag-manager', 'tag-db-info'],
@@ -58,6 +69,25 @@ export function TagDisplayBar({ profile, missingTags }: {
           : '下划线模式下保存时标签以下划线写入 sidecar'}
       </span>
       {missingTags != null && <TranslateMissingButton profile={profile} tags={missingTags} />}
+      <form
+        className="tm-wiki-lookup"
+        onSubmit={(event) => {
+          event.preventDefault()
+          openWiki()
+        }}
+      >
+        <input
+          type="text"
+          aria-label="在 Tag Wiki 中查询标签"
+          placeholder="查询标签 Wiki，如 solo"
+          value={wikiInput}
+          onChange={(event) => setWikiInput(event.target.value)}
+        />
+        <button type="submit" disabled={!wikiInput.trim()} title={`在本页内置 Wiki 中查询 ${wikiInput.trim() || '标签'}`}>
+          <BookOpen size={13} aria-hidden="true" />
+          <span>查 Wiki</span>
+        </button>
+      </form>
     </div>
     {dictionaryMissing && <p className="tm-toolbar-hint tm-toolbar-warning">
       <Languages size={13} aria-hidden="true" />
@@ -67,5 +97,6 @@ export function TagDisplayBar({ profile, missingTags }: {
       {profile} 离线词库：{dictionary.entries.toLocaleString('zh-CN')} 条
       {dictionary.updated ? ` · 生成于 ${dictionary.updated.slice(0, 10)}` : ''}
     </p>}
+    {wikiTag && <WikiDrawer tag={wikiTag} onClose={() => setWikiTag(null)} />}
   </div>
 }
