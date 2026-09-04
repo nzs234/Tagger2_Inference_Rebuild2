@@ -5,8 +5,10 @@ to touch SQLite or the store API itself):
 
 - ``next``: dump the first ``--count`` not-yet-summarized titles of a slice
   file into a JSON file (title -> {display_title, text}) using the exact page
-  text the regular pipeline feeds the model. Pages whose rendered text is
-  empty are unsummarizable; they are dropped from the slice and reported.
+  text the regular pipeline feeds the model. Dumped titles STAY in the slice:
+  only ``apply`` removes titles, so a worker that dies between the two steps
+  loses nothing. Pages whose rendered text is empty are unsummarizable; they
+  are dropped from the slice and reported.
 - ``apply``: validate a worker's output JSON (title -> summary fields),
   persist valid entries through :class:`WikiStore`, remove them from the
   slice file and print what remains. Entries without any usable text field
@@ -54,6 +56,8 @@ def _cmd_next(args: argparse.Namespace) -> None:
     for title in slice_titles:
         if len(pages) >= args.count:
             break
+        if title in pages or title in skipped_empty:
+            continue
         page = store.get_page(title)
         text = page_context_text(page) if page is not None else ""
         if not text:
@@ -64,13 +68,17 @@ def _cmd_next(args: argparse.Namespace) -> None:
             "text": text,
         }
     store.close()
-    done = set(pages) | set(skipped_empty)
+    done = set(skipped_empty)
     remaining = [t for t in slice_titles if t not in done]
     _save_slice(Path(args.slice), remaining)
-    Path(args.out).write_text(json.dumps(pages, ensure_ascii=False, indent=1), encoding="utf-8")
     print(
         json.dumps(
-            {"dumped": len(pages), "skipped_empty": skipped_empty, "remaining_in_slice": len(remaining)},
+            {
+                "dumped": len(pages),
+                "skipped_empty": skipped_empty,
+                "remaining_in_slice": len(remaining),
+                "note": "dumped titles stay in the slice until apply",
+            },
             ensure_ascii=False,
         )
     )
