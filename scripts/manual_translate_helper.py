@@ -68,6 +68,8 @@ def _cmd_next(args: argparse.Namespace) -> None:
             "text": text,
         }
     store.close()
+    out_path = Path(args.out)
+    out_path.write_text(json.dumps(pages, ensure_ascii=False, indent=1), encoding="utf-8")
     done = set(skipped_empty)
     remaining = [t for t in slice_titles if t not in done]
     _save_slice(Path(args.slice), remaining)
