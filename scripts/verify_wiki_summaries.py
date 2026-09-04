@@ -43,8 +43,8 @@ JUDGE_SYSTEM_PROMPT = (
     "逐条判断中文摘要是否忠实于原文：含义有没有错、有没有编造原文没有的内容、usage 方向是否正确。"
     "轻微的措辞差异或简化判 accurate；实质错误（含义错误、编造、张冠李戴）判 inaccurate；"
     "介于两者之间判 minor。原文太短时只要求摘要不与原文矛盾。"
-    "返回 ONLY 一个 JSON 对象：{\"verdicts\": [{\"title\": \"...\", \"verdict\": \"accurate|minor|inaccurate\", "
-    "\"reason\": \"一句话中文理由\"}]}，verdicts 数组必须覆盖输入的每一个 title。不要输出 JSON 以外的内容。"
+    '返回 ONLY 一个 JSON 对象：{"verdicts": [{"title": "...", "verdict": "accurate|minor|inaccurate", '
+    '"reason": "一句话中文理由"}]}，verdicts 数组必须覆盖输入的每一个 title。不要输出 JSON 以外的内容。'
 )
 
 VERDICTS = {"accurate", "minor", "inaccurate"}
@@ -55,7 +55,7 @@ def _collect_entries(profile: str, path: Path) -> list[dict[str, str]]:
     from tagger2.tag_wiki.wiki_store import WikiStore
 
     store = WikiStore(path)
-    entries: list[dict[str, str]] = []
+    entries: list[dict[str, Any]] = []
     with store.connection() as conn:
         rows = conn.execute(
             "SELECT page_title, meaning, usage, pairing, notes, tags FROM summaries ORDER BY page_title"
@@ -68,7 +68,13 @@ def _collect_entries(profile: str, path: Path) -> list[dict[str, str]]:
                 "profile": profile,
                 "title": title,
                 "text": text,
-                "summary": {"meaning": meaning, "usage": usage, "pairing": pairing, "notes": notes, "tags": tags_json},
+                "summary": {
+                    "meaning": meaning,
+                    "usage": usage,
+                    "pairing": pairing,
+                    "notes": notes,
+                    "tags": tags_json,
+                },
             }
         )
     store.close()
@@ -89,10 +95,16 @@ def _load_done(out_path: Path) -> set[str]:
 
 async def _judge_batch(provider: Any, batch: list[dict[str, str]]) -> dict[str, dict[str, str]]:
     payload = json.dumps(
-        {"entries": [{"title": e["title"], "text": e["text"], "summary": e["summary"]} for e in batch]},
+        {
+            "entries": [
+                {"title": e["title"], "text": e["text"], "summary": e["summary"]} for e in batch
+            ]
+        },
         ensure_ascii=False,
     )
-    reply = await provider.generate(image=None, prompt=payload, model=None, system_prompt=JUDGE_SYSTEM_PROMPT)
+    reply = await provider.generate(
+        image=None, prompt=payload, model=None, system_prompt=JUDGE_SYSTEM_PROMPT
+    )
     from tagger2.tag_wiki.translator import extract_summary_json
 
     data = extract_summary_json(str(reply or ""))
@@ -103,39 +115,112 @@ async def _judge_batch(provider: Any, batch: list[dict[str, str]]) -> dict[str, 
         verdict = str(item.get("verdict", "")).strip().casefold()
         if verdict not in VERDICTS:
             verdict = "minor" if verdict else "error"
-        verdicts[str(item["title"])] = {"verdict": verdict, "reason": str(item.get("reason", "")).strip()}
+        verdicts[str(item["title"])] = {
+            "verdict": verdict,
+            "reason": str(item.get("reason", "")).strip(),
+        }
     return verdicts
 
 
-async def _sweep(args: argparse.Namespace) -> None:
-    from tagger2.providers.client import VisionProvider  # noqa: F401  (typing only)
+def _build_provider(args: argparse.Namespace) -> Any:
+    if args.judge == "lmstudio":
+        cfg = ProviderConfig(
+            kind=ProviderKind.LM_STUDIO,
+            base_url=args.base_url,
+            model=args.model,
+            temperature=0.1,
+            top_p=0.9,
+            max_output_tokens=2048,
+            timeout_seconds=300.0,
+            max_concurrency=args.concurrency,
+            max_retries=1,
+            allow_local=True,
+            json_mode=False,
+            id="verify-judge",
+        )
+        return create_provider(cfg)
+    if args.judge == "cpa":
+        return _profile_provider(args)
+    raise SystemExit(f"unknown judge: {args.judge}")
 
-    cfg = ProviderConfig(
-        kind=ProviderKind.LM_STUDIO,
-        base_url=args.base_url,
-        model=args.model,
-        temperature=0.1,
-        top_p=0.9,
-        max_output_tokens=2048,
-        timeout_seconds=300.0,
-        max_concurrency=args.concurrency,
-        max_retries=1,
-        allow_local=True,
-        json_mode=False,
-        id="verify-judge",
+
+def _profile_provider(args: argparse.Namespace) -> Any:
+    """Build a provider from a stored app profile (e.g. the cpa Gemini proxy)."""
+    import sqlite3
+
+    app_db = project_root / "data" / "tagger2.sqlite3"
+    conn = sqlite3.connect(app_db)
+    conn.row_factory = sqlite3.Row
+    row = conn.execute("SELECT * FROM provider_profiles WHERE id=?", (args.judge,)).fetchone()
+    conn.close()
+    if row is None:
+        raise SystemExit(f"provider profile not found in {app_db}: {args.judge}")
+    cfg = json.loads(row["config_json"]) if row["config_json"] else {}
+    cfg.update(
+        {"id": args.judge, "name": row["name"], "kind": row["kind"], "base_url": row["base_url"]}
     )
-    provider = create_provider(cfg)
+    cfg["backup_model"] = cfg.pop("fallback_model", cfg.get("backup_model"))
+    cfg["max_retries"] = cfg.pop("retries", cfg.get("max_retries", 2))
+    # Image-generation routing is handled by its dedicated adapter.
+    for image_key in ("image_enabled", "image_family", "image_base_url", "image_api_style"):
+        cfg.pop(image_key, None)
+    try:
+        from tagger2.secrets import CompositeSecretStore
+
+        cfg["api_keys"] = tuple(
+            CompositeSecretStore().get_many(row["secret_ref"] or f"provider_{args.judge}")
+        )
+    except Exception:  # noqa: BLE001 - no keys stored / keyring unavailable; provider may still accept anonymous calls
+        cfg["api_keys"] = ()
+    # Judge settings: deterministic, generous timeout, script-level concurrency.
+    cfg["temperature"] = 0.1
+    cfg["timeout_seconds"] = 300.0
+    cfg["max_concurrency"] = args.concurrency
+    cfg["allow_local"] = True
+    cfg["id"] = f"verify-judge-{args.judge}"
+    return create_provider(ProviderConfig.from_mapping(cfg))
+
+
+def _load_titles_filters(items: list[str]) -> dict[str, set[str]]:
+    filters: dict[str, set[str]] = {}
+    for item in items:
+        profile, sep, path = item.partition("=")
+        if not sep:
+            raise SystemExit(f"--titles-file expects profile=path, got {item!r}")
+        titles = {
+            line.strip()
+            for line in Path(path).read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        }
+        filters.setdefault(profile.strip(), set()).update(titles)
+    return filters
+
+
+async def _sweep(args: argparse.Namespace) -> None:
+    provider = _build_provider(args)
 
     out_path = Path(args.out)
     done = _load_done(out_path)
-    entries: list[dict[str, str]] = []
+    entries: list[dict[str, Any]] = []
     for profile in args.profiles.split(","):
         entries.extend(_collect_entries(profile.strip(), DATABASES[profile.strip()]))
     todo = [e for e in entries if f"{e['profile']}:{e['title']}" not in done]
+    filters = _load_titles_filters(args.titles_file or [])
+    if filters:
+        todo = [e for e in todo if e["title"] in filters.get(e["profile"], set())]
     if args.limit:
         todo = todo[: args.limit]
     print(
-        json.dumps({"total": len(entries), "already_checked": len(entries) - len(todo), "todo": len(todo)}, ensure_ascii=False),
+        json.dumps(
+            {
+                "total": len(entries),
+                "already_checked": len(entries) - len(todo),
+                "todo": len(todo),
+                "titles_filter": {k: len(v) for k, v in filters.items()} or None,
+                "judge": args.judge,
+            },
+            ensure_ascii=False,
+        ),
         flush=True,
     )
 
@@ -167,7 +252,9 @@ async def _sweep(args: argparse.Namespace) -> None:
                         verdicts[entry["title"]] = {"verdict": "error", "reason": str(exc)[:200]}
                 lines = []
                 for entry in batch:
-                    verdict = verdicts.get(entry["title"], {"verdict": "error", "reason": "missing in judge reply"})
+                    verdict = verdicts.get(
+                        entry["title"], {"verdict": "error", "reason": "missing in judge reply"}
+                    )
                     stats[verdict["verdict"]] = stats.get(verdict["verdict"], 0) + 1
                     lines.append(
                         json.dumps(
@@ -222,22 +309,43 @@ def _aggregate(out_path: Path) -> None:
         stats[row.get("verdict", "error")] = stats.get(row.get("verdict", "error"), 0) + 1
         if row.get("verdict") in {"inaccurate", "error"}:
             flagged.append(row)
-    print(json.dumps({"checked": len(rows), "by_profile": by_profile}, ensure_ascii=False, indent=1))
+    print(
+        json.dumps({"checked": len(rows), "by_profile": by_profile}, ensure_ascii=False, indent=1)
+    )
     for row in flagged[:50]:
-        print(f"- [{row['profile']}] {row['title']}: {row.get('verdict')} — {row.get('reason', '')[:120]}")
+        print(
+            f"- [{row['profile']}] {row['title']}: {row.get('verdict')} — {row.get('reason', '')[:120]}"
+        )
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--profiles", default="e621,danbooru", help="comma-separated profiles to audit")
+    parser.add_argument(
+        "--profiles", default="e621,danbooru", help="comma-separated profiles to audit"
+    )
     parser.add_argument("--provider", default="lmstudio")
+    parser.add_argument(
+        "--judge",
+        default="lmstudio",
+        choices=["lmstudio", "cpa"],
+        help="which party judges (cpa loads the stored app profile)",
+    )
+    parser.add_argument(
+        "--titles-file",
+        action="append",
+        default=None,
+        metavar="PROFILE=PATH",
+        help="restrict the sweep to these titles (repeatable)",
+    )
     parser.add_argument("--base-url", default="http://127.0.0.1:1234/v1")
     parser.add_argument("--model", default="gemma-4-31b-jang_4m-crack")
     parser.add_argument("--concurrency", type=int, default=2)
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--out", default="data/tag_wiki/verify_results.jsonl")
     parser.add_argument("--limit", type=int, default=None, help="cap entries (smoke test)")
-    parser.add_argument("--summary", action="store_true", help="aggregate the results file and exit")
+    parser.add_argument(
+        "--summary", action="store_true", help="aggregate the results file and exit"
+    )
     args = parser.parse_args()
     if args.summary:
         _aggregate(Path(args.out))
