@@ -119,6 +119,7 @@ export interface WikiDatabaseStatus {
 
 export interface WikiIndexStatus {
   embedding_model: string
+  embedding_backend?: 'local' | 'openai'
   embedding_model_ready: boolean
   dimension: number | null
   fts_enabled: boolean
@@ -139,6 +140,9 @@ export interface TagWikiStatus {
   index: WikiIndexStatus
   build: BuildStatus
   translate: TranslateStatus
+  /** Finished-product mode: bundled databases are read-only, build/translate
+   *  endpoints answer 403 and the UI hides the maintenance controls. */
+  frozen?: boolean
 }
 
 export interface BuildRequest {

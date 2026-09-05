@@ -35,3 +35,26 @@ allow_unsafe_pickle = false
 embed_model_repo = "intfloat/multilingual-e5-small"
 # Default post_count threshold for the "popular tags" translation scope.
 min_post_count = 1000
+# Finished-product mode: with frozen = true the /build and /translate
+# endpoints are rejected (403) — the bundled wiki/vector databases are
+# read-only for end users. The maintainer builds locally with false, then
+# ships the databases with true.
+frozen = false
+# Embedding backend used for building vectors and embedding queries.
+#  - "local": ONNX/PyTorch weights under data/tag_wiki/models/<repo>
+#  - "openai": OpenAI-compatible /v1/embeddings server (e.g. LM Studio's
+#    local server) at embed_endpoint — handy for rebuilding with a stronger
+#    model (bge-m3, Qwen3-Embedding) on the maintainer's machine.
+# NOTE: rebuild and query must use the SAME model. If vectors are rebuilt
+# through a remote server, export that model to ONNX under
+# data/tag_wiki/models/<repo> (matching embed_model_repo) so end users
+# embed queries with the same model offline.
+#embed_backend = "local"
+#embed_endpoint = "http://127.0.0.1:1234/v1"
+#embed_model = ""          # empty = use the first model served by the endpoint
+#embed_api_key = ""        # only needed by non-LM Studio providers
+# Prefix overrides ("passage: "/"query: " for e5, "search_document: "/
+# "search_query: " for nomic, none for bge/qwen/gte). Absent = auto-detect
+# from the model name; set to "" to force no prefix.
+#embed_passage_prefix = ""
+#embed_query_prefix = ""

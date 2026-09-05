@@ -67,6 +67,7 @@ ERROR_WIKI_SEARCH_FAILED = "wiki_search_failed"
 ERROR_WIKI_ASK_FAILED = "wiki_ask_failed"
 ERROR_WIKI_BUILD_FAILED = "wiki_build_failed"
 ERROR_WIKI_TRANSLATE_FAILED = "wiki_translate_failed"
+ERROR_WIKI_FROZEN = "wiki_frozen"
 
 
 class BuildRequest(BaseModel):
@@ -270,6 +271,7 @@ __all__ = [
     "ERROR_WIKI_BUILD_FAILED",
     "ERROR_WIKI_BUSY",
     "ERROR_WIKI_EMBED_MODEL_UNAVAILABLE",
+    "ERROR_WIKI_FROZEN",
     "ERROR_WIKI_LOOKUP_FAILED",
     "ERROR_WIKI_NOT_BUILT",
     "ERROR_WIKI_PAGE_NOT_FOUND",

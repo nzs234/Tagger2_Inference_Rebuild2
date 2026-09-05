@@ -6,6 +6,7 @@ import sys
 import types
 from pathlib import Path
 
+import httpx
 import numpy as np
 import pytest
 
@@ -13,8 +14,10 @@ from tagger2.tag_wiki.contracts import ERROR_WIKI_EMBED_MODEL_UNAVAILABLE
 from tagger2.tag_wiki.embedder import (
     EmbeddingModelError,
     OnnxEmbedder,
+    OpenAIEmbedder,
     _mean_pooling,
     create_embedder,
+    default_remote_prefixes,
     model_dir_for,
 )
 
@@ -135,3 +138,155 @@ def test_onnx_embedder_feeds_required_token_type_ids(tmp_path: Path, monkeypatch
     # The required input was synthesized as zeros with input_ids' shape.
     assert "token_type_ids" in session.feeds
     assert np.array_equal(session.feeds["token_type_ids"], np.zeros_like(session.feeds["input_ids"]))
+
+
+# -- OpenAIEmbedder (OpenAI-compatible /v1/embeddings, e.g. LM Studio) -------
+
+
+class _FakeServer:
+    """Minimal OpenAI-compatible embeddings server over httpx.MockTransport.
+
+    Vectors encode which marker the text contains so per-text routing can be
+    asserted even though the fake replies with the ``index`` fields reversed.
+    """
+
+    def __init__(self, models: list[str], *, status: int = 200) -> None:
+        self.httpx = httpx
+        self.models = models
+        self.status = status
+        self.embedding_requests: list[list[str]] = []
+
+    def handler(self, request: "httpx.Request") -> "httpx.Response":
+        if request.url.path.endswith("/models"):
+            return self.httpx.Response(
+                200, json={"data": [{"id": name} for name in self.models]}
+            )
+        if request.url.path.endswith("/embeddings"):
+            if self.status >= 400:
+                return self.httpx.Response(self.status, text="boom")
+            import json
+
+            body = json.loads(request.content)
+            self.embedding_requests.append([str(t) for t in body["input"]])
+            vectors = [[1.0, 0.0] if "alpha" in t else [0.0, 2.0] for t in body["input"]]
+            data = [
+                {"index": i, "embedding": v}
+                for i, v in reversed(list(enumerate(vectors)))
+            ]
+            return self.httpx.Response(200, json={"data": data})
+        return self.httpx.Response(404)
+
+    def transport(self) -> "httpx.MockTransport":
+        return self.httpx.MockTransport(self.handler)
+
+
+def test_openai_embedder_resolves_model_and_dimension():
+    server = _FakeServer(["nomic-embed-text-v1.5"])
+    embedder = OpenAIEmbedder(endpoint="http://lm.studio/v1/", transport=server.transport())
+    assert embedder.model == "nomic-embed-text-v1.5"
+    assert embedder.dimension == 2
+    embedder.close()
+
+
+def test_openai_embedder_preserves_order_and_normalizes():
+    server = _FakeServer(["bge-m3"])
+    embedder = OpenAIEmbedder(
+        endpoint="http://lm.studio/v1",
+        transport=server.transport(),
+    )
+    vectors = embedder.embed_passages(["alpha one", "beta two", "alpha three"])
+    assert vectors.shape == (3, 2)
+    assert vectors.dtype == np.float32
+    # The fake answers in reversed index order; the embedder must restore it.
+    assert np.allclose(vectors[0], [1.0, 0.0])
+    assert np.allclose(vectors[1], [0.0, 1.0])
+    assert np.allclose(vectors[2], [1.0, 0.0])
+    # Rows are unit vectors: cosine search relies on the dot product.
+    assert np.allclose(np.linalg.norm(vectors, axis=1), 1.0)
+    query = embedder.embed_query("beta query")
+    assert query.shape == (2,)
+    assert np.allclose(query, [0.0, 1.0])
+    embedder.close()
+
+
+def test_openai_embedder_applies_prefixes_by_model_family():
+    server = _FakeServer(["text-embedding-nomic-embed-text-v1.5"])
+    embedder = OpenAIEmbedder(endpoint="http://x/v1", transport=server.transport())
+    embedder.embed_passages(["a", "b"])
+    embedder.embed_query("q")
+    # Request 0 is the construction-time dimension probe.
+    assert server.embedding_requests[1] == ["search_document: a", "search_document: b"]
+    assert server.embedding_requests[2] == ["search_query: q"]
+
+    server2 = _FakeServer(["intfloat/multilingual-e5-small"])
+    embedder2 = OpenAIEmbedder(endpoint="http://x/v1", transport=server2.transport())
+    embedder2.embed_passages(["a"])
+    embedder2.embed_query("q")
+    assert server2.embedding_requests[1] == ["passage: a"]
+    assert server2.embedding_requests[2] == ["query: q"]
+    embedder.close()
+    embedder2.close()
+
+
+def test_openai_embedder_explicit_prefix_override():
+    server = _FakeServer(["bge-m3"])
+    embedder = OpenAIEmbedder(
+        endpoint="http://x/v1",
+        transport=server.transport(),
+        passage_prefix="",
+        query_prefix="Q|",
+    )
+    embedder.embed_passages(["raw text"])
+    embedder.embed_query("q")
+    assert server.embedding_requests[1] == ["raw text"]
+    assert server.embedding_requests[2] == ["Q|q"]
+    embedder.close()
+
+
+def test_openai_embedder_batches_requests():
+    server = _FakeServer(["bge-m3"])
+    embedder = OpenAIEmbedder(
+        endpoint="http://x/v1",
+        transport=server.transport(),
+        batch_size=2,
+    )
+    vectors = embedder.embed_passages(["t1", "t2", "t3 alpha", "t4", "t5"])
+    assert vectors.shape == (5, 2)
+    # 5 texts at batch size 2 → 3 requests, plus the warm-up probe.
+    assert len(server.embedding_requests) == 4
+    embedder.close()
+
+
+def test_openai_embedder_errors_without_server(monkeypatch: pytest.MonkeyPatch):
+    import httpx
+
+    def refusing_handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused", request=request)
+
+    embedder_module = sys.modules["tagger2.tag_wiki.embedder"]
+    monkeypatch.setattr(embedder_module, "REMOTE_RETRY_ATTEMPTS", 1)
+    with pytest.raises(EmbeddingModelError) as exc_info:
+        OpenAIEmbedder(
+            endpoint="http://127.0.0.1:9/v1",
+            transport=httpx.MockTransport(refusing_handler),
+        )
+    assert exc_info.value.retryable is True
+
+
+def test_openai_embedder_http_error(monkeypatch: pytest.MonkeyPatch):
+    server = _FakeServer(["bge-m3"], status=500)
+    embedder_module = sys.modules["tagger2.tag_wiki.embedder"]
+    monkeypatch.setattr(embedder_module, "REMOTE_RETRY_ATTEMPTS", 1)
+    with pytest.raises(EmbeddingModelError):
+        embedder = OpenAIEmbedder(endpoint="http://x/v1", transport=server.transport())
+        embedder.embed_passages(["a"])
+
+
+def test_default_remote_prefixes():
+    assert default_remote_prefixes("nomic-embed-text-v1.5") == (
+        "search_document: ",
+        "search_query: ",
+    )
+    assert default_remote_prefixes("multilingual-e5-large") == ("passage: ", "query: ")
+    assert default_remote_prefixes("bge-m3") == ("", "")
+    assert default_remote_prefixes("Qwen3-Embedding-0.6B") == ("", "")

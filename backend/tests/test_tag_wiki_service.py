@@ -1064,3 +1064,87 @@ async def test_danbooru_build_skips_dump_and_embeds(
     # The e621 store was never created: the dump pipeline stayed untouched.
     assert not (tmp_path / "tag_wiki.sqlite3").exists()
     await service.aclose()
+
+
+class CapturingEmbedder:
+    """FakeEmbedder that records the passage texts it was asked to embed."""
+
+    dimension = 4
+
+    def __init__(self) -> None:
+        self.texts: list[str] = []
+
+    def embed_passages(self, texts: list[str]) -> np.ndarray:
+        self.texts.extend(texts)
+        return np.tile(np.array([0.5, 0.5, 0.5, 0.5], dtype=np.float32), (len(texts), 1))
+
+    def embed_query(self, text: str) -> np.ndarray:
+        return np.ones(4, dtype=np.float32)
+
+    def close(self) -> None:
+        pass
+
+
+async def test_embed_texts_include_page_title_without_prefix(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Passage text = page_title + heading + body, with no embedder prefix:
+    the tag name is the strongest retrieval anchor and prefixes belong to the
+    embedder implementations (the old code double-prefixed e5 passages)."""
+
+    store = WikiStore(tmp_path / "tag_wiki.sqlite3")
+    seed_page(store)
+    service = make_service(tmp_path, store=store)
+    embedder = CapturingEmbedder()
+    monkeypatch.setattr(service, "_get_embedder", lambda: (embedder, ""))
+
+    processed = service._embed_pending_sync(False, store)
+
+    assert processed == 1
+    assert len(embedder.texts) == 1
+    assert "passage:" not in embedder.texts[0]
+    assert embedder.texts[0].startswith("hug")
+    # title + heading + body joined by newlines (body content from seed_page)
+    assert "Usage" in embedder.texts[0]
+    assert "Use for hugging." in embedder.texts[0]
+    await service.aclose()
+
+
+async def test_frozen_mode_rejects_build_and_translate(tmp_path: Path) -> None:
+    """Packaged (frozen) builds answer 403 wiki_frozen on maintenance entry
+    points while lookups/search stay usable."""
+
+    store = WikiStore(tmp_path / "tag_wiki.sqlite3")
+    seed_page(store)
+    service = TagWikiService(
+        store=store,
+        tag_database=HUG_TAG_DB,
+        translations=FakeTranslations(),
+        data_dir=tmp_path,
+        frozen=True,
+    )
+
+    status = service.status()
+    assert status["frozen"] is True
+
+    with pytest.raises(TagWikiError) as build_exc:
+        await service.start_build(BuildRequest(profile="e621", download_dump=False, reindex=False))
+    assert build_exc.value.code == "wiki_frozen"
+    assert build_exc.value.status_code == 403
+
+    with pytest.raises(TagWikiError) as translate_exc:
+        await service.start_translate(TranslateRequest(profile="e621", scope="model_vocab"))
+    assert translate_exc.value.code == "wiki_frozen"
+    assert translate_exc.value.status_code == 403
+
+    # Read paths are untouched: lookup works on a seeded page.
+    result = await service.lookup("hug")
+    assert result["query"] == "hug"
+    await service.aclose()
+
+
+async def test_unfrozen_mode_exposes_frozen_false(tmp_path: Path) -> None:
+    store = WikiStore(tmp_path / "tag_wiki.sqlite3")
+    service = make_service(tmp_path, store=store)
+    assert service.status()["frozen"] is False
+    await service.aclose()

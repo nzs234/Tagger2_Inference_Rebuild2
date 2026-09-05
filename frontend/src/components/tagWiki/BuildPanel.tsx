@@ -58,6 +58,9 @@ export function BuildPanel({ profile }: { profile: TagWikiProfile }) {
 
   const status = statusQuery.data
   const isTranslating = status?.translate?.state === 'running'
+  // Finished-product mode: the backend rejects build/translate with 403, so
+  // the maintenance controls are hidden instead of inviting a dead click.
+  const frozen = status?.frozen === true
 
   // Per-mirror database/index view; the top-level keys mirror e621 for
   // older backends.
@@ -247,6 +250,13 @@ export function BuildPanel({ profile }: { profile: TagWikiProfile }) {
             </div>
           )}
 
+          {frozen && (
+            <Notice tone="info">
+              <Database size={15} />
+              <span>Wiki 数据与中文翻译已内置，可直接使用；数据维护由发布者完成，此面板不提供构建操作。</span>
+            </Notice>
+          )}
+
           {/* Error messages */}
           {(buildError || translateError || localError) && (
             <Notice tone="danger">
@@ -257,6 +267,7 @@ export function BuildPanel({ profile }: { profile: TagWikiProfile }) {
 
           {/* Build options — dump download / re-import only exist for e621;
               the danbooru corpus ships pre-imported. */}
+          {!frozen && (
           <div className="tw-build-flags">
             {profile === 'e621' && (
               <label>
@@ -290,9 +301,11 @@ export function BuildPanel({ profile }: { profile: TagWikiProfile }) {
               强制重新向量化
             </label>
           </div>
+          )}
 
           {/* Controls */}
           <div className="tw-build-actions-row">
+            {!frozen && (
             <div className="tw-build-action-group">
               <Button
                 variant="outline"
@@ -304,7 +317,9 @@ export function BuildPanel({ profile }: { profile: TagWikiProfile }) {
                 {isBuilding ? '正在构建 Wiki…' : profile === 'e621' ? '下载/更新 Wiki 数据' : '重建向量索引'}
               </Button>
             </div>
+            )}
 
+            {!frozen && (
             <div className="tw-translate-controls">
               <label className="tw-inline-label">
                 <span>翻译范围</span>
@@ -372,6 +387,7 @@ export function BuildPanel({ profile }: { profile: TagWikiProfile }) {
                 {isTranslating ? '正在翻译…' : '翻译中文摘要'}
               </Button>
             </div>
+            )}
 
             <button
               type="button"

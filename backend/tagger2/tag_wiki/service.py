@@ -44,6 +44,7 @@ from .contracts import (
     ERROR_WIKI_BUILD_FAILED,
     ERROR_WIKI_BUSY,
     ERROR_WIKI_EMBED_MODEL_UNAVAILABLE,
+    ERROR_WIKI_FROZEN,
     ERROR_WIKI_LOOKUP_FAILED,
     ERROR_WIKI_NOT_BUILT,
     ERROR_WIKI_PAGE_NOT_FOUND,
@@ -56,8 +57,10 @@ from .contracts import (
     TranslateRequest,
 )
 from .embedder import (
+    DEFAULT_REMOTE_ENDPOINT,
     Embedder,
     EmbeddingModelError,
+    OpenAIEmbedder,
     create_embedder,
     ensure_model_downloaded,
     model_dir_for,
@@ -289,6 +292,13 @@ class TagWikiService:
         data_dir: Path | None = None,
         embed_repo: str = DEFAULT_EMBED_MODEL_REPO,
         default_min_post_count: int = 1000,
+        embed_backend: str = "local",
+        embed_endpoint: str = DEFAULT_REMOTE_ENDPOINT,
+        embed_api_key: str = "",
+        embed_model: str = "",
+        embed_passage_prefix: str | None = None,
+        embed_query_prefix: str | None = None,
+        frozen: bool = False,
     ) -> None:
         if data_dir is None:
             from ..config import get_settings
@@ -311,6 +321,19 @@ class TagWikiService:
         self._vocab_provider = vocab_provider
         self._embed_repo = embed_repo
         self._default_min_post_count = max(0, int(default_min_post_count))
+        # Embedding backend: "local" runs an ONNX/PyTorch model from
+        # data/tag_wiki/models; "openai" talks to an OpenAI-compatible
+        # /v1/embeddings server (LM Studio) and skips local model files.
+        self._embed_backend = "openai" if embed_backend == "openai" else "local"
+        self._embed_endpoint = embed_endpoint or DEFAULT_REMOTE_ENDPOINT
+        self._embed_api_key = embed_api_key or ""
+        self._embed_model = (embed_model or "").strip()
+        self._embed_passage_prefix = embed_passage_prefix
+        self._embed_query_prefix = embed_query_prefix
+        # Frozen ships as a finished product: the bundled wiki/vector
+        # databases are maintained by the packager, so build and translate
+        # entry points are rejected with a 403 instead of racing the bundle.
+        self._frozen = bool(frozen)
         self._downloads_dir = self._data_dir / "tag_wiki" / "downloads"
         self._models_root = self._data_dir / "tag_wiki" / "models"
         # Embedder lifecycle: created lazily on first search/build, kept for
@@ -378,9 +401,15 @@ class TagWikiService:
         return model_dir_for(self._embed_repo, self._models_root)
 
     def model_ready(self) -> bool:
+        if self._embed_backend == "openai":
+            # Nothing to check on disk; reachability is verified (and cached)
+            # when the embedder is created, and a down server surfaces as
+            # keyword-only search with a logged warning.
+            return True
         model_dir = self._model_dir()
         return (
             (model_dir / "onnx" / "model.onnx").is_file()
+            or (model_dir / "model.onnx").is_file()
             or (model_dir / "model.safetensors").is_file()
             or (model_dir / "pytorch_model.bin").is_file()
         )
@@ -396,11 +425,33 @@ class TagWikiService:
             if self._embedder_loaded:
                 return self._embedder, self._embedder_error
             self._embedder_loaded = True
+            if self._embed_backend == "openai":
+                try:
+                    self._embedder = OpenAIEmbedder(
+                        endpoint=self._embed_endpoint,
+                        model=self._embed_model,
+                        api_key=self._embed_api_key,
+                        passage_prefix=self._embed_passage_prefix,
+                        query_prefix=self._embed_query_prefix,
+                    )
+                except EmbeddingModelError as exc:
+                    self._embedder = None
+                    self._embedder_error = str(exc)
+                    logger.warning("tag wiki remote embedder unavailable: %s", exc)
+                    # Unlike local model files, a remote server can come up
+                    # at any time — retry on the next call instead of
+                    # caching the failure for the process lifetime.
+                    self._embedder_loaded = False
+                return self._embedder, self._embedder_error
             if not self.model_ready():
                 self._embedder_error = "嵌入模型尚未下载：请先在构建面板完成一次构建"
                 return None, self._embedder_error
             try:
-                self._embedder = create_embedder(self._model_dir())
+                self._embedder = create_embedder(
+                    self._model_dir(),
+                    passage_prefix=self._embed_passage_prefix,
+                    query_prefix=self._embed_query_prefix,
+                )
             except EmbeddingModelError as exc:
                 self._embedder = None
                 self._embedder_error = str(exc)
@@ -409,15 +460,21 @@ class TagWikiService:
 
     def _get_searcher(self, profile: str = _WIKI_PROFILE) -> WikiSearcher:
         searcher = self._searchers.get(profile)
-        if searcher is None:
-            store = self._store_for(profile)
-            embedder, _error = self._get_embedder()
-            searcher = WikiSearcher(
-                store,
-                embedder,
-                chunk_loader=store.chunks_by_ids,
-            )
-            self._searchers[profile] = searcher
+        if searcher is not None:
+            return searcher
+        store = self._store_for(profile)
+        embedder, _error = self._get_embedder()
+        if embedder is None and self._embed_backend == "openai":
+            # A down remote server must not pin keyword-only search for the
+            # process lifetime: keep the searcher uncached so the next query
+            # retries the connection and picks up LM Studio once it runs.
+            return WikiSearcher(store, None, chunk_loader=store.chunks_by_ids)
+        searcher = WikiSearcher(
+            store,
+            embedder,
+            chunk_loader=store.chunks_by_ids,
+        )
+        self._searchers[profile] = searcher
         return searcher
 
     # -- status -------------------------------------------------------------
@@ -433,10 +490,15 @@ class TagWikiService:
             except ValueError:
                 dimension = None
         fts = store.fts_available()
+        embedding_model = self._embed_repo
+        if self._embed_backend == "openai":
+            label = self._embed_model or "(auto)"
+            embedding_model = f"{label} @ {self._embed_endpoint}"
         return {
             "database": meta,
             "index": {
-                "embedding_model": self._embed_repo,
+                "embedding_model": embedding_model,
+                "embedding_backend": self._embed_backend,
                 "embedding_model_ready": self.model_ready(),
                 "dimension": dimension,
                 "fts_enabled": fts,
@@ -453,13 +515,27 @@ class TagWikiService:
             # Backward-compatible top-level view of the e621 profile.
             "database": e621["database"],
             "index": e621["index"],
+            # True in packaged builds: the bundled databases are read-only and
+            # the maintenance entry points below return 403.
+            "frozen": self._frozen,
             "build": dict(self._build_state),
             "translate": dict(self._translate_state),
         }
 
     # -- build pipeline -----------------------------------------------------
 
+    def _require_not_frozen(self) -> None:
+        """Reject maintenance entry points in packaged (frozen) builds."""
+
+        if self._frozen:
+            raise TagWikiError(
+                "成品包模式下 wiki 数据为只读，构建/重建/翻译由发布者完成后随包分发",
+                code=ERROR_WIKI_FROZEN,
+                status_code=403,
+            )
+
     async def start_build(self, request: BuildRequest) -> dict[str, Any]:
+        self._require_not_frozen()
         if self._build_task is not None and not self._build_task.done():
             raise TagWikiError("已有一次构建在进行中", code=ERROR_WIKI_BUSY, status_code=409)
         self._set_build_state(
@@ -490,9 +566,11 @@ class TagWikiService:
             if pruned:
                 logger.info("tag wiki pruned %d unsearchable chunks (%s)", pruned, profile)
             self._set_build_state(phase="model", message="检查嵌入模型")
-            await asyncio.to_thread(ensure_model_downloaded, self._embed_repo, self._models_root)
-            # The model may have just appeared; rebuild the cached searcher so
-            # semantic search picks it up.
+            if self._embed_backend != "openai":
+                await asyncio.to_thread(ensure_model_downloaded, self._embed_repo, self._models_root)
+            # The model may have just appeared (or the remote server may have
+            # just come up); rebuild the cached searcher so semantic search
+            # picks it up.
             self._searchers.pop(profile, None)
             self._embedder_loaded = False
             self._set_build_state(phase="embed", message="向量索引中")
@@ -581,8 +659,16 @@ class TagWikiService:
             pending = target.pending_embedding_chunks(256)
             if not pending:
                 break
+            # The page title (the tag name) is the strongest semantic anchor
+            # for tag-wiki retrieval — many section bodies never mention the
+            # tag they belong to. Prefixes ("passage: ", "search_document: ")
+            # are the embedder's business, never added here.
             texts = [
-                f"passage: {chunk['heading']}\n{chunk['text']}" if chunk["heading"] else f"passage: {chunk['text']}"
+                "\n".join(
+                    part
+                    for part in (chunk["page_title"], chunk["heading"], chunk["text"])
+                    if part
+                )
                 for chunk in pending
             ]
             vectors = embedder.embed_passages(texts)
@@ -765,6 +851,7 @@ class TagWikiService:
     # -- translate ----------------------------------------------------------
 
     async def start_translate(self, request: TranslateRequest) -> dict[str, Any]:
+        self._require_not_frozen()
         if self._translate_task is not None and not self._translate_task.done():
             raise TagWikiError("已有一次翻译任务在进行中", code=ERROR_WIKI_BUSY, status_code=409)
         store = self._store_for(request.profile)

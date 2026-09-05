@@ -395,6 +395,13 @@ class Runtime:
             vocab_provider=self._tag_wiki_vocab,
             embed_repo=self.settings.tag_wiki_embed_repo,
             default_min_post_count=self.settings.tag_wiki_min_post_count,
+            embed_backend=self.settings.tag_wiki_embed_backend,
+            embed_endpoint=self.settings.tag_wiki_embed_endpoint,
+            embed_api_key=self.settings.tag_wiki_embed_api_key,
+            embed_model=self.settings.tag_wiki_embed_model,
+            embed_passage_prefix=self.settings.tag_wiki_embed_passage_prefix,
+            embed_query_prefix=self.settings.tag_wiki_embed_query_prefix,
+            frozen=self.settings.tag_wiki_frozen,
         )
         self.processors = ProcessorHost(self)
         self.job_manager = JobManager(self.storage)

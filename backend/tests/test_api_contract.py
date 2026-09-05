@@ -262,7 +262,10 @@ def test_model_category_thresholds_are_public_persistent_and_resettable(tmp_path
 
 
 def test_provider_type_is_editable_and_deleted_defaults_stay_deleted(tmp_path: Path) -> None:
-    with _client(tmp_path) as client:
+    # allow_local_providers: these tests exercise provider CRUD semantics, not
+    # URL policy, and public DNS may legitimately resolve through a local
+    # fake-ip proxy (e.g. 198.18.0.0/15) on dev machines.
+    with _client(tmp_path, allow_local_providers=True) as client:
         created = client.post(
             "/api/v1/providers",
             json={
@@ -299,7 +302,7 @@ def test_provider_type_is_editable_and_deleted_defaults_stay_deleted(tmp_path: P
         assert profile["id"] not in ids
         assert "gemini" not in ids
 
-    with _client(tmp_path) as restarted:
+    with _client(tmp_path, allow_local_providers=True) as restarted:
         ids = {item["id"] for item in restarted.get("/api/v1/providers").json()["items"]}
         assert "gemini" not in ids
 
@@ -319,7 +322,8 @@ def test_unsaved_provider_discovery_uses_ephemeral_keys_and_closes_client(tmp_pa
         return FakeProvider()
 
     monkeypatch.setattr("tagger2.main.create_provider", fake_create_provider)
-    with _client(tmp_path) as client:
+    # Provider discovery semantics, not URL policy: tolerate fake-ip DNS.
+    with _client(tmp_path, allow_local_providers=True) as client:
         before_ids = {item["id"] for item in client.get("/api/v1/providers").json()["items"]}
         response = client.post(
             "/api/v1/providers/discover-models",

@@ -104,7 +104,7 @@ data/tag_wiki/
 └── models/                     # intfloat__multilingual-e5-small 快照
 ```
 
-模块布局遵循 tag-manager 模板：`contracts.py`（pydantic 请求模型 + 响应 TypedDict）、`wiki_store.py`（SQLite，WAL + RLock + schema_migrations）、`importer.py`（e621 下载 + DText 解析 + 增量导入）、`danbooru_importer.py`（danbooru JSON API 分页抓取 + 增量导入）、`embedder.py`（ONNX/torch 双后端）、`searcher.py`（RRF 融合检索）、`translator.py`（摘要批任务）、`service.py`（编排 + 后台任务）、`api.py`（路由）。接线位于 `main.py` 的 `Runtime.__init__`（共享 tag 数据库与 provider 工厂，注入 `_tag_wiki_vocab`）与 `create_app`（SPA catch-all 之前挂载路由）。
+模块布局遵循 tag-manager 模板：`contracts.py`（pydantic 请求模型 + 响应 TypedDict）、`wiki_store.py`（SQLite，WAL + RLock + schema_migrations）、`importer.py`（e621 下载 + DText 解析 + 增量导入）、`danbooru_importer.py`（danbooru JSON API 分页抓取 + 增量导入）、`embedder.py`（ONNX/torch/OpenAI 兼容远程三后端）、`searcher.py`（RRF 融合检索）、`translator.py`（摘要批任务）、`service.py`（编排 + 后台任务）、`api.py`（路由）。接线位于 `main.py` 的 `Runtime.__init__`（共享 tag 数据库与 provider 工厂，注入 `_tag_wiki_vocab`）与 `create_app`（SPA catch-all 之前挂载路由）。
 
 ## 运行参数
 
@@ -117,9 +117,32 @@ data/tag_wiki/
 embed_model_repo = "intfloat/multilingual-e5-small"
 # 「高频标签」翻译范围 post_count 阈值的默认值（经 /status 下发，作为 UI 初始值）。
 min_post_count = 1000
+# 成品包模式：true 时 /build 与 /translate 直接返回 403（code: wiki_frozen），
+# 前端构建面板隐藏全部维护入口。发布者本地用 false 构建数据，随包分发时置 true。
+frozen = false
+# 嵌入后端："local" 用 data/tag_wiki/models 下的 ONNX/PyTorch 权重；
+# "openai" 调用 OpenAI 兼容的 /v1/embeddings 服务（如 LM Studio 本地 Server）。
+#embed_backend = "local"
+#embed_endpoint = "http://127.0.0.1:1234/v1"
+#embed_model = ""          # 留空 = 自动使用服务端列出的第一个模型
+#embed_api_key = ""        # 仅非 LM Studio 的服务需要
+#embed_passage_prefix = "" # 留空键 = 按模型名自动推断（nomic/e5 有前缀，bge/qwen 无）
+#embed_query_prefix = ""
 ```
 
-`embed_model_repo` 通过 `TagWikiService(embed_repo=...)` 注入；`min_post_count` 经 `GET /status` 的 `index.min_post_count` 下发给前端作为初始值。其余为代码内默认值（`contracts.py` / 各模块常量）：章节上限 `MAX_CHUNK_CHARS=1200`、ask 上下文预算 6000 字符/12 章节、摘要字段上限 400 字符。
+`embed_model_repo` 通过 `TagWikiService(embed_repo=...)` 注入；`min_post_count` 经 `GET /status` 的 `index.min_post_count` 下发给前端作为初始值。其余为代码内默认值（`contracts.py` / 各模块常量）：章节上限 `MAX_CHUNK_CHARS=1200`、ask 上下文预算 6000 字符/12 章节、摘要字段上限 400 字符。`GET /status` 另返回顶层 `frozen` 与 `index.embedding_backend`。
+
+### 成品包分发（frozen 模式）与模型一致性
+
+面向最终用户的包携带已构建完成的 wiki/向量数据库；发行脚本在打包阶段强制把包内 `config/app.toml` 置为 `frozen = true`（开发机本地保持 `frozen = false`）：构建、重建向量、中文翻译只由发布者执行，后端 403、前端隐藏维护面板，用户开箱即用。**重建与查询必须使用同一个嵌入模型**：
+
+- 当前基线：`shawnw3i/Qwen3-Embedding-0.6B-ONNX`（1024 维，last-token pooling）。模型首次使用时自动从 Hugging Face 下载（支持根目录或 `onnx/` 子目录布局与 external data 分卷）；Qwen 风格导出自动补 `position_ids`。
+- 维护机批量重建可用 `embed_backend = "openai"` 指向 LM Studio 等本地 GPU 服务，跑完后切回 `local` 并用同一 ONNX 模型重嵌一次，保证与用户端完全一致（推荐直接用 `scripts/reembed_tag_wiki.py`）。
+- 发行包内携带 tokenizer/config（`data/tag_wiki/models/shawnw3i__Qwen3-Embedding-0.6B-ONNX/`）；多 GB 的 `model.onnx` 权重作为发行页单独资产提供，用户下载后放入上述目录即启用本地语义检索。包内数据库向量与用户侧模型不一致（维度或语义空间）时语义检索会失配。
+
+### 向量质量基线（重建必读）
+
+入库文本为 `page_title + heading + body`（tag 名是最强检索锚点）；`passage:`/`query:` 等前缀由 embedder 实现负责，调用方不再拼（修复过的双重前缀问题）。pooling 模式按模型目录的 `1_Pooling/config.json` 自动识别（Qwen3 为 last-token，e5 等为 mean）。重建向量务必走一次全量重嵌（构建面板勾选「强制重新向量化」或 `scripts/reembed_tag_wiki.py`），并确认状态接口 `index.dimension` 与新模型一致。
 
 ## 测试
 
