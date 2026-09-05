@@ -1,65 +1,27 @@
-import { useEffect, useState } from 'react'
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { useState } from 'react'
+import { useQuery } from '@tanstack/react-query'
+import { ChevronDown, ChevronUp, Database, RefreshCw } from 'lucide-react'
 import {
-  AlertTriangle,
-  ChevronDown,
-  ChevronUp,
-  Database,
-  Download,
-  Languages,
-  LoaderCircle,
-  RefreshCw,
-} from 'lucide-react'
-import {
-  clampInt,
-  describeWikiError,
   tagWikiApi,
   WIKI_PROFILE_LABELS,
   type TagWikiProfile,
   type TagWikiStatus,
-  type TranslateRequest,
-  type TranslateStatus,
 } from '../../lib/tagWiki'
-import { Button, Notice, ProgressBar } from '../ui'
+import { Notice } from '../ui'
 
-const PHASE_LABELS: Record<string, string> = {
-  idle: '空闲',
-  download: '正在下载 E621 数据包…',
-  parse: '正在解析 Wiki 词条…',
-  model: '正在准备 Embedding 向量模型…',
-  embed: '正在生成向量索引…',
-  done: '构建完成',
-}
-
+// Data maintenance (dump download, reindex, re-embedding, translation) is a
+// maintainer/CLI job; the UI is intentionally read-only status + query.
 export function BuildPanel({ profile }: { profile: TagWikiProfile }) {
   const [collapsed, setCollapsed] = useState(false)
-  const [downloadDump, setDownloadDump] = useState(true)
-  const [reindex, setReindex] = useState(true)
-  const [forceReembed, setForceReembed] = useState(false)
-  const [scope, setScope] = useState<TranslateRequest['scope']>('model_vocab')
-  const [minPostCount, setMinPostCount] = useState<number>(1000)
-  const [maxPages, setMaxPages] = useState<number>(2000)
-  const [concurrency, setConcurrency] = useState<number>(4)
-  const [localError, setLocalError] = useState<string | null>(null)
-
-  const queryClient = useQueryClient()
 
   const statusQuery = useQuery<TagWikiStatus>({
     queryKey: ['tag-wiki', 'status'],
     queryFn: tagWikiApi.status,
-    refetchInterval: (query) => {
-      const data = query.state.data
-      const isBuilding = data?.build?.state === 'running'
-      const isTranslating = data?.translate?.state === 'running'
-      return isBuilding || isTranslating ? 2000 : 30_000
-    },
+    refetchInterval: 30_000,
     retry: 1,
   })
 
   const status = statusQuery.data
-  const isTranslating = status?.translate?.state === 'running'
-  // Finished-product mode: the backend rejects build/translate with 403, so
-  // the maintenance controls are hidden instead of inviting a dead click.
   const frozen = status?.frozen === true
 
   // Per-mirror database/index view; the top-level keys mirror e621 for
@@ -68,124 +30,36 @@ export function BuildPanel({ profile }: { profile: TagWikiProfile }) {
   const db = profileStatus?.database ?? status?.database
   const idx = profileStatus?.index ?? status?.index
 
-  // Adopt the server-configured default threshold (config [tag_wiki]) once it
-  // is known; the effect only re-runs when that configured value changes.
-  const configuredMinPostCount = idx?.min_post_count
-  useEffect(() => {
-    if (typeof configuredMinPostCount === 'number' && configuredMinPostCount >= 0) {
-      setMinPostCount(configuredMinPostCount)
-    }
-  }, [configuredMinPostCount])
-
-  // Dedicated fine-grained progress poll for the translate job; the aggregate
-  // /status response above already covers the build pipeline.
-  const translateProgressQuery = useQuery<TranslateStatus>({
-    queryKey: ['tag-wiki', 'translate-progress'],
-    queryFn: tagWikiApi.translateProgress,
-    enabled: Boolean(isTranslating),
-    // Stop as soon as this endpoint itself stops reporting a running job
-    // instead of hard-polling for up to a status-refresh interval.
-    refetchInterval: (query) => (query.state.data?.state === 'running' ? 2000 : false),
-    retry: 1,
-  })
-
-  // The moment the fine-grained poll sees the job finish, refresh the
-  // aggregate status so isTranslating flips and the poll stays disabled.
-  const progressState = translateProgressQuery.data?.state
-  useEffect(() => {
-    if (progressState && progressState !== 'running') {
-      void queryClient.invalidateQueries({ queryKey: ['tag-wiki', 'status'] })
-    }
-  }, [progressState, queryClient])
-
-  const buildMutation = useMutation({
-    mutationFn: () =>
-      tagWikiApi.build({
-        profile,
-        // dump download / re-import are e621-only; the backend ignores them
-        // for the pre-imported danbooru corpus.
-        download_dump: profile === 'e621' ? downloadDump : undefined,
-        reindex: profile === 'e621' ? reindex : undefined,
-        force_reembed: forceReembed,
-      }),
-    onSuccess: (data) => {
-      queryClient.setQueryData(['tag-wiki', 'status'], data)
-      setLocalError(null)
-    },
-    onError: (err) => {
-      setLocalError(describeWikiError(err, '启动 Wiki 构建失败'))
-    },
-  })
-
-  const translateMutation = useMutation({
-    mutationFn: () =>
-      tagWikiApi.translate({
-        profile,
-        scope,
-        min_post_count: scope === 'popular' ? minPostCount : undefined,
-        max_pages: maxPages,
-        concurrency,
-      }),
-    onSuccess: (data) => {
-      queryClient.setQueryData<TagWikiStatus>(['tag-wiki', 'status'], (old) => {
-        if (!old) return old
-        return { ...old, translate: data }
-      })
-      // Drop the cached progress of any previous run so the live poll takes over.
-      queryClient.removeQueries({ queryKey: ['tag-wiki', 'translate-progress'] })
-      setLocalError(null)
-    },
-    onError: (err) => {
-      setLocalError(describeWikiError(err, '启动中文翻译失败'))
-    },
-  })
-
-  const build = status?.build
-  const translate = status?.translate
-
-  const isBuilding = build?.state === 'running'
-  const buildError = build?.error || (build?.state === 'error' ? build?.message : null)
-  const translateError = translate?.error || (translate?.state === 'error' ? translate?.message : null)
-
-  // Prefer the fine-grained progress endpoint while it reports a running job.
-  const progressData = translateProgressQuery.data
-  const liveTranslate = progressData && progressData.state === 'running' ? progressData : translate
-
-  const translatePercent =
-    liveTranslate && liveTranslate.total > 0
-      ? Math.min(100, Math.round((liveTranslate.done / liveTranslate.total) * 100))
-      : 0
-
   return (
     <div className="tw-build-panel">
       <div className="tw-build-panel-header">
           <div className="tw-build-title-row">
           <Database size={16} aria-hidden="true" />
           <h2 className="tw-build-title">
-            {WIKI_PROFILE_LABELS[profile]} Wiki 数据库与翻译构建
+            {WIKI_PROFILE_LABELS[profile]} Wiki 数据库状态
           </h2>
-          {isBuilding && (
-            <span className="tw-running-tag">
-              <LoaderCircle size={12} className="spin" />
-              构建中
-            </span>
-          )}
-          {isTranslating && (
-            <span className="tw-running-tag">
-              <LoaderCircle size={12} className="spin" />
-              翻译中
-            </span>
-          )}
         </div>
-        <button
-          type="button"
-          className="tw-collapse-btn"
-          onClick={() => setCollapsed((v) => !v)}
-          aria-expanded={!collapsed}
-          title={collapsed ? '展开构建面板' : '收起构建面板'}
-        >
-          {collapsed ? <ChevronDown size={16} /> : <ChevronUp size={16} />}
-        </button>
+        <div className="tw-build-header-actions">
+          <button
+            type="button"
+            className="icon-button icon-button-quiet"
+            title="刷新状态"
+            aria-label="刷新状态"
+            onClick={() => statusQuery.refetch()}
+            disabled={statusQuery.isFetching}
+          >
+            <RefreshCw size={14} className={statusQuery.isFetching ? 'spin' : ''} />
+          </button>
+          <button
+            type="button"
+            className="tw-collapse-btn"
+            onClick={() => setCollapsed((v) => !v)}
+            aria-expanded={!collapsed}
+            title={collapsed ? '展开面板' : '收起面板'}
+          >
+            {collapsed ? <ChevronDown size={16} /> : <ChevronUp size={16} />}
+          </button>
+        </div>
       </div>
 
       {!collapsed && (
@@ -224,182 +98,12 @@ export function BuildPanel({ profile }: { profile: TagWikiProfile }) {
             </div>
           </div>
 
-          {/* Active progress notifications */}
-          {isBuilding && (
-            <div className="tw-active-progress">
-              <div className="tw-progress-desc">
-                <LoaderCircle size={14} className="spin" />
-                <span>{PHASE_LABELS[build?.phase ?? 'idle'] || build?.message || '正在构建…'}</span>
-              </div>
-            </div>
-          )}
-
-          {isTranslating && (
-            <div className="tw-active-progress">
-              <div className="tw-progress-desc">
-                <LoaderCircle size={14} className="spin" />
-                <span>
-                  {liveTranslate?.message || '正在批量翻译摘要…'}{' '}
-                  <small>
-                    ({liveTranslate?.done ?? 0} / {liveTranslate?.total ?? 0}
-                    {liveTranslate?.failed ? `，失败 ${liveTranslate.failed}` : ''})
-                  </small>
-                </span>
-              </div>
-              <ProgressBar value={translatePercent} label="翻译进度" />
-            </div>
-          )}
-
           {frozen && (
             <Notice tone="info">
               <Database size={15} />
-              <span>Wiki 数据与中文翻译已内置，可直接使用；数据维护由发布者完成，此面板不提供构建操作。</span>
+              <span>Wiki 数据与中文翻译已内置，可直接使用；数据维护由发布者完成。</span>
             </Notice>
           )}
-
-          {/* Error messages */}
-          {(buildError || translateError || localError) && (
-            <Notice tone="danger">
-              <AlertTriangle size={15} />
-              <span>{localError || buildError || translateError}</span>
-            </Notice>
-          )}
-
-          {/* Build options — dump download / re-import only exist for e621;
-              the danbooru corpus ships pre-imported. */}
-          {!frozen && (
-          <div className="tw-build-flags">
-            {profile === 'e621' && (
-              <label>
-                <input
-                  type="checkbox"
-                  checked={downloadDump}
-                  disabled={isBuilding || isTranslating || buildMutation.isPending}
-                  onChange={(e) => setDownloadDump(e.target.checked)}
-                />
-                下载最新 Dump
-              </label>
-            )}
-            {profile === 'e621' && (
-              <label>
-                <input
-                  type="checkbox"
-                  checked={reindex}
-                  disabled={isBuilding || isTranslating || buildMutation.isPending}
-                  onChange={(e) => setReindex(e.target.checked)}
-                />
-                重建索引
-              </label>
-            )}
-            <label>
-              <input
-                type="checkbox"
-                checked={forceReembed}
-                disabled={isBuilding || isTranslating || buildMutation.isPending}
-                onChange={(e) => setForceReembed(e.target.checked)}
-              />
-              强制重新向量化
-            </label>
-          </div>
-          )}
-
-          {/* Controls */}
-          <div className="tw-build-actions-row">
-            {!frozen && (
-            <div className="tw-build-action-group">
-              <Button
-                variant="outline"
-                size="sm"
-                icon={buildMutation.isPending || isBuilding ? <LoaderCircle className="spin" size={14} /> : <Download size={14} />}
-                disabled={isBuilding || isTranslating || buildMutation.isPending}
-                onClick={() => buildMutation.mutate()}
-              >
-                {isBuilding ? '正在构建 Wiki…' : profile === 'e621' ? '下载/更新 Wiki 数据' : '重建向量索引'}
-              </Button>
-            </div>
-            )}
-
-            {!frozen && (
-            <div className="tw-translate-controls">
-              <label className="tw-inline-label">
-                <span>翻译范围</span>
-                <select
-                  value={scope}
-                  disabled={isBuilding || isTranslating || translateMutation.isPending}
-                  onChange={(e) => setScope(e.target.value as TranslateRequest['scope'])}
-                >
-                  <option value="model_vocab">模型词表标签</option>
-                  <option value="popular">高频标签</option>
-                  <option value="all">全部已知标签</option>
-                </select>
-              </label>
-
-              {scope === 'popular' && (
-                <label className="tw-inline-label">
-                  <span>最小帖子数</span>
-                  <input
-                    type="number"
-                    min={0}
-                    step={100}
-                    value={minPostCount}
-                    disabled={isBuilding || isTranslating || translateMutation.isPending}
-                    onChange={(e) => setMinPostCount(clampInt(Number(e.target.value), 0, 1_000_000))}
-                    style={{ width: '90px' }}
-                  />
-                </label>
-              )}
-
-              <label className="tw-inline-label">
-                <span>单次页数上限</span>
-                <input
-                  type="number"
-                  className="tw-max-pages-input"
-                  min={1}
-                  max={50000}
-                  step={100}
-                  value={maxPages}
-                  disabled={isBuilding || isTranslating || translateMutation.isPending}
-                  onChange={(e) => setMaxPages(clampInt(Number(e.target.value), 1, 50_000))}
-                />
-              </label>
-
-              <label className="tw-inline-label">
-                <span>并行数</span>
-                <input
-                  type="number"
-                  min={1}
-                  max={12}
-                  step={1}
-                  value={concurrency}
-                  disabled={isBuilding || isTranslating || translateMutation.isPending}
-                  onChange={(e) => setConcurrency(clampInt(Number(e.target.value), 1, 12))}
-                  style={{ width: '64px' }}
-                />
-              </label>
-
-              <Button
-                variant="outline"
-                size="sm"
-                icon={translateMutation.isPending || isTranslating ? <LoaderCircle className="spin" size={14} /> : <Languages size={14} />}
-                disabled={isBuilding || isTranslating || translateMutation.isPending}
-                onClick={() => translateMutation.mutate()}
-              >
-                {isTranslating ? '正在翻译…' : '翻译中文摘要'}
-              </Button>
-            </div>
-            )}
-
-            <button
-              type="button"
-              className="icon-button icon-button-quiet"
-              title="刷新状态"
-              aria-label="刷新状态"
-              onClick={() => statusQuery.refetch()}
-              disabled={statusQuery.isFetching}
-            >
-              <RefreshCw size={14} className={statusQuery.isFetching ? 'spin' : ''} />
-            </button>
-          </div>
         </div>
       )}
     </div>

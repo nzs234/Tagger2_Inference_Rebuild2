@@ -89,7 +89,7 @@ runtime\python.exe scripts\fetch_danbooru_wiki.py --status
 
 ## 前端
 
-- 侧边栏「创作与处理」组新增 **Tag Wiki** 页：构建管理面板（状态徽标 + 构建/翻译按钮 + 进度条）+ 三个查询模式 Tab。
+- 侧边栏「创作与处理」组新增 **Tag Wiki** 页：只读状态面板（Wiki 页数/章节数/已向量化/已翻译摘要/Dump 日期/检索状态徽标）+ 三个查询模式 Tab。构建、重建向量与中文翻译是维护者/CLI 专属操作（`scripts/build_tag_wiki.py`、`scripts/reembed_tag_wiki.py`），前端不提供维护入口；成品包 frozen 模式下后端同样拒绝（403）。
 - TagManager 的标签编辑/展示栏与工作台 TagCloud 的 tag 药丸上有 **BookOpen 图标按钮**，点开 `WikiDrawer` 快查（含义摘要 + 隐含搭配 + 相关 tag）。
 - 客户端 `frontend/src/lib/tagWiki.ts` 的类型与 `contracts.py` 的 TypedDict 一一对应。
 
