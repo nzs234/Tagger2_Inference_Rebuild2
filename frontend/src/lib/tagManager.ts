@@ -292,7 +292,80 @@ export const tagManagerApi = {
     }),
 }
 
-/** Serialises image-list query parameters exactly as the backend expects. */
+/**
+ * Escape one tag for the tag query parameters: a literal backslash or comma
+ * is backslash-escaped so a tag may itself contain commas.  Every other
+ * character is passed through unchanged, matching the backend parser, so
+ * legacy requests (no backslashes) keep their exact old behaviour.
+ */
+export function escapeTagForQuery(tag: string): string {
+  return tag.replace(/\\/g, '\\\\').replace(/,/g, '\\,')
+}
+
+/** Split one tag query value on unescaped commas and unescape each part. */
+function splitTagQueryValue(value: string): string[] {
+  const parts: string[] = []
+  let current = ''
+  let escaped = false
+  for (const char of value) {
+    if (escaped) {
+      current += char
+      escaped = false
+    } else if (char === '\\') {
+      current += char
+      escaped = true
+    } else if (char === ',') {
+      parts.push(current)
+      current = ''
+    } else {
+      current += char
+    }
+  }
+  parts.push(current)
+  return parts
+}
+
+/** Undo the escape written by `escapeTagForQuery`; other `\x` pairs stay verbatim. */
+function unescapeTagQueryValue(value: string): string {
+  let out = ''
+  let escaped = false
+  for (const char of value) {
+    if (escaped) {
+      out += char === ',' || char === '\\' ? char : `\\${char}`
+      escaped = false
+    } else if (char === '\\') {
+      escaped = true
+    } else {
+      out += char
+    }
+  }
+  return escaped ? `${out}\\` : out
+}
+
+/**
+ * Parse the comma-separated filter input into tags, honouring backslash
+ * escapes so a tag may itself contain a comma.  Mirrors the backend's
+ * `_split_tag_query`; plain legacy input behaves exactly as before.
+ */
+export function parseTagFilterInput(value: string): string[] {
+  return splitTagQueryValue(value)
+    .map((part) => unescapeTagQueryValue(part.trim()))
+    .filter(Boolean)
+}
+
+/**
+ * Render the filter-bar input value for a tag list.  Tags are shown in the
+ * preferred separator style; literal commas and backslashes are escaped so
+ * editing the box never silently splits a tag that contains a comma.
+ */
+export function formatTagFilterInput(tags: string[], style: TagStyle): string {
+  return tags.map((tag) => escapeTagForQuery(formatTagForDisplay(tag, style))).join(', ')
+}
+
+/** Serialises image-list query parameters exactly as the backend expects.
+ * Tags are sent as repeated query parameters with commas/backslashes
+ * escaped, so a tag containing a comma survives the round trip; the backend
+ * also still accepts the legacy single comma-joined parameter. */
 export function imageFilterQuery(params: TagManagerImageQuery): URLSearchParams {
   const query = new URLSearchParams()
   query.set('offset', String(params.offset ?? 0))
@@ -300,8 +373,8 @@ export function imageFilterQuery(params: TagManagerImageQuery): URLSearchParams 
   if (params.sort) query.set('sort', params.sort)
   const filter = params.filter
   if (filter) {
-    if (filter.includeTags.length) query.set('include_tags', filter.includeTags.join(','))
-    if (filter.excludeTags.length) query.set('exclude_tags', filter.excludeTags.join(','))
+    for (const tag of filter.includeTags) query.append('include_tags', escapeTagForQuery(tag))
+    for (const tag of filter.excludeTags) query.append('exclude_tags', escapeTagForQuery(tag))
     // `all` is the backend default and stays off the wire.
     if (filter.includeMode && filter.includeMode !== 'all') query.set('include_mode', filter.includeMode)
     if (filter.kind && filter.kind !== 'any') query.set('kind', filter.kind)

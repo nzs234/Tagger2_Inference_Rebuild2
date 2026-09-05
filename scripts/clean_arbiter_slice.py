@@ -49,7 +49,7 @@ def main() -> None:
             excluded.append(e)
             continue
         lines = e["text"].splitlines()
-        kept_lines = [l for l in lines if not LINE_BLOCK.search(l)]
+        kept_lines = [line for line in lines if not LINE_BLOCK.search(line)]
         if len(kept_lines) < 0.4 * len(lines):
             excluded.append(e)
             continue

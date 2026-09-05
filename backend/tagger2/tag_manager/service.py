@@ -15,12 +15,20 @@ import os
 import re
 import threading
 import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
+from functools import lru_cache
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Literal, Mapping, cast
 
 from PIL import Image
 
-from ..security import PathAllowlist, PathNotAllowedError, atomic_write_bytes
+from ..security import (
+    PathAllowlist,
+    PathNotAllowedError,
+    atomic_write_bytes,
+    sanitize_provider_error,
+)
 from ..workflow.dataset_import import SUPPORTED_EXTENSIONS
 from .contracts import (
     BatchOperationRequest,
@@ -46,6 +54,18 @@ from .tag_db import TagDatabaseError
 from .translations import TagTranslations, normalize_lookup_key
 
 logger = logging.getLogger("tagger2.tag_manager")
+
+
+@lru_cache(maxsize=256)
+def _compile_tag_pattern(pattern: str) -> re.Pattern[str]:
+    """Compile one batch regex pattern once per process.
+
+    Patterns are validated (length, shape, compilability) in the request
+    contract, so only vetted patterns reach here; caching keeps a 2000-image
+    batch from recompiling the same pattern for every sidecar.
+    """
+
+    return re.compile(pattern)
 
 SCAN_CHUNK = 500
 MAX_BATCH_IMAGES = 2000
@@ -182,6 +202,29 @@ class TagManagerService:
                 lock = threading.Lock()
                 self._session_locks[session_id] = lock
             return lock
+
+    @contextmanager
+    def _exclusive_session(self, session_id: str) -> Iterator[None]:
+        """Serialize the mutating operations of one dataset session.
+
+        save/batch/undo/redo and the index scan share this lock so concurrent
+        requests can never interleave read-modify-write spans on the same
+        sidecars.  ``threading.Lock`` is not reentrant: wrap exactly the
+        public entry points, never nested helpers.
+        """
+
+        lock = self._session_lock(session_id)
+        if not lock.acquire(blocking=False):
+            raise TagManagerError(
+                "another write or scan is already running for this dataset",
+                code="session_busy",
+                status_code=409,
+                retryable=True,
+            )
+        try:
+            yield
+        finally:
+            lock.release()
 
     def _require_session(self, session_id: str) -> dict[str, Any]:
         session = self.store.get_session(session_id)
@@ -393,6 +436,13 @@ class TagManagerService:
     def save_image(self, session_id: str, image_id: int, edit: ImageEditRequest) -> dict[str, Any]:
         session = self._require_session(session_id)
         self._require_writable_root(session)
+        with self._exclusive_session(session_id):
+            return self._save_image_locked(session, image_id, edit)
+
+    def _save_image_locked(
+        self, session: Mapping[str, Any], image_id: int, edit: ImageEditRequest
+    ) -> dict[str, Any]:
+        session_id = str(session["id"])
         image = self._require_image(session_id, image_id)
         kind = str(edit.content.kind)
         current_kind = str(image["sidecar_kind"])
@@ -413,23 +463,36 @@ class TagManagerService:
             )
         sidecar_path = self._resolve_sidecar(session, image, sidecar_rel)
         current_mtime = _stat_mtime(sidecar_path)
-        if edit.expected_sidecar_mtime is not None and current_mtime != edit.expected_sidecar_mtime:
-            raise TagManagerError(
-                "sidecar changed since it was loaded",
-                code="sidecar_conflict",
-                status_code=409,
-                retryable=True,
-            )
+        self._assert_sidecar_not_stale(edit.expected_sidecar_mtime, current_mtime, image)
 
         before_text = _read_sidecar_text(sidecar_path)
+        before_version = _sidecar_version(sidecar_path)
         rendered = _render_edit(edit.content)
         atomic_write_bytes(sidecar_path, rendered.encode("utf-8"))
+        # Journal before the index refresh: if anything below fails, the entry
+        # already covers the written sidecar, so undo can restore a consistent
+        # state (and the undo itself repairs the index rows).
+        entry_id = self.store.append_journal(
+            session_id,
+            op="edit",
+            spec={"image_ids": [image_id], "kind": kind},
+            changes=[{
+                "image_id": image_id,
+                "sidecar": sidecar_rel,
+                "existed": before_text is not None,
+                "kind": kind,
+                "before": before_text or "",
+                "after": rendered,
+                "before_version": before_version,
+                "after_version": _sidecar_version(sidecar_path),
+            }],
+        )
+        self.store.trim_journal(session_id, JOURNAL_DEPTH)
         content = load_sidecar(
             sidecar_path.with_suffix(".txt") if kind == "tag_txt" else None,
             sidecar_path if kind != "tag_txt" else None,
         )
         categories = _CategoryResolver(self.tag_database, str(session["profile"]))
-        new_mtime = _stat_mtime(sidecar_path)
         self.store.upsert_images(
             session_id,
             [{
@@ -439,7 +502,7 @@ class TagManagerService:
                 "sidecar_kind": kind,
                 "sidecar_path": sidecar_rel,
                 "mtime": float(image["mtime"]),
-                "sidecar_mtime": new_mtime,
+                "sidecar_mtime": _stat_mtime(sidecar_path),
                 "width": image["width"],
                 "height": image["height"],
                 "tag_count": len(content.tags),
@@ -449,50 +512,91 @@ class TagManagerService:
             image_id,
             categories.categorize(content.tags),
             sidecar_kind=kind,
-            sidecar_mtime=new_mtime,
+            sidecar_mtime=_stat_mtime(sidecar_path),
         )
-        entry_id = self.store.append_journal(
-            session_id,
-            op="edit",
-            spec={"image_ids": [image_id], "kind": kind},
-            changes=[{
-                "image_id": image_id,
-                "sidecar": sidecar_rel,
-                "existed": before_text is not None,
-                "before": before_text or "",
-                "after": rendered,
-            }],
-        )
-        self.store.trim_journal(session_id, JOURNAL_DEPTH)
         return {"image_id": image_id, "journal_id": entry_id, "sidecar_kind": kind}
+
+    @staticmethod
+    def _assert_sidecar_not_stale(
+        expected_mtime: float | None,
+        current_mtime: float | None,
+        image: Mapping[str, Any],
+    ) -> None:
+        """Optimistic-concurrency guard for one sidecar write.
+
+        The client contract carries the ``st_mtime`` float it received from
+        ``get_image``.  When the client does not supply one, the indexed
+        ``sidecar_mtime`` is the fallback expectation, so an externally
+        modified or deleted sidecar is never overwritten silently.  Exact
+        ``mtime_ns``/size stamps are kept per journal change instead, because
+        the SQLite REAL column and the JSON client contract cannot round-trip
+        nanosecond integers losslessly.
+        """
+
+        expected = expected_mtime if expected_mtime is not None else image["sidecar_mtime"]
+        if expected is None:
+            return  # nothing to compare against (no sidecar at scan time)
+        if current_mtime != expected:
+            raise TagManagerError(
+                "sidecar changed since it was loaded",
+                code="sidecar_conflict",
+                status_code=409,
+                retryable=True,
+            )
 
     def batch_operation(self, session_id: str, request: BatchOperationRequest) -> dict[str, Any]:
         session = self._require_session(session_id)
         self._require_writable_root(session)
-        targets = self._resolve_targets(session_id, request)
-        if not targets:
-            return {"affected": 0, "changes": []}
-        if len(targets) > MAX_BATCH_IMAGES:
-            raise TagManagerError(
-                f"batch operations are capped at {MAX_BATCH_IMAGES} images",
-                code="batch_too_large",
-                status_code=413,
-            )
-        categories = _CategoryResolver(self.tag_database, str(session["profile"]))
-        changes: list[dict[str, Any]] = []
-        for image in targets:
-            change = self._apply_batch_to_image(session, image, request, categories)
-            if change is not None:
-                changes.append(change)
+        with self._exclusive_session(session_id):
+            targets = self._resolve_targets(session_id, request)
+            if not targets:
+                return {"affected": 0, "changes": []}
+            if len(targets) > MAX_BATCH_IMAGES:
+                raise TagManagerError(
+                    f"batch operations are capped at {MAX_BATCH_IMAGES} images",
+                    code="batch_too_large",
+                    status_code=413,
+                )
+            categories = _CategoryResolver(self.tag_database, str(session["profile"]))
+            changes: list[dict[str, Any]] = []
+            try:
+                for image in targets:
+                    change = self._apply_batch_to_image(session, image, request, categories)
+                    if change is not None:
+                        changes.append(change)
+            except Exception:
+                # Keep the images already written recoverable: journal the
+                # partial changes before propagating, so undo can restore them.
+                if changes:
+                    self._append_batch_journal(session_id, request, changes, partial=True)
+                raise
+            entry_id = self._append_batch_journal(session_id, request, changes)
+            return {"affected": len(changes), "journal_id": entry_id}
+
+    def _append_batch_journal(
+        self,
+        session_id: str,
+        request: BatchOperationRequest,
+        changes: list[dict[str, Any]],
+        *,
+        partial: bool = False,
+    ) -> int:
+        spec: dict[str, Any] = {
+            "tags": request.tags,
+            "replacement": request.replacement,
+            "use_regex": request.use_regex,
+            "count": len(changes),
+        }
+        if partial:
+            spec["partial"] = True
         entry_id = self.store.append_journal(
             session_id,
             op=f"batch_{request.op}",
-            spec={"tags": request.tags, "replacement": request.replacement,
-                  "use_regex": request.use_regex, "count": len(changes)},
+            spec=spec,
             changes=changes,
         )
         self.store.trim_journal(session_id, JOURNAL_DEPTH)
-        return {"affected": len(changes), "journal_id": entry_id}
+        return entry_id
 
     def _resolve_targets(
         self, session_id: str, request: BatchOperationRequest
@@ -530,18 +634,27 @@ class TagManagerService:
         request: BatchOperationRequest,
         categories: "_CategoryResolver",
     ) -> dict[str, Any] | None:
-        kind = str(image["sidecar_kind"])
-        if kind == "raw_e621_json":
+        if str(image["sidecar_kind"]) == "raw_e621_json":
             return None  # read-only surfaces are skipped, never half-edited
-        sidecar_rel = image["sidecar_path"] or _sidecar_rel_for_kind(
-            str(image["relative_path"]), "tag_txt"
-        )
-        effective_kind = kind if kind != "none" else "tag_txt"
-        sidecar_path = self._resolve_sidecar(session, image, sidecar_rel)
-        before_text = _read_sidecar_text(sidecar_path)
         content, _live_mtime = self._load_content_and_mtime(
             paths=self._sidecar_paths(session, image)
         )
+        if content.kind == "raw_e621_json":
+            return None  # the index row is stale; never edit a read-only file
+        # The sidecar on disk is authoritative for the format: a stale index
+        # row must not render one format over another (e.g. tag_txt rendering
+        # over a tags_json document the scan has not seen yet).
+        indexed_kind = str(image["sidecar_kind"])
+        if content.kind != "none":
+            effective_kind = content.kind
+        elif indexed_kind in {"tag_txt", "tags_json", "standard_json"}:
+            effective_kind = cast(Literal["tag_txt", "tags_json", "standard_json"], indexed_kind)
+        else:
+            effective_kind = "tag_txt"
+        sidecar_rel = _sidecar_rel_for_kind(str(image["relative_path"]), effective_kind)
+        sidecar_path = self._resolve_sidecar(session, image, sidecar_rel)
+        before_text = _read_sidecar_text(sidecar_path)
+        before_version = _sidecar_version(sidecar_path)
 
         if effective_kind == "tag_txt":
             new_tags = _apply_tag_op(list(content.tags), request)
@@ -570,78 +683,242 @@ class TagManagerService:
         if after_text == (before_text or ""):
             return None
         atomic_write_bytes(sidecar_path, after_text.encode("utf-8"))
-        refreshed = load_sidecar(
-            sidecar_path.with_suffix(".txt") if effective_kind == "tag_txt" else None,
-            sidecar_path if effective_kind != "tag_txt" else None,
-        )
-        self.store.set_image_tags(
-            int(image["id"]),
-            categories.categorize(refreshed.tags),
-            sidecar_kind=effective_kind,
-            sidecar_mtime=_stat_mtime(sidecar_path),
-        )
-        return {
+        change = {
             "image_id": int(image["id"]),
             "sidecar": sidecar_rel,
             "existed": before_text is not None,
+            "kind": effective_kind,
             "before": before_text or "",
             "after": after_text,
+            "before_version": before_version,
+            "after_version": _sidecar_version(sidecar_path),
         }
+        try:
+            refreshed = load_sidecar(
+                sidecar_path.with_suffix(".txt") if effective_kind == "tag_txt" else None,
+                sidecar_path if effective_kind != "tag_txt" else None,
+            )
+            self.store.set_image_tags(
+                int(image["id"]),
+                categories.categorize(refreshed.tags),
+                sidecar_kind=effective_kind,
+                sidecar_mtime=_stat_mtime(sidecar_path),
+            )
+        except Exception:  # noqa: BLE001 - the write is journalled; undo/rescan repairs the index
+            logger.warning(
+                "tag manager batch index refresh failed for %s;"
+                " the journal entry keeps the change recoverable",
+                sidecar_rel,
+                exc_info=True,
+            )
+        return change
 
     # -- undo / redo -------------------------------------------------------
 
     def undo(self, session_id: str) -> dict[str, Any]:
-        entry = self.store.latest_journal_entry(session_id, undone=False)
-        if entry is None:
-            raise TagManagerError(
-                "nothing to undo",
-                code="undo_empty",
-                status_code=409,
+        self._require_session(session_id)
+        with self._exclusive_session(session_id):
+            entry = self.store.latest_journal_entry(session_id, undone=False)
+            if entry is None:
+                raise TagManagerError(
+                    "nothing to undo",
+                    code="undo_empty",
+                    status_code=409,
+                )
+            self._replay_changes(
+                session_id, entry["changes"], use="before", entry_id=int(entry["id"])
             )
-        self._replay_changes(session_id, entry["changes"], use="before")
-        self.store.set_journal_undone(int(entry["id"]), True)
-        return {"journal_id": int(entry["id"]), "reverted": len(entry["changes"])}
+            self.store.set_journal_undone(int(entry["id"]), True)
+            return {"journal_id": int(entry["id"]), "reverted": len(entry["changes"])}
 
     def redo(self, session_id: str) -> dict[str, Any]:
-        entry = self.store.latest_journal_entry(session_id, undone=True)
-        if entry is None:
-            raise TagManagerError(
-                "nothing to redo",
-                code="redo_empty",
-                status_code=409,
+        self._require_session(session_id)
+        with self._exclusive_session(session_id):
+            entry = self.store.latest_journal_entry(session_id, undone=True)
+            if entry is None:
+                raise TagManagerError(
+                    "nothing to redo",
+                    code="redo_empty",
+                    status_code=409,
+                )
+            self._replay_changes(
+                session_id, entry["changes"], use="after", entry_id=int(entry["id"])
             )
-        self._replay_changes(session_id, entry["changes"], use="after")
-        self.store.set_journal_undone(int(entry["id"]), False)
-        return {"journal_id": int(entry["id"]), "reapplied": len(entry["changes"])}
+            self.store.set_journal_undone(int(entry["id"]), False)
+            return {"journal_id": int(entry["id"]), "reapplied": len(entry["changes"])}
 
     def _replay_changes(
-        self, session_id: str, changes: list[Mapping[str, Any]], *, use: str
+        self,
+        session_id: str,
+        changes: list[Mapping[str, Any]],
+        *,
+        use: str,
+        entry_id: int,
     ) -> None:
         session = self._require_session(session_id)
         self._require_writable_root(session)
         categories = _CategoryResolver(self.tag_database, str(session["profile"]))
+        other = "after" if use == "before" else "before"
+        # Phase 1 validates every change against the live sidecars, so a
+        # conflict, format mismatch or corrupt journal aborts before any file
+        # is touched: undo/redo never applies half an entry.
+        planned: list[tuple[Mapping[str, Any], Path, str]] = []
         for change in changes:
             image = self.store.get_image(session_id, int(change["image_id"]))
             if image is None:
                 continue  # the image row is gone; nothing to restore
             sidecar_rel = str(change["sidecar"])
             sidecar_path = self._resolve_sidecar(session, image, sidecar_rel)
+            slot_kind = self._journal_slot_kind(change, entry_id, sidecar_rel)
+            self._assert_replay_matches(
+                sidecar_path, change, other=other, slot_kind=slot_kind
+            )
+            self._assert_journal_text_valid(
+                str(change[use]), slot_kind, sidecar_rel
+            )
+            planned.append((change, sidecar_path, slot_kind))
+        # Phase 2 applies; every planned text was already proven to fit.
+        for change, sidecar_path, slot_kind in planned:
             text = str(change[use])
             if not text and not change["existed"]:
                 sidecar_path.unlink(missing_ok=True)
-                kind = "none"
-            else:
-                atomic_write_bytes(sidecar_path, text.encode("utf-8"))
-                kind = str(change.get("kind") or _kind_from_suffix(sidecar_path))
+                self.store.set_image_tags(
+                    int(change["image_id"]),
+                    [],
+                    sidecar_kind="none",
+                    sidecar_mtime=None,
+                )
+                continue
+            atomic_write_bytes(sidecar_path, text.encode("utf-8"))
             content = load_sidecar(
-                sidecar_path.with_suffix(".txt") if kind == "tag_txt" else None,
-                sidecar_path if kind != "tag_txt" else None,
+                sidecar_path.with_suffix(".txt") if slot_kind == "tag_txt" else None,
+                sidecar_path if slot_kind != "tag_txt" else None,
             )
+            journalled_kind = str(change.get("kind") or "")
+            if journalled_kind and journalled_kind != content.kind:
+                # The restored bytes win over the journalled kind: the index
+                # must describe what is actually on disk.
+                logger.warning(
+                    "undo/redo journal entry %s change for image %s recorded kind"
+                    " %s but the restored sidecar parses as %s; trusting the"
+                    " sidecar content",
+                    entry_id, change["image_id"], journalled_kind, content.kind,
+                )
+            kind = content.kind
             self.store.set_image_tags(
-                int(image["id"]),
+                int(change["image_id"]),
                 categories.categorize(content.tags) if kind != "none" else [],
                 sidecar_kind=kind,
                 sidecar_mtime=_stat_mtime(sidecar_path) if kind != "none" else None,
+            )
+
+    @staticmethod
+    def _journal_slot_kind(
+        change: Mapping[str, Any], entry_id: int, sidecar_rel: str
+    ) -> str:
+        """Loader slot kind (tag_txt vs json) for one journalled change.
+
+        Entries written by this service carry the per-change ``kind``.  Legacy
+        entries recorded it only in the entry ``spec`` (single-image saves) or
+        not at all (batch changes), so the suffix decides the loader slot; the
+        fallback is logged loudly instead of silently misreading a tags_json
+        file as standard_json.  The restored content still wins in phase 2.
+        """
+
+        kind = str(change.get("kind") or "")
+        if kind:
+            return kind
+        fallback = _kind_from_suffix(Path(sidecar_rel))
+        logger.warning(
+            "undo/redo journal entry %s change for sidecar %s has no kind"
+            " recorded; falling back to the file suffix (%s)",
+            entry_id, sidecar_rel, fallback,
+        )
+        return fallback
+
+    @staticmethod
+    def _assert_replay_matches(
+        sidecar_path: Path,
+        change: Mapping[str, Any],
+        *,
+        other: str,
+        slot_kind: str,
+    ) -> None:
+        """Fail before writing when the live sidecar no longer fits the journal.
+
+        Undo expects the entry's ``after`` state on disk, redo its ``before``
+        state; an empty journalled state means "no annotation" (missing or
+        blank file).  The mtime_ns+size version stamps are diagnostics in the
+        warning — text equality is the decision, because every replay rewrites
+        the file and therefore cannot keep mtimes stable.
+        """
+
+        sidecar_rel = str(change.get("sidecar", sidecar_path.name))
+        expected_text = str(change.get(other, ""))
+        current_text = _read_sidecar_text(sidecar_path)
+        if expected_text:
+            matches = current_text == expected_text
+        else:
+            matches = current_text is None or not current_text.strip()
+        if not matches:
+            logger.warning(
+                "undo/redo refused: sidecar %s changed since the entry was"
+                " written (expected %s version %s, live version %s)",
+                sidecar_rel,
+                other,
+                change.get(f"{other}_version"),
+                _sidecar_version(sidecar_path),
+            )
+            raise TagManagerError(
+                f"sidecar changed since the journal was written: {sidecar_rel}",
+                code="sidecar_conflict",
+                status_code=409,
+                retryable=True,
+            )
+        if not current_text:
+            return
+        try:
+            detected = load_sidecar(
+                sidecar_path.with_suffix(".txt") if slot_kind == "tag_txt" else None,
+                sidecar_path if slot_kind != "tag_txt" else None,
+            )
+        except SidecarError as exc:
+            raise TagManagerError(
+                str(exc), code="sidecar_invalid", status_code=409
+            ) from exc
+        journalled_kind = str(change.get("kind") or "")
+        if journalled_kind and detected.kind not in {"none", journalled_kind}:
+            raise TagManagerError(
+                f"sidecar {sidecar_rel} now parses as {detected.kind} but the"
+                f" journal recorded {journalled_kind}",
+                code="sidecar_kind_mismatch",
+                status_code=409,
+                retryable=True,
+            )
+
+    @staticmethod
+    def _assert_journal_text_valid(text: str, slot_kind: str, sidecar_rel: str) -> None:
+        """Reject journalled text that could not be re-parsed after writing.
+
+        Without this check a corrupt (typically legacy) entry would fail in
+        phase 2 — after earlier changes of the same entry were already applied.
+        """
+
+        if not text or slot_kind == "tag_txt":
+            return
+        try:
+            parsed = json.loads(text)
+        except ValueError as exc:
+            raise TagManagerError(
+                f"journalled text for {sidecar_rel} is not valid JSON",
+                code="journal_invalid",
+                status_code=409,
+            ) from exc
+        if not isinstance(parsed, dict):
+            raise TagManagerError(
+                f"journalled text for {sidecar_rel} is not a JSON object",
+                code="journal_invalid",
+                status_code=409,
             )
 
     # -- stats / autocomplete ----------------------------------------------
@@ -700,8 +977,13 @@ class TagManagerService:
         try:
             provider = self._provider_factory(provider_id)
         except Exception as exc:  # noqa: BLE001 - provider errors are sanitized below
+            logger.warning(
+                "tag manager provider %s unavailable: %s",
+                provider_id,
+                sanitize_provider_error(exc),
+            )
             raise TagManagerError(
-                f"在线模型不可用：{exc}",
+                "在线模型不可用：请检查「Provider 配置」中的地址与密钥，或稍后重试",
                 code=unavailable_code,
                 status_code=409,
             ) from exc
@@ -719,9 +1001,15 @@ class TagManagerService:
                 system_prompt=NL_TRANSLATION_SYSTEM_PROMPT[request.target],
             )
         except Exception as exc:  # noqa: BLE001 - one failure mode for the UI
-            logger.warning("tag manager NL translation failed via %s: %s", provider_id, exc)
+            # The raw provider error may carry URLs, keys or account details;
+            # details go to the log (sanitized), the client gets a fixed text.
+            logger.warning(
+                "tag manager NL translation failed via %s: %s",
+                provider_id,
+                sanitize_provider_error(exc),
+            )
             raise TagManagerError(
-                f"翻译失败：{exc}",
+                "翻译失败：在线模型暂时不可用，请稍后重试",
                 code="nl_translate_failed",
                 status_code=502,
                 retryable=True,
@@ -782,9 +1070,14 @@ class TagManagerService:
             except TagManagerError:
                 raise
             except Exception as exc:  # noqa: BLE001 - one failure mode for the UI
-                logger.warning("tag manager tag translation failed via %s: %s", provider_id, exc)
+                # Details stay in the log; the client only gets the fixed text.
+                logger.warning(
+                    "tag manager tag translation failed via %s: %s",
+                    provider_id,
+                    sanitize_provider_error(exc),
+                )
                 raise TagManagerError(
-                    f"翻译失败：{exc}",
+                    "翻译失败：在线模型暂时不可用，请稍后重试",
                     code="tag_translate_failed",
                     status_code=502,
                     retryable=True,
@@ -978,6 +1271,22 @@ def _stat_mtime(path: Path) -> float | None:
         return None
 
 
+def _sidecar_version(path: Path) -> dict[str, int] | None:
+    """mtime_ns + size snapshot persisted as a journal change's version stamp.
+
+    Exact integer nanoseconds and the byte size survive JSON round-trips, so
+    replay code can diagnose drift precisely; the float ``st_mtime`` stays on
+    the SQLite REAL column and the client contract, where nanosecond integers
+    would lose precision.
+    """
+
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    return {"mtime_ns": stat.st_mtime_ns, "size": stat.st_size}
+
+
 def _read_sidecar_text(path: Path) -> str | None:
     if not path.is_file():
         return None
@@ -1067,7 +1376,7 @@ def _apply_tag_op(
         return merged if merged != dedup_tags(tags) else None
     if request.op == "remove":
         if request.use_regex:
-            patterns = [re.compile(tag) for tag in request.tags]
+            patterns = [_compile_tag_pattern(tag) for tag in request.tags]
             kept = [
                 tag for tag in tags
                 if not any(pattern.search(tag) for pattern in patterns)
@@ -1078,7 +1387,7 @@ def _apply_tag_op(
         return kept if kept != tags else None
     # replace
     if request.use_regex:
-        pattern = re.compile(request.tags[0]) if request.tags else None
+        pattern = _compile_tag_pattern(request.tags[0]) if request.tags else None
         replacement = request.replacement or ""
         updated = [
             pattern.sub(replacement, tag) if pattern else tag for tag in tags
@@ -1108,7 +1417,7 @@ def _apply_entry_op(
         return entries + fresh if fresh else None
     if request.op == "remove":
         if request.use_regex:
-            patterns = [re.compile(tag) for tag in request.tags]
+            patterns = [_compile_tag_pattern(tag) for tag in request.tags]
             kept = [
                 entry for entry in entries
                 if not any(pattern.search(str(entry.get("text", ""))) for pattern in patterns)
@@ -1122,7 +1431,7 @@ def _apply_entry_op(
         return kept if kept != entries else None
     # replace
     if request.use_regex:
-        pattern = re.compile(request.tags[0]) if request.tags else None
+        pattern = _compile_tag_pattern(request.tags[0]) if request.tags else None
         replacement = request.replacement or ""
         updated = []
         for entry in entries:

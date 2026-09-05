@@ -49,10 +49,12 @@ class FakeStore:
         chunks: list[dict[str, Any]] | None = None,
         embeddings: dict[int, np.ndarray] | None = None,
         raise_on_search: bool = False,
+        raise_on_matrix: bool = False,
     ) -> None:
         self.chunks = chunks or []
         self.embeddings = embeddings or {}
         self.raise_on_search = raise_on_search
+        self.raise_on_matrix = raise_on_matrix
 
     def search_text(self, query: str, limit: int = 20) -> list[dict[str, Any]]:
         if self.raise_on_search:
@@ -68,6 +70,8 @@ class FakeStore:
         return results
 
     def load_embedding_matrix(self) -> tuple[list[int], np.ndarray]:
+        if self.raise_on_matrix:
+            raise RuntimeError("embedding matrix failure")
         if not self.embeddings:
             return [], np.empty((0, 4), dtype=np.float32)
         cids = sorted(self.embeddings.keys())
@@ -206,3 +210,147 @@ def test_suggested_tags_dedup_and_cap():
     tags = searcher.suggested_tags("wolf canine fox", max_tags=2)
     assert len(tags) == 2
     assert tags == ["wolf", "canine"]
+
+
+# -- deterministic ranking ----------------------------------------------------
+
+
+def test_fused_order_stable_on_score_ties():
+    """Identical fused RRF scores tie-break by ascending chunk id.
+
+    The keyword leg ranks cid 3 first while the vector leg ranks cid 5 first
+    (mirrored ranks) — the swapped RRF contributions fuse to exactly the same
+    score, and the candidate set's iteration order used to decide the winner.
+    """
+
+    embedder = FakeEmbedder()
+    chunks = [
+        {"id": 3, "page_title": "jackal", "heading": "H", "text": "canine jackal"},
+        {"id": 5, "page_title": "wolf", "heading": "H", "text": "canine wolf"},
+    ]
+    embeddings = {
+        5: np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32),
+        3: np.array([0.5, 0.0, 0.0, 0.0], dtype=np.float32),
+    }
+    store = FakeStore(chunks=chunks, embeddings=embeddings)
+    searcher = WikiSearcher(store, embedder, rrf_k=60)
+
+    hits = searcher.search("canine", top_k=2)
+    assert hits[0]["score"] == pytest.approx(hits[1]["score"])
+    assert [hit["page_title"] for hit in hits] == ["jackal", "wolf"]
+    # Repeating the query must reproduce the exact same order.
+    assert [hit["page_title"] for hit in searcher.search("canine", top_k=2)] == [
+        "jackal",
+        "wolf",
+    ]
+
+
+def test_vector_leg_tie_breaks_by_chunk_id():
+    """Vector candidates with equal similarity get ranks by ascending id."""
+
+    embedder = FakeEmbedder()
+    # Both chunks map to the same (zero) similarity for the "feline" query.
+    store = FakeStore(
+        chunks=[],
+        embeddings={
+            9: np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32),
+            4: np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32),
+        },
+    )
+
+    def loader(cids):
+        meta = {
+            4: {"id": 4, "page_title": "cat", "heading": "H", "text": "feline"},
+            9: {"id": 9, "page_title": "panther", "heading": "H", "text": "feline"},
+        }
+        return [meta[cid] for cid in cids]
+
+    searcher = WikiSearcher(store, embedder, chunk_loader=loader)
+    hits = searcher.search("feline", top_k=2)
+    # Equal similarity: the lower id wins the better rank deterministically
+    # (argpartition/argsort used to leave this order to chance).
+    assert [hit["page_title"] for hit in hits] == ["cat", "panther"]
+    assert hits[0]["score"] > hits[1]["score"]
+    assert [hit["page_title"] for hit in searcher.search("feline", top_k=2)] == [
+        "cat",
+        "panther",
+    ]
+
+
+# -- loader failure / ghost hits -----------------------------------------------
+
+
+def test_loader_failure_drops_vector_only_hits():
+    """A configured chunk_loader that raises must not surface ghost hits."""
+
+    embedder = FakeEmbedder()
+    store = FakeStore(
+        chunks=[{"id": 10, "page_title": "fox", "heading": "H", "text": "quick fox"}],
+        embeddings={
+            10: np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32),
+            11: np.array([0.9, 0.0, 0.0, 0.0], dtype=np.float32),  # not in chunks
+        },
+    )
+
+    def broken_loader(_cids):
+        raise RuntimeError("chunk table unavailable")
+
+    searcher = WikiSearcher(store, embedder, chunk_loader=broken_loader)
+    hits = searcher.search("fox", top_k=5)
+    # The keyword-resolved hit renders; the vector-only chunk 11 is dropped
+    # instead of emitted with an empty page_title/text.
+    assert [hit["page_title"] for hit in hits] == ["fox"]
+    assert all(hit["text"] for hit in hits)
+
+
+def test_loader_missing_ids_are_dropped():
+    """Vector candidates the loader cannot resolve are dropped, not blanked."""
+
+    embedder = FakeEmbedder()
+    store = FakeStore(
+        chunks=[],
+        embeddings={
+            1: np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32),
+            2: np.array([0.9, 0.0, 0.0, 0.0], dtype=np.float32),
+        },
+    )
+
+    def partial_loader(_cids):
+        return [{"id": 1, "page_title": "wolf", "heading": "H", "text": "canine"}]
+
+    searcher = WikiSearcher(store, embedder, chunk_loader=partial_loader)
+    hits = searcher.search("canine", top_k=5)
+    assert [hit["page_title"] for hit in hits] == ["wolf"]
+
+
+def test_both_legs_failing_raises_unavailable():
+    """Vector + keyword both failing raises instead of faking an empty result."""
+
+    store = FakeStore(chunks=[], embeddings={}, raise_on_search=True, raise_on_matrix=True)
+    searcher = WikiSearcher(store, FakeEmbedder())
+    with pytest.raises(WikiSearchError) as exc_info:
+        searcher.search("test")
+    assert exc_info.value.code == ERROR_WIKI_SEARCH_UNAVAILABLE
+    assert "向量" in exc_info.value.message and "全文" in exc_info.value.message
+
+
+def test_vector_leg_failure_with_keyword_hits_still_returns_results():
+    """A broken vector leg degrades to keyword-only results, not an error."""
+
+    store = FakeStore(
+        chunks=[{"id": 10, "page_title": "fox", "heading": "H", "text": "quick fox"}],
+        embeddings={1: np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)},
+        raise_on_matrix=True,
+    )
+    searcher = WikiSearcher(store, FakeEmbedder())
+    hits = searcher.search("fox", top_k=5)
+    assert [hit["page_title"] for hit in hits] == ["fox"]
+    assert hits[0]["matched_by"] == ["keyword"]
+
+
+def test_no_matches_with_working_legs_stays_empty():
+    """Legs that succeed but match nothing keep the plain empty semantics."""
+
+    store = FakeStore(chunks=[{"id": 1, "page_title": "wolf", "heading": "H", "text": "canine"}])
+    searcher = WikiSearcher(store, embedder=None)
+    assert searcher.search("unrelated query words", top_k=5) == []

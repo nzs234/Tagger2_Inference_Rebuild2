@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Annotated, Literal, Union
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -22,6 +23,91 @@ TagManagerProfile = Literal["e621", "danbooru"]
 # uses the same closed vocabulary as the workflow contracts.
 COUNT_VALUES = ("", "solo", "duo", "trio", "group")
 
+# Per-tag caps.  Filter tags are short booru-style names; batch tags get more
+# room because a regex pattern needs space.  The list-level ``max_length``
+# caps bound the whole payload (64 x 100 and 256 x 256 characters), and the
+# ImageFilter total-length validator keeps include+exclude jointly bounded.
+FILTER_TAG_MAX_LENGTH = 100
+BATCH_TAG_MAX_LENGTH = 256
+FILTER_TAGS_TOTAL_MAX_LENGTH = 8192
+
+# Regex guards for ``use_regex`` batch operations.  Python's ``re`` has no
+# match timeout, so the defence is upfront rejection: patterns are length
+# capped, must compile, and obviously catastrophic shapes (a quantified group
+# whose body already contains a quantifier, e.g. ``(a+)+`` or ``(?:.*)*``)
+# are refused before any sidecar is touched.
+REGEX_PATTERN_MAX_LENGTH = 256
+REGEX_MAX_REPEAT_BOUND = 1000
+
+FilterTag = Annotated[str, Field(max_length=FILTER_TAG_MAX_LENGTH)]
+BatchTag = Annotated[str, Field(max_length=BATCH_TAG_MAX_LENGTH)]
+
+# Group syntax like ``(?:``, ``(?P<name>``, ``(?=`` and inline flags ``(?i)``
+# is syntax, not quantifiers, so it is normalised away before the nested
+# quantifier scan.  ``(?<!\\)`` keeps escaped literal parens untouched.
+_GROUP_FLAGS_RE = re.compile(r"(?<!\\)\(\?[a-z]+(?:-[a-z]+)?\)")
+_GROUP_PREFIX_RE = re.compile(
+    r"(?<!\\)\(\?(?:P?<[a-zA-Z0-9_]*>|[=:!>]|\{[a-z-]+\}|[a-z]+(?:-[a-z]+)?:)"
+)
+_GROUP_BODY = r"(?:[^()\\]|\\.)*?"
+# A quantifier applied to a group whose body already contains a quantifier —
+# the classic exponential-backtracking shape, e.g. ``(a+)+`` or ``(a|ab?)+``.
+_QUANTIFIED_GROUP = (
+    r"\(" + _GROUP_BODY + r"(?:[+*?]|\{\d+(?:,\d*)?\})" + _GROUP_BODY + r"\)\s*[*+{]"
+)
+# A quantified group whose body contains another quantified group, e.g.
+# ``((a+))*``.
+_QUANTIFIED_GROUP_OF_GROUP = (
+    r"\("
+    + _GROUP_BODY
+    + r"\("
+    + _GROUP_BODY
+    + r"(?:[+*?]|\{\d+(?:,\d*)?\})"
+    + _GROUP_BODY
+    + r"\)"
+    + _GROUP_BODY
+    + r"\)\s*[*+{]"
+)
+_REPEAT_BOUND_RE = re.compile(r"\{(\d+)(,(\d*))?\}")
+
+
+def _has_nested_quantifier(pattern: str) -> bool:
+    text = _GROUP_FLAGS_RE.sub("", pattern)
+    text = _GROUP_PREFIX_RE.sub("(", text)
+    return (
+        re.search(_QUANTIFIED_GROUP, text) is not None
+        or re.search(_QUANTIFIED_GROUP_OF_GROUP, text) is not None
+    )
+
+
+def validate_regex_pattern(pattern: str) -> str:
+    """Reject regex patterns that are oversized, invalid or ReDoS-prone.
+
+    Returns the pattern unchanged when it is safe; raises ``ValueError``
+    (surfaced as a stable 422 by the request models) otherwise.
+    """
+
+    if len(pattern) > REGEX_PATTERN_MAX_LENGTH:
+        raise ValueError(
+            f"regex pattern must be at most {REGEX_PATTERN_MAX_LENGTH} characters"
+        )
+    if _has_nested_quantifier(pattern):
+        raise ValueError(
+            "regex pattern nests quantifiers and could hang the server"
+        )
+    for match in _REPEAT_BOUND_RE.finditer(pattern):
+        low = int(match.group(1))
+        high = match.group(3)
+        if low > REGEX_MAX_REPEAT_BOUND or (high and int(high) > REGEX_MAX_REPEAT_BOUND):
+            raise ValueError(
+                f"regex repetition bound must be at most {REGEX_MAX_REPEAT_BOUND}"
+            )
+    try:
+        re.compile(pattern)
+    except re.error as exc:
+        raise ValueError(f"invalid regex pattern: {exc}") from exc
+    return pattern
+
 
 class CreateDatasetRequest(BaseModel):
     """Open a dataset directory for browsing and tag editing."""
@@ -40,8 +126,8 @@ class ImageFilter(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    include_tags: list[str] = Field(default_factory=list, max_length=64)
-    exclude_tags: list[str] = Field(default_factory=list, max_length=64)
+    include_tags: list[FilterTag] = Field(default_factory=list, max_length=64)
+    exclude_tags: list[FilterTag] = Field(default_factory=list, max_length=64)
     include_mode: Literal["all", "any"] = "all"
     kind: Literal["any", "none", "tag_txt", "tags_json", "standard_json", "raw_e621_json"] = "any"
     sidecar: Literal["any", "present", "missing"] = "any"
@@ -54,6 +140,9 @@ class ImageFilter(BaseModel):
             # An "any" match over an empty set would select nothing; make the
             # empty filter behave like "no constraint" instead.
             self.include_mode = "all"
+        total = sum(len(tag) for tag in (*self.include_tags, *self.exclude_tags))
+        if total > FILTER_TAGS_TOTAL_MAX_LENGTH:
+            raise ValueError("combined include/exclude tags exceed the total length limit")
         return self
 
 
@@ -63,7 +152,7 @@ class BatchOperationRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     op: Literal["add", "remove", "replace"]
-    tags: list[str] = Field(default_factory=list, max_length=256)
+    tags: list[BatchTag] = Field(default_factory=list, max_length=256)
     replacement: str | None = Field(default=None, max_length=256)
     use_regex: bool = False
     image_ids: list[Annotated[int, Field(ge=1)]] | None = None
@@ -90,6 +179,18 @@ class BatchOperationRequest(BaseModel):
             raise ValueError("exactly one of image_ids or filter is required")
         if self.image_ids is not None and not self.image_ids:
             raise ValueError("image_ids must not be empty")
+        if self.image_ids is not None:
+            # Deduplicate while preserving the caller's order: a repeated id
+            # would otherwise apply the operation twice to the same image
+            # (observable for non-idempotent regex replaces).
+            self.image_ids = list(dict.fromkeys(self.image_ids))
+        if self.use_regex and self.op in {"remove", "replace"}:
+            patterns = self.tags if self.op == "remove" else self.tags[:1]
+            for pattern in patterns:
+                try:
+                    validate_regex_pattern(pattern)
+                except ValueError as exc:
+                    raise ValueError(f"use_regex: {exc}") from exc
         return self
 
 
@@ -214,14 +315,21 @@ class TagTranslateRequest(BaseModel):
 
 
 __all__ = [
+    "BATCH_TAG_MAX_LENGTH",
     "BatchOperationRequest",
+    "BatchTag",
     "COUNT_VALUES",
     "CreateDatasetRequest",
     "EditableSidecarKind",
+    "FILTER_TAG_MAX_LENGTH",
+    "FILTER_TAGS_TOTAL_MAX_LENGTH",
+    "FilterTag",
     "ImageEditRequest",
     "ImageFilter",
     "NineFieldEdit",
     "NlTranslateRequest",
+    "REGEX_MAX_REPEAT_BOUND",
+    "REGEX_PATTERN_MAX_LENGTH",
     "SidecarKindLiteral",
     "StandardJsonContent",
     "TagEdit",
@@ -230,4 +338,5 @@ __all__ = [
     "TagTxtContent",
     "TagsJsonContent",
     "TranslationLookupRequest",
+    "validate_regex_pattern",
 ]

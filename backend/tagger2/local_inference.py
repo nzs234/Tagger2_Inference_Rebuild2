@@ -22,6 +22,7 @@ from .common import empty_cuda_cache, is_out_of_memory
 from .model_registry import ModelBackend, ModelRecord, ModelRegistry
 from .preprocessing import preprocess_batch, preprocess_image
 from .schemas import TagItem
+from .tag_text import canonical_tag_name
 
 
 logger = logging.getLogger("tagger2.local_inference")
@@ -1052,7 +1053,13 @@ def _cached_tag_cutoffs(
 
 
 def normalize_tag_name(value: str) -> str:
-    return " ".join(value.replace("_", " ").strip().casefold().split())
+    """Return the merge key for one local-model tag.
+
+    Delegates to the shared :func:`tagger2.tag_text.canonical_tag_name` rule;
+    the alias is kept for the long-standing public name.
+    """
+
+    return canonical_tag_name(value)
 
 
 def merge_predictions(

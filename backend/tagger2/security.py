@@ -588,6 +588,40 @@ def redact_secret(value: str | None, *, keep: int = 4) -> str | None:
     return "*" * max(4, len(value) - keep) + value[-keep:]
 
 
+# Provider exceptions are echoed to API clients and operator logs; neither may
+# carry credentials.  The patterns below redact the credential shapes that
+# leak most often through HTTP client messages: signed URL query parameters,
+# Authorization headers, well-known provider key prefixes and URL userinfo.
+_SECRET_QUERY_PARAM_RE = re.compile(
+    r"(?i)\b(key|api_key|apikey|access_token|token|authorization)=([^&\s\"']+)"
+)
+_SECRET_BEARER_RE = re.compile(r"(?i)\b(bearer)\s+([a-z0-9._\-]{8,})")
+_SECRET_USERINFO_RE = re.compile(r"(?i)(https?://[^/\s\"':@]+:)([^@\s\"'/]+)(@)")
+_SECRET_TOKEN_RE = re.compile(
+    r"(?i)\b(?:sk[-_][a-z0-9._\-]{6,}|xai-[a-z0-9._\-]{6,}|aiza[a-z0-9._\-]{10,})"
+)
+
+
+def sanitize_provider_error(exc: BaseException | str, *, max_length: int = 300) -> str:
+    """Return provider exception text that is safe for responses and logs.
+
+    The message is collapsed to one line, credential-shaped substrings are
+    replaced with ``***``/``[redacted]`` placeholders and the result is
+    truncated so a chatty upstream error cannot flood a client payload.
+    Callers should still log the exception through the logger (with this
+    helper) and keep raw exception objects out of API payloads entirely.
+    """
+
+    text = " ".join(str(exc).split())
+    text = _SECRET_BEARER_RE.sub(r"\1 ***", text)
+    text = _SECRET_QUERY_PARAM_RE.sub(r"\1=***", text)
+    text = _SECRET_USERINFO_RE.sub(r"\1***\3", text)
+    text = _SECRET_TOKEN_RE.sub("[redacted]", text)
+    if len(text) > max_length:
+        text = text[: max_length - 1].rstrip() + "…"
+    return text
+
+
 __all__ = [
     "SecurityError",
     "PathNotAllowedError",
@@ -606,4 +640,5 @@ __all__ = [
     "atomic_write_json",
     "sha256_file",
     "redact_secret",
+    "sanitize_provider_error",
 ]

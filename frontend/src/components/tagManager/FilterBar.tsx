@@ -1,16 +1,12 @@
 import { Field } from '../ui'
 import {
-  formatTagForDisplay,
+  formatTagFilterInput,
+  parseTagFilterInput,
   type ImageFilterState,
   type TagManagerSidecarFilter,
   type TagManagerSort,
 } from '../../lib/tagManager'
 import { usePreferences } from '../../store/app'
-
-/** Filters accept either separator style; the backend matches both. */
-function parseTagList(value: string): string[] {
-  return value.split(',').map((tag) => tag.trim()).filter(Boolean)
-}
 
 export function FilterBar({ filter, sort, disabled, onChange, onSortChange }: {
   filter: ImageFilterState
@@ -20,17 +16,17 @@ export function FilterBar({ filter, sort, disabled, onChange, onSortChange }: {
   onSortChange: (sort: TagManagerSort) => void
 }) {
   const tagStyle = usePreferences((state) => state.tagStyle)
-  const render = (tags: string[]) => tags.map((tag) => formatTagForDisplay(tag, tagStyle)).join(', ')
+  const render = (tags: string[]) => formatTagFilterInput(tags, tagStyle)
 
   return <div className="tm-filter-grid">
-    <Field label="包含标签" hint="逗号分隔，下划线或空格均可">
+    <Field label="包含标签" hint="逗号分隔，下划线或空格均可；含逗号的标签写作 a\,b">
       <input
         value={render(filter.includeTags)}
         aria-label="包含标签"
         disabled={disabled}
         spellCheck={false}
         placeholder="solo, long_hair"
-        onChange={(event) => onChange({ ...filter, includeTags: parseTagList(event.target.value) })}
+        onChange={(event) => onChange({ ...filter, includeTags: parseTagFilterInput(event.target.value) })}
       />
     </Field>
     <Field label="匹配模式">
@@ -44,14 +40,14 @@ export function FilterBar({ filter, sort, disabled, onChange, onSortChange }: {
         <option value="any">包含任意标签</option>
       </select>
     </Field>
-    <Field label="排除标签" hint="逗号分隔">
+    <Field label="排除标签" hint="逗号分隔；含逗号的标签写作 a\,b">
       <input
         value={render(filter.excludeTags)}
         aria-label="排除标签"
         disabled={disabled}
         spellCheck={false}
         placeholder="comic"
-        onChange={(event) => onChange({ ...filter, excludeTags: parseTagList(event.target.value) })}
+        onChange={(event) => onChange({ ...filter, excludeTags: parseTagFilterInput(event.target.value) })}
       />
     </Field>
     <Field label="Sidecar 类型">

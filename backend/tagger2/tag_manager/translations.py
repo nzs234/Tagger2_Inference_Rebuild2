@@ -25,6 +25,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from ..security import atomic_write_bytes
+from ..tag_text import canonical_tag_key
 
 TRANSLATION_FORMAT = "tag-translations-v1"
 SUPPORTED_PROFILES = ("e621", "danbooru")
@@ -101,10 +102,12 @@ def normalize_lookup_key(tag: str) -> str:
     """Return the dictionary key for one tag.
 
     The dictionaries are keyed on the lowercase underscore spelling, so a tag
-    the user typed or stored with spaces still resolves.
+    the user typed or stored with spaces still resolves.  This is the shared
+    :func:`tagger2.tag_text.canonical_tag_key` rule; the alias is kept so the
+    long-standing public name keeps working.
     """
 
-    return tag.strip().replace(" ", "_").casefold()
+    return canonical_tag_key(tag)
 
 
 class TagTranslations:

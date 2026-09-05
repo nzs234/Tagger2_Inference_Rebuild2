@@ -94,15 +94,26 @@ describe('tag manager API client', () => {
       offset: '120',
       limit: '60',
       sort: 'tags',
-      include_tags: 'solo,long_hair',
+      include_tags: 'long_hair', // tags are repeated parameters now; the last one shows here
       exclude_tags: 'comic',
       include_mode: 'any',
       kind: 'tag_txt',
       sidecar: 'missing',
     })
+    expect(query.getAll('include_tags')).toEqual(['solo', 'long_hair'])
+    expect(query.getAll('exclude_tags')).toEqual(['comic'])
     // Neutral filters must not be sent at all.
     const neutral = imageFilterQuery({ offset: 0, limit: 60, filter: emptyImageFilter })
     expect(Object.fromEntries(neutral)).toEqual({ offset: '0', limit: '60' })
+    // A tag containing a comma is escaped, so it survives the round trip.
+    const comma = imageFilterQuery({
+      offset: 0,
+      limit: 60,
+      filter: { ...emptyImageFilter, includeTags: ['1girl, smile'], excludeTags: ['a\\b'] },
+    })
+    expect(comma.getAll('include_tags')).toEqual(['1girl\\, smile'])
+    expect(comma.getAll('exclude_tags')).toEqual(['a\\\\b'])
+    expect(comma.get('include_tags')).not.toContain('1girl,')
   })
 
   it('fetches the image page and a single image detail', async () => {

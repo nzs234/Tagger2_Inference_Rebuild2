@@ -101,7 +101,9 @@ export async function request<T>(path: string, init: RequestInit = {}): Promise<
   }
 
   if (response.status === 204) return undefined as T
-  return (await response.json()) as T
+  const bodyText = await response.text()
+  if (!bodyText.trim()) return undefined as T
+  return JSON.parse(bodyText) as T
 }
 
 async function requestBlob(path: string): Promise<Blob> {
@@ -117,7 +119,9 @@ async function requestBlob(path: string): Promise<Blob> {
         ? detail.message
         : `请求失败 (${response.status})`
     const code = typeof body.code === 'string' ? body.code : typeof detail?.code === 'string' ? detail.code : 'request_failed'
-    throw new ApiError(message, response.status, code, response.headers.get('x-request-id') ?? undefined)
+    const requestId = typeof body.request_id === 'string' ? body.request_id : response.headers.get('x-request-id') ?? undefined
+    const retryable = body.retryable === true || detail?.retryable === true
+    throw new ApiError(message, response.status, code, requestId, retryable)
   }
   return response.blob()
 }

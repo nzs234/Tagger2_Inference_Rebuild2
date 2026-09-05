@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 from fastapi import APIRouter, HTTPException, Query, Response
 from fastapi.responses import FileResponse
+from pydantic import ValidationError
 
 from .contracts import (
     BatchOperationRequest,
@@ -15,6 +18,65 @@ from .contracts import (
     TranslationLookupRequest,
 )
 from .service import TagManagerError, TagManagerService
+
+
+def _split_tag_query(values: Sequence[str]) -> list[str]:
+    """Parse one or more tag query values into tags, losslessly.
+
+    Each value is split on *unescaped* commas only: ``\\,`` is a literal comma
+    and ``\\\\`` a literal backslash, so a tag containing a comma survives the
+    round trip (``include_tags=a%5C,b`` selects the tag ``a,b``).  Values that
+    contain no backslashes — everything sent by clients that never escape —
+    parse exactly like the previous plain ``str.split(",")`` behaviour, and
+    sending the parameter once per tag (repeated query parameters) works for
+    both spellings.
+    """
+
+    tags: list[str] = []
+    for raw in values:
+        for part in _split_unescaped_commas(raw):
+            tag = _unescape_tag(part.strip())
+            if tag.strip():
+                tags.append(tag)
+    return tags
+
+
+def _split_unescaped_commas(value: str) -> list[str]:
+    parts: list[str] = []
+    current: list[str] = []
+    escaped = False
+    for char in value:
+        if escaped:
+            current.append(char)
+            escaped = False
+        elif char == "\\":
+            current.append(char)
+            escaped = True
+        elif char == ",":
+            parts.append("".join(current))
+            current = []
+        else:
+            current.append(char)
+    parts.append("".join(current))
+    return parts
+
+
+def _unescape_tag(value: str) -> str:
+    out: list[str] = []
+    escaped = False
+    for char in value:
+        if escaped:
+            # Only the two escapes we document are rewritten; any other
+            # ``\\x`` sequence stays verbatim so legacy values are unchanged.
+            out.append(char if char in {",", "\\"} else f"\\{char}")
+            escaped = False
+        elif char == "\\":
+            escaped = True
+        else:
+            out.append(char)
+    if escaped:
+        out.append("\\")
+    return "".join(out)
 
 
 def _error(exc: TagManagerError) -> HTTPException:
@@ -68,8 +130,8 @@ def create_tag_manager_router(service: TagManagerService) -> APIRouter:
         offset: int = Query(default=0, ge=0),
         limit: int = Query(default=200, ge=1, le=1000),
         sort: str = Query(default="name", pattern="^(name|mtime|tags)$"),
-        include_tags: str = Query(default="", max_length=4096),
-        exclude_tags: str = Query(default="", max_length=4096),
+        include_tags: list[str] | None = Query(default=None),
+        exclude_tags: list[str] | None = Query(default=None),
         include_mode: str = Query(default="all", pattern="^(all|any)$"),
         kind: str = Query(
             default="any",
@@ -77,17 +139,34 @@ def create_tag_manager_router(service: TagManagerService) -> APIRouter:
         ),
         sidecar: str = Query(default="any", pattern="^(any|present|missing)$"),
     ):
-        # Query params arrive comma-separated; parse on the boundary so the
-        # validated ImageFilter stays the single contract shape.
+        # Tag parameters arrive either comma-separated (legacy) or as repeated
+        # query parameters with backslash-escaped commas (lossless); both are
+        # parsed on the boundary so the validated ImageFilter stays the single
+        # contract shape, including its per-tag length limits (stable 422).
         payload = {
-            "include_tags": [tag for tag in include_tags.split(",") if tag.strip()],
-            "exclude_tags": [tag for tag in exclude_tags.split(",") if tag.strip()],
+            "include_tags": _split_tag_query(include_tags or ()),
+            "exclude_tags": _split_tag_query(exclude_tags or ()),
             "include_mode": include_mode,
             "kind": kind,
             "sidecar": sidecar,
         }
         try:
             image_filter = ImageFilter.model_validate(payload)
+        except ValidationError as exc:
+            # Per-tag and total length limits end here as a stable 422 in the
+            # same envelope shape the global handler produces for request
+            # validation failures.
+            fields: dict[str, list[str]] = {}
+            for error in exc.errors():
+                location = ".".join(str(part) for part in error.get("loc", ()))
+                fields.setdefault(location or "filter", []).append(
+                    str(error.get("msg") or "invalid value")
+                )
+            raise HTTPException(
+                status_code=422,
+                detail={"code": "validation_error", "message": "请求参数校验失败", "fields": fields},
+            ) from exc
+        try:
             return service.list_images(
                 session_id, image_filter=image_filter, sort=sort, offset=offset, limit=limit
             )

@@ -16,20 +16,24 @@ from collections.abc import Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
+from ..tag_text import canonical_tag_key
 from ..workflow.contracts import utc_now
-from .translations import normalize_lookup_key
 
 SCHEMA_VERSION = 1
 
-# SQLite side of ``normalize_lookup_key``: the same lowercase underscore form
+# SQLite side of ``canonical_tag_key``: the same lowercase underscore form
 # so a filter typed with spaces matches a sidecar written with underscores.
 _TAG_KEY_SQL = "REPLACE(LOWER(t.tag), ' ', '_')"
 
 
 def normalize_tag_key(tag: str) -> str:
-    """Return the comparison key used by tag filters."""
+    """Return the comparison key used by tag filters.
 
-    return normalize_lookup_key(tag)
+    Delegates to the shared :func:`tagger2.tag_text.canonical_tag_key` rule;
+    the alias is kept so callers and tests keep their long-standing name.
+    """
+
+    return canonical_tag_key(tag)
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_migrations (
