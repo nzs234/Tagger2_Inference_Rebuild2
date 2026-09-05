@@ -378,9 +378,19 @@ try {
       if (-not (Test-Path -LiteralPath (Join-Path $smoke "runtime\get-pip.py"))) {
         throw "Base runtime package does not contain the pip bootstrap"
       }
-      foreach ($excludedDirectory in @("runtime\Lib\site-packages", "runtime\Scripts", "models\", "data_cache\")) {
+      foreach ($excludedDirectory in @("runtime\Lib\site-packages", "runtime\Scripts")) {
         if (Test-Path -LiteralPath (Join-Path $smoke $excludedDirectory)) {
           throw "Base runtime package contains excluded directory: $excludedDirectory"
+        }
+      }
+      foreach ($placeholderDirectory in @("models", "data_cache")) {
+        $placeholderPath = Join-Path $smoke $placeholderDirectory
+        if (Test-Path -LiteralPath $placeholderPath -PathType Container) {
+          $unexpectedFiles = Get-ChildItem -LiteralPath $placeholderPath -File -Recurse -Force |
+            Where-Object { $_.Name -ne ".gitkeep" }
+          if ($unexpectedFiles) {
+            throw "Base runtime package contains model/cache files in $placeholderDirectory: $($unexpectedFiles.FullName -join ', ')"
+          }
         }
       }
       foreach ($wikiDatabase in @("data\tag_wiki\tag_wiki.sqlite3", "data\tag_wiki\tag_wiki_danbooru.sqlite3")) {
