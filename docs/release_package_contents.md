@@ -1,9 +1,7 @@
 # Tagger2 发布包说明
 
-这个压缩包用于分享和部署 Tagger2 Inference 1.10.2。基础 Python 包内置便携式 Python
-3.12，但不包含第三方 site-packages；解压后运行 `setup.bat`，脚本会在该 runtime 中安装
-锁定依赖，之后运行 `start.bat`，浏览器打开 `http://127.0.0.1:20000`。也可以在启动前
-设置 `TAGGER2_TORCH_VARIANT=cpu` 强制使用 CPU。
+这个压缩包用于分享和部署 Tagger2 Inference 1.10.2。基础发行模式（`base-python-with-wiki`）内置便携式 Python
+3.12、构建完成的 Wiki 数据库和应用代码，但不包含第三方 site-packages；解压后运行 `setup.bat`，脚本会在该 runtime 中首次安装锁定依赖，之后运行 `start.bat`，浏览器打开 `http://127.0.0.1:20000`。CPU/CUDA 依赖均在首次启动时按 lockfile 下载；也可以在启动前设置 `TAGGER2_TORCH_VARIANT=cpu` 强制使用 CPU。
 
 ## 已包含
 
@@ -22,7 +20,7 @@
     - fingerprint：`2e3c4af6cc93b7f2cc8e55e2eda024ee69942f08a3618b6c2f0dfe6d45991972`
     - 规则统计：keep 47,095、replace 3,171、drop 105,440、pass 0
 
-自 V1.10.1 起，构建完成的 **Tag Wiki 数据库随包发行**（`data/tag_wiki/`）：
+基础发行包继续包含构建完成的 **Tag Wiki 数据库**（`data/tag_wiki/`）：
 
 - `tag_wiki.sqlite3`（e621 镜像：页面 / 章节 / 向量 / 中文摘要）
 - `tag_wiki_danbooru.sqlite3`（danbooru 镜像，同 schema）

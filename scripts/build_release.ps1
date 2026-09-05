@@ -4,6 +4,7 @@ param(
   [string]$UpstreamSourceRoot = $env:TAGGER2_UPSTREAM_SOURCE_ROOT,
   [switch]$SkipRuntime,
   [switch]$BaseRuntimeOnly,
+  [switch]$FullRuntime,
   [switch]$SkipSmokeTest
 )
 
@@ -31,8 +32,15 @@ $stage = Join-Path $root (".release_$stamp")
 $out = Join-Path $root $OutputDir
 $smoke = Join-Path $root (".release_smoke_$stamp")
 
+if ($FullRuntime -and $BaseRuntimeOnly) {
+  throw "FullRuntime and BaseRuntimeOnly cannot be used together"
+}
+# Base Python is the safe default. Full runtime packaging is opt-in for legacy/internal use.
+if (-not $FullRuntime) {
+  $BaseRuntimeOnly = $true
+}
 if ($SkipRuntime -and $BaseRuntimeOnly) {
-  throw "SkipRuntime and BaseRuntimeOnly cannot be used together"
+  throw "SkipRuntime cannot be used with the default BaseRuntimeOnly mode; use -FullRuntime or omit runtime explicitly"
 }
 
 $sourceCommit = (& git -C $root rev-parse HEAD).Trim()
@@ -153,6 +161,7 @@ try {
     built_at = $stamp
     source_commit = $sourceCommit
     upstream_commit = $upstreamCommit
+    runtime_mode = if ($BaseRuntimeOnly) { "base-python-with-wiki" } else { "full-runtime" }
     checks = @(
       "backend_tests",
       "ruff",
@@ -368,6 +377,16 @@ try {
       }
       if (-not (Test-Path -LiteralPath (Join-Path $smoke "runtime\get-pip.py"))) {
         throw "Base runtime package does not contain the pip bootstrap"
+      }
+      foreach ($excludedDirectory in @("runtime\Lib\site-packages", "runtime\Scripts", "models\", "data_cache\")) {
+        if (Test-Path -LiteralPath (Join-Path $smoke $excludedDirectory)) {
+          throw "Base runtime package contains excluded directory: $excludedDirectory"
+        }
+      }
+      foreach ($wikiDatabase in @("data\tag_wiki\tag_wiki.sqlite3", "data\tag_wiki\tag_wiki_danbooru.sqlite3")) {
+        if (-not (Test-Path -LiteralPath (Join-Path $smoke $wikiDatabase))) {
+          throw "Base runtime package is missing Wiki database: $wikiDatabase"
+        }
       }
       & $packagedPython -c "import sys; assert sys.version_info[:2] == (3, 12), sys.version; print('release smoke: base Python', sys.version.split()[0])"
       if ($LASTEXITCODE -ne 0) { throw "Packaged base Python smoke test failed with exit code $LASTEXITCODE" }
