@@ -115,7 +115,10 @@ async def _judge_batch(provider: Any, batch: list[dict[str, str]]) -> dict[str, 
         verdict = str(item.get("verdict", "")).strip().casefold()
         if verdict not in VERDICTS:
             verdict = "minor" if verdict else "error"
-        verdicts[str(item["title"])] = {
+        # Judges sometimes echo the tag with spaces instead of underscores
+        # (e.g. "nippon_ichi software"); normalize back to the corpus form.
+        title = str(item["title"]).strip().replace(" ", "_")
+        verdicts[title] = {
             "verdict": verdict,
             "reason": str(item.get("reason", "")).strip(),
         }
@@ -196,6 +199,41 @@ def _load_titles_filters(items: list[str]) -> dict[str, set[str]]:
     return filters
 
 
+async def _judge_with_retry(
+    provider: Any, batch: list[dict[str, str]]
+) -> dict[str, dict[str, str]]:
+    """Judge a batch; entries the judge omitted (or a failed call) are retried
+    singly inline, so nothing is dropped and no requeue can land behind the
+    worker sentinels."""
+    last_error = ""
+    try:
+        verdicts = await _judge_batch(provider, batch)
+    except Exception as exc:  # noqa: BLE001 - fall through to inline singles
+        verdicts = {}
+        last_error = str(exc)[:200]
+    if len(batch) == 1 and batch[0]["title"] in verdicts:
+        return verdicts
+    out: dict[str, dict[str, str]] = {}
+    for entry in batch:
+        got = verdicts.get(entry["title"])
+        if got is not None:
+            out[entry["title"]] = got
+            continue
+        for _attempt in range(2):
+            try:
+                single = await _judge_batch(provider, [entry])
+                got = single.get(entry["title"])
+                if got is not None:
+                    break
+            except Exception as exc:  # noqa: BLE001 - keep the last error text
+                last_error = str(exc)[:200]
+        out[entry["title"]] = got or {
+            "verdict": "error",
+            "reason": last_error or "missing in judge reply",
+        }
+    return out
+
+
 async def _sweep(args: argparse.Namespace) -> None:
     provider = _build_provider(args)
 
@@ -241,13 +279,8 @@ async def _sweep(args: argparse.Namespace) -> None:
                     return
                 verdicts: dict[str, dict[str, str]] = {}
                 try:
-                    verdicts = await _judge_batch(provider, batch)
+                    verdicts = await _judge_with_retry(provider, batch)
                 except Exception as exc:  # noqa: BLE001 - record and continue
-                    if len(batch) > 1:
-                        for entry in batch:
-                            await queue.put([entry])
-                        queue.task_done()
-                        continue
                     for entry in batch:
                         verdicts[entry["title"]] = {"verdict": "error", "reason": str(exc)[:200]}
                 lines = []
