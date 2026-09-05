@@ -1,6 +1,6 @@
 # Tagger2 发布包说明
 
-这个压缩包用于分享和部署 Tagger2 Inference 1.10.2。基础发行模式（`base-python-with-wiki`）内置便携式 Python
+这个压缩包用于分享和部署 Tagger2 Inference 1.10.3。基础发行模式（`base-python-with-wiki`）内置便携式 Python
 3.12、构建完成的 Wiki 数据库和应用代码，但不包含第三方 site-packages；解压后运行 `setup.bat`，脚本会在该 runtime 中首次安装锁定依赖，之后运行 `start.bat`，浏览器打开 `http://127.0.0.1:20000`。CPU/CUDA 依赖均在首次启动时按 lockfile 下载；也可以在启动前设置 `TAGGER2_TORCH_VARIANT=cpu` 强制使用 CPU。
 
 ## 已包含
@@ -26,7 +26,12 @@
 - `tag_wiki_danbooru.sqlite3`（danbooru 镜像，同 schema）
 
 打包时通过 SQLite `VACUUM INTO` 生成干净紧凑的快照（scripts/snapshot_wiki_databases.py），
-解压即用、无需重建语料；跨语言嵌入模型本身仍属模型类大文件，首次构建时按需下载。
+解压即用、无需重建语料。V1.10.3 起两个库的向量均由 **Qwen3-Embedding-0.6B（ONNX，1024 维）**
+生成；包内同时携带该模型的 tokenizer/config 文件（`data/tag_wiki/models/shawnw3i__Qwen3-Embedding-0.6B-ONNX/`），
+与发行页单独提供的 `Tagger2_Qwen3-Embedding-0.6B-ONNX_model.onnx` 资产配套使用：
+将该文件下载后放入上述目录（重命名为 `model.onnx`）即可启用本地语义检索，无需 LM Studio 或在线服务。
+发行包的 `config/app.toml` 在打包阶段强制 `frozen = true`：Wiki 构建/重建/翻译入口对最终用户关闭
+（后端 403、前端隐藏维护面板），数据维护由发布者完成后随包分发。
 
 资源位于 `data/workflows/resources/`，每个资源都带有独立 manifest 和内容指纹。
 分类快照与 tokenizer 属模型类大文件（合计约 131 MB），自 V1.10 起不随包发行：首次使用时应用自动从
@@ -43,7 +48,7 @@
 - `runtime_ocr/`、PaddleOCR 模型缓存和 OCR 资源描述：这些文件体积较大，且描述中可能含
   原机器的绝对路径。需要 OCR 时，请按项目文档单独安装隔离 OCR 运行时并注册本机资源。
 
-以下历史说明适用于旧版 V1.04.1，并非 1.10.2 的当前版本上下文。1.10.2 包内容与资源策略以上文的 Tag Wiki 快照、workflow manifest、迁移和限制说明为准。
+以下历史说明适用于旧版 V1.04.1，并非 1.10.3 的当前版本上下文。1.10.3 包内容与资源策略以上文的 Tag Wiki 快照、workflow manifest、迁移和限制说明为准。
 
 V1.04.1 延续 V1.03 的上游固定基线 `ccc9d07497be637fc097c5da009d791f017144c9`。Replacement
 保留上游的随机 `anthro` → `furry` 规则；调用方按 `job_id + sample_id +

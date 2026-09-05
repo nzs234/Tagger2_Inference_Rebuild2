@@ -223,6 +223,7 @@ try {
     "docs/V1.10_RELEASE_NOTES.md",
     "docs/V1.10.1_RELEASE_NOTES.md",
     "docs/V1.10.2_RELEASE_NOTES.md",
+    "docs/V1.10.3_RELEASE_NOTES.md",
     "docs/tag_manager.md",
     "docs/tag_wiki.md",
     "docs/release_package_contents.md",
@@ -297,6 +298,40 @@ try {
     --data-dir (Join-Path $root "data") `
     --dest $wikiDbStage
   if ($LASTEXITCODE -ne 0) { throw "Could not snapshot the wiki databases" }
+
+  # The shipped app.toml mirrors the maintainer's working config; the packaged
+  # build must always be read-only for end users: frozen=true rejects the
+  # build/translate endpoints and hides the maintenance UI.
+  $stagedConfigPath = Join-Path $stage "config\app.toml"
+  $stagedConfig = [System.IO.File]::ReadAllText($stagedConfigPath)
+  if ($stagedConfig -match '(?m)^frozen\s*=') {
+    $stagedConfig = $stagedConfig -replace '(?m)^frozen\s*=.*$', 'frozen = true'
+  } elseif ($stagedConfig -match '(?m)^\[tag_wiki\]\s*$') {
+    $stagedConfig = $stagedConfig -replace '(?m)^\[tag_wiki\]\s*$', "[tag_wiki]`nfrozen = true"
+  } else {
+    $stagedConfig = $stagedConfig.TrimEnd() + "`n`n[tag_wiki]`nfrozen = true`n"
+  }
+  $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+  [System.IO.File]::WriteAllText($stagedConfigPath, $stagedConfig, $utf8NoBom)
+
+  # Ship the local embedding model's tokenizer/config files next to the wiki
+  # databases so the packaged app can load the same model the vectors were
+  # built with. The multi-GB ONNX weights are NOT embedded here: they ship as
+  # a separate release asset the user drops into this directory.
+  $wikiRepoMatch = Select-String -LiteralPath $stagedConfigPath -Pattern '^embed_model_repo\s*=\s*"([^"]+)"' | Select-Object -First 1
+  if (-not $wikiRepoMatch) {
+    throw "config/app.toml has no [tag_wiki] embed_model_repo; cannot bundle the wiki embedding tokenizer"
+  }
+  $wikiModelDirName = $wikiRepoMatch.Matches[0].Groups[1].Value -replace '/', '__'
+  $wikiModelSource = Join-Path $root ("data\tag_wiki\models\" + $wikiModelDirName)
+  $wikiModelStage = Join-Path $stage ("data\tag_wiki\models\" + $wikiModelDirName)
+  if (-not (Test-Path -LiteralPath (Join-Path $wikiModelSource "tokenizer.json"))) {
+    throw "Wiki embedding model files are missing under data/tag_wiki/models/$wikiModelDirName; provision the model before packaging"
+  }
+  New-Item -ItemType Directory -Force -Path $wikiModelStage | Out-Null
+  Get-ChildItem -LiteralPath $wikiModelSource -File |
+    Where-Object { $_.Name -notlike 'model.onnx*' } |
+    Copy-Item -Destination $wikiModelStage -Force
 
   # Keep the embedded interpreter portable. The startup script will later
   # replace this relative entry with the actual extracted package path.
@@ -397,6 +432,23 @@ try {
         if (-not (Test-Path -LiteralPath (Join-Path $smoke $wikiDatabase))) {
           throw "Base runtime package is missing Wiki database: $wikiDatabase"
         }
+      }
+      $smokeConfig = [System.IO.File]::ReadAllText((Join-Path $smoke "config\app.toml"))
+      if ($smokeConfig -notmatch '(?m)^frozen\s*=\s*true\s*$') {
+        throw "Packaged app.toml does not enable frozen mode; end users could mutate the bundled wiki databases"
+      }
+      $smokeWikiRepo = Select-String -LiteralPath (Join-Path $smoke "config\app.toml") -Pattern '^embed_model_repo\s*=\s*"([^"]+)"' | Select-Object -First 1
+      if (-not $smokeWikiRepo) {
+        throw "Packaged app.toml has no [tag_wiki] embed_model_repo"
+      }
+      $smokeWikiModelDir = Join-Path $smoke ("data\tag_wiki\models\" + ($smokeWikiRepo.Matches[0].Groups[1].Value -replace '/', '__'))
+      foreach ($wikiModelFile in @("tokenizer.json", "config.json")) {
+        if (-not (Test-Path -LiteralPath (Join-Path $smokeWikiModelDir $wikiModelFile))) {
+          throw "Base runtime package is missing wiki embedding model file: $wikiModelFile"
+        }
+      }
+      if (Test-Path -LiteralPath (Join-Path $smokeWikiModelDir "model.onnx")) {
+        throw "Wiki embedding ONNX weights must ship as a separate release asset, not inside the base package"
       }
       & $packagedPython -c "import sys; assert sys.version_info[:2] == (3, 12), sys.version; print('release smoke: base Python', sys.version.split()[0])"
       if ($LASTEXITCODE -ne 0) { throw "Packaged base Python smoke test failed with exit code $LASTEXITCODE" }
