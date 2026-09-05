@@ -389,7 +389,7 @@ try {
           $unexpectedFiles = Get-ChildItem -LiteralPath $placeholderPath -File -Recurse -Force |
             Where-Object { $_.Name -ne ".gitkeep" }
           if ($unexpectedFiles) {
-            throw "Base runtime package contains model/cache files in $placeholderDirectory: $($unexpectedFiles.FullName -join ', ')"
+            throw "Base runtime package contains model/cache files in ${placeholderDirectory}: $($unexpectedFiles.FullName -join ', ')"
           }
         }
       }
