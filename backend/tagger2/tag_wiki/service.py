@@ -31,6 +31,7 @@ import json
 import logging
 import re
 import threading
+from collections.abc import Mapping
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Sequence
@@ -38,11 +39,16 @@ from typing import Any, Callable, Sequence
 from ..tag_manager.tag_db import TagDatabase, TagDatabaseError, TagInfo
 from ..tag_manager.translations import TagTranslations
 from .contracts import (
+    CATALOG_DEFAULT_PAGE_SIZE,
+    CATALOG_MAX_PAGE_SIZE,
+    CATALOG_SEARCH_CANDIDATE_CAP,
     DEFAULT_EMBED_MODEL_REPO,
     ERROR_WIKI_ASK_FAILED,
     ERROR_WIKI_ASK_UNAVAILABLE,
     ERROR_WIKI_BUILD_FAILED,
     ERROR_WIKI_BUSY,
+    ERROR_WIKI_CATALOG_MISSING,
+    ERROR_WIKI_CATALOG_TAG_NOT_FOUND,
     ERROR_WIKI_EMBED_MODEL_UNAVAILABLE,
     ERROR_WIKI_FROZEN,
     ERROR_WIKI_LOOKUP_FAILED,
@@ -75,6 +81,13 @@ from .importer import (
 )
 from .danbooru_importer import default_danbooru_store_path
 from .searcher import WikiSearchError, WikiSearcher
+from .taxonomy import (
+    GROUP_ORDER,
+    category_label,
+    group_label,
+    group_sort_key,
+    split_tokens,
+)
 from .translator import translate_pages
 from .wiki_store import WikiStore, default_tag_wiki_database_path, normalize_title
 
@@ -156,6 +169,46 @@ def _page_public(page: dict[str, Any]) -> dict[str, Any]:
         "sections": page.get("sections", []),
         "related_tags": page.get("related_tags", []),
     }
+
+
+# Fuzzy-search tiers for catalog results, best first: the exact canonical
+# name, the canonical tag behind an exact alias, a name-prefix hit, then
+# token-prefix / contained substring hits.
+CATALOG_MATCH_TIERS: tuple[str, ...] = ("exact", "alias", "prefix", "token", "contained")
+
+# Relation buckets are sorted by target popularity, so the first entries are
+# the useful ones; popular tags otherwise drag hundreds of wiki links into
+# one detail response (pokemon_(species) has 800+), which floods the UI.
+_CATALOG_MAX_RELATIONS_PER_BUCKET = 30
+
+
+def _catalog_match_tier(q: str, tokens: Sequence[str], name: str) -> int:
+    """Rank one candidate name against the normalized query.
+
+    Tier order matches ``CATALOG_MATCH_TIERS``; the store's LIKE fetch only
+    guarantees "contained", so this refines the store ordering (post_count
+    desc) into relevance order without losing it inside a tier.
+    """
+
+    if name == q:
+        return 0
+    if name.startswith(q):
+        return 2
+    name_tokens = split_tokens(name)
+    for token in tokens:
+        if any(name_token.startswith(token) for name_token in name_tokens):
+            return 3
+    return 4
+
+
+def _catalog_row_matches_filters(row: Mapping[str, Any], category: str | None, group: str | None) -> bool:
+    """Whether one catalog row satisfies the browse sidebar filters."""
+
+    if category is not None and str(row.get("category", "")) != category:
+        return False
+    if group is not None and str(row.get("group_key", "")) != group:
+        return False
+    return True
 
 
 def _parse_ask_reply(reply: str) -> dict[str, Any]:
@@ -716,6 +769,319 @@ class TagWikiService:
         if page is None:
             raise TagWikiError(f"Wiki 页面不存在：{title}", code=ERROR_WIKI_PAGE_NOT_FOUND, status_code=404)
         return _page_public(page)
+
+    # -- tag catalog (read-only booru-style directory) -----------------------
+
+    def _require_catalog(self, profile: str = _WIKI_PROFILE) -> WikiStore:
+        """Return the profile store, raising 409 when the catalog is absent.
+
+        The catalog tables are written only by
+        ``scripts/build_tag_wiki_catalog.py``; until then every ``/catalog``
+        endpoint answers with a stable setup error instead of an empty page.
+        """
+
+        store = self._store_for(profile)
+        if not store.catalog_built():
+            raise TagWikiError(
+                "标签目录尚未生成：请先运行 scripts/build_tag_wiki_catalog.py",
+                code=ERROR_WIKI_CATALOG_MISSING,
+                status_code=409,
+            )
+        return store
+
+    def _catalog_item(
+        self,
+        profile: str,
+        row: Mapping[str, Any],
+        *,
+        alias_of: str | None = None,
+        match: str | None = None,
+    ) -> dict[str, Any]:
+        """Shape one ``catalog_tags`` row into the documented item dict."""
+
+        item: dict[str, Any] = {
+            "name": str(row["name"]),
+            "translation": self.translations.translate(profile, str(row["name"])),
+            "category": str(row["category"]),
+            "group_key": str(row["group_key"]),
+            "group_label": group_label(str(row["group_key"])),
+            "post_count": int(row.get("post_count") or 0),
+            "has_wiki": bool(row.get("has_wiki")),
+            "alias_of": alias_of if alias_of is not None else row.get("alias_of"),
+        }
+        if match is not None:
+            item["match"] = match
+        return item
+
+    def catalog_status(self, profile: str = _WIKI_PROFILE) -> dict[str, Any]:
+        """Catalog generation metadata for one profile (never raises 409)."""
+
+        store = self._store_for(profile)
+        built = store.catalog_built()
+        meta = store.catalog_meta() if built else {}
+        return {
+            "built": built,
+            "profile": profile,
+            "generated_at": meta.get("generated_at"),
+            "taxonomy_version": int(meta.get("taxonomy_version") or 0) or None,
+            "min_post_count": int(meta.get("min_post_count") or 0) or None,
+            "tag_count": store.catalog_tag_count(),
+            "relation_count": store.catalog_relation_count(),
+        }
+
+    async def catalog_categories(self, profile: str = _WIKI_PROFILE) -> dict[str, Any]:
+        """Category + group tree for the browse sidebar."""
+
+        self._require_catalog(profile)
+        status = self.catalog_status(profile)
+        stats = await asyncio.to_thread(self._store_for(profile).catalog_categories_stats)
+        categories: dict[str, dict[str, Any]] = {}
+        for row in stats:
+            category = str(row["category"])
+            entry = categories.get(category)
+            if entry is None:
+                entry = {
+                    "category": category,
+                    "label": category_label(category),
+                    "tag_count": 0,
+                    "groups": [],
+                }
+                categories[category] = entry
+            entry["tag_count"] += int(row["tag_count"])
+            entry["groups"].append(
+                {
+                    "key": str(row["group_key"]),
+                    "label": group_label(str(row["group_key"])),
+                    "tag_count": int(row["tag_count"]),
+                }
+            )
+        ordered = sorted(
+            categories.values(),
+            key=lambda entry: (group_sort_key(entry["category"] if entry["category"] in GROUP_ORDER
+                                              else "other_general"), entry["category"]),
+        )
+        for entry in ordered:
+            entry["groups"].sort(key=lambda group: (-group["tag_count"], group["key"]))
+        return {
+            "profile": profile,
+            "built": True,
+            "generated_at": status["generated_at"],
+            "taxonomy_version": status["taxonomy_version"] or 0,
+            "min_post_count": status["min_post_count"] or 0,
+            "tag_count": status["tag_count"],
+            "relation_count": status["relation_count"],
+            "categories": ordered,
+        }
+
+    async def catalog_browse(
+        self,
+        *,
+        profile: str = _WIKI_PROFILE,
+        category: str | None = None,
+        group: str | None = None,
+        q: str | None = None,
+        offset: int = 0,
+        limit: int = CATALOG_DEFAULT_PAGE_SIZE,
+    ) -> dict[str, Any]:
+        """Browse/search the catalog: directory pages or fuzzy ranked search.
+
+        Without ``q`` this is a plain directory page (post_count desc, name
+        asc, SQL pagination). With ``q`` the store provides the substring
+        candidate set and this method ranks it: exact canonical name, then
+        the canonical tag behind an exact alias, then prefix matches, then
+        token-prefix / contained matches — always post_count then name inside
+        a tier, and always restricted to catalog (high-frequency) tags.
+        """
+
+        store = self._require_catalog(profile)
+        clean_category = (category or "").strip() or None
+        clean_group = (group or "").strip() or None
+        clean_q = normalize_title(q or "")
+        limit = max(1, min(int(limit), CATALOG_MAX_PAGE_SIZE))
+        offset = max(0, int(offset))
+        if not clean_q:
+            total, rows = await asyncio.to_thread(
+                store.catalog_browse,
+                category=clean_category,
+                group=clean_group,
+                q=None,
+                offset=offset,
+                limit=limit,
+            )
+            items = [self._catalog_item(profile, row) for row in rows]
+            return {
+                "profile": profile,
+                "category": clean_category,
+                "group": clean_group,
+                "q": None,
+                "total": total,
+                "offset": offset,
+                "limit": limit,
+                "items": items,
+            }
+        result = await asyncio.to_thread(
+            self._catalog_search_sync,
+            profile,
+            clean_q,
+            clean_category,
+            clean_group,
+            offset,
+            limit,
+        )
+        result.update(
+            {
+                "profile": profile,
+                "category": clean_category,
+                "group": clean_group,
+                "q": clean_q,
+            }
+        )
+        return result
+
+    def _catalog_search_sync(
+        self,
+        profile: str,
+        q: str,
+        category: str | None,
+        group: str | None,
+        offset: int,
+        limit: int,
+    ) -> dict[str, Any]:
+        """Rank substring candidates for one fuzzy catalog query.
+
+        Runs in a worker thread (called from :meth:`catalog_browse`): the
+        candidate fetch is one indexed LIKE query, ranking is pure Python.
+        """
+
+        store = self._store_for(profile)
+        candidate_cap = CATALOG_SEARCH_CANDIDATE_CAP
+        # Candidate set: the full query as one substring, UNION the same
+        # browse per query token. The full-string LIKE alone would miss a
+        # name like "blue_dragon" for "drag blue" (no single name contains
+        # the whole phrase); token queries catch those, ranking below does
+        # the ordering. Merged by name, both endpoints already filtered.
+        candidates: dict[str, dict[str, Any]] = {}
+        _total, rows = store.catalog_browse(
+            category=category, group=group, q=q, offset=0, limit=candidate_cap
+        )
+        for row in rows:
+            candidates[str(row["name"])] = row
+        tokens = [token for token in split_tokens(q) if len(token) >= 2]
+        if len(tokens) > 1 and len(candidates) < candidate_cap:
+            for token in tokens:
+                _token_total, token_rows = store.catalog_browse(
+                    category=category, group=group, q=token, offset=0, limit=candidate_cap
+                )
+                for row in token_rows:
+                    candidates.setdefault(str(row["name"]), row)
+
+        # Exact alias: the canonical tag behind the query may be absent from
+        # the substring candidate list (different spelling), so resolve it
+        # through the shared tag database and merge it in. Only a query that
+        # resolved THROUGH an alias (alias_of set) counts as an alias match;
+        # a canonical query is tier 0 via the ordinary loop below.
+        alias_info = self._tag_info(profile, q, required=False)
+        alias_canonical = ""
+        alias_display = ""
+        if alias_info is not None and alias_info.get("alias_of"):
+            alias_canonical = normalize_title(str(alias_info["name"]))
+            alias_display = str(alias_info["alias_of"])
+
+        ranked: list[tuple[int, str, dict[str, Any]]] = []
+        for name, row in candidates.items():
+            if alias_canonical and name == alias_canonical:
+                tier = 1  # exact alias
+                item = self._catalog_item(profile, row, alias_of=alias_display)
+            else:
+                tier = _catalog_match_tier(q, tokens, name)
+                item = self._catalog_item(profile, row)
+            item["match"] = CATALOG_MATCH_TIERS[tier]
+            ranked.append((tier, name, item))
+        if alias_canonical and alias_canonical not in candidates:
+            alias_row = store.catalog_get_tag(alias_canonical)
+            if alias_row is not None and _catalog_row_matches_filters(alias_row, category, group):
+                item = self._catalog_item(profile, alias_row, alias_of=alias_display)
+                item["match"] = "alias"
+                ranked.append((1, alias_canonical, item))
+        ranked.sort(key=lambda entry: (entry[0], -entry[2]["post_count"], entry[1]))
+        total = len(ranked)
+        items = [entry[2] for entry in ranked[offset : offset + limit]]
+        return {
+            "total": total,
+            "offset": offset,
+            "limit": limit,
+            "items": items,
+        }
+
+    async def catalog_tag_detail(self, title: str, *, profile: str = _WIKI_PROFILE) -> dict[str, Any]:
+        """One catalog tag with its wiki page, summary and grouped relations.
+
+        Relations come from the catalog tables, so every returned name is
+        itself a catalog (post_count >= threshold) tag and clickable in the
+        UI. Legacy ``/lookup`` and ``/page`` stay untouched.
+        """
+
+        store = self._require_catalog(profile)
+        row = await asyncio.to_thread(store.catalog_get_tag, title)
+        if row is None:
+            raise TagWikiError(
+                f"标签目录中不存在：{title}",
+                code=ERROR_WIKI_CATALOG_TAG_NOT_FOUND,
+                status_code=404,
+            )
+        page, relation_groups = await asyncio.to_thread(
+            self._catalog_detail_sync, store, row, profile
+        )
+        return {
+            "tag": self._catalog_item(profile, row),
+            "page": _page_public(page) if page is not None else None,
+            "implications": relation_groups["implications"],
+            "wiki_links": relation_groups["wiki_links"],
+            "cooccurrences": relation_groups["cooccurrences"],
+        }
+
+    def _catalog_detail_sync(
+        self, store: WikiStore, row: Mapping[str, Any], profile: str
+    ) -> tuple[dict[str, Any] | None, dict[str, list[dict[str, Any]]]]:
+        """Blocking half of the catalog detail view, run in a worker thread.
+
+        The wiki page fetch, the relation query and the per-relation
+        tag-database/translation lookups are all SQLite or first-load work,
+        so they share one thread hop instead of stalling the event loop.
+        """
+
+        name = str(row["name"])
+        page = store.get_page(name) if row["has_wiki"] else None
+        relation_rows = store.catalog_relations_for(name)
+        groups: dict[str, list[dict[str, Any]]] = {
+            "implications": [],
+            "wiki_links": [],
+            "cooccurrences": [],
+        }
+        for relation in relation_rows:
+            relation_type = str(relation["relation_type"])
+            bucket_key = {"implication": "implications", "wiki_link": "wiki_links"}.get(
+                relation_type, "cooccurrences"
+            )
+            other = (
+                relation["related_name"]
+                if relation["direction"] == "forward"
+                else relation["tag_name"]
+            )
+            info = self._tag_info(profile, other, required=False)
+            groups[bucket_key].append(
+                {
+                    "name": other,
+                    "relation_type": relation_type,
+                    "direction": str(relation["direction"]),
+                    "score": float(relation["score"] or 0.0),
+                    "tag": self._ref_from_info(profile, info) if info is not None else None,
+                }
+            )
+        for relation_bucket in groups.values():
+            relation_bucket.sort(key=lambda item: (-item["score"], item["name"]))
+            del relation_bucket[_CATALOG_MAX_RELATIONS_PER_BUCKET:]
+        return page, groups
 
     # -- search / ask -------------------------------------------------------
 

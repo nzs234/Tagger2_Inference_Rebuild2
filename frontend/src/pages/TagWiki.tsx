@@ -1,159 +1,238 @@
-import { useRef, useState } from 'react'
-import { useMutation } from '@tanstack/react-query'
+import { useEffect, useMemo, useRef, useState } from 'react'
+import { useQuery } from '@tanstack/react-query'
 import {
-  AlertCircle,
-  BookOpen,
-  Bot,
-  HelpCircle,
+  ChevronLeft,
+  ChevronRight,
+  Database,
+  FileText,
+  LayoutGrid,
   LoaderCircle,
   Search,
-  Send,
-  Sparkles,
 } from 'lucide-react'
 import { BuildPanel } from '../components/tagWiki/BuildPanel'
-import { ChunkHitCard, LookupResultCard, WikiTagPill } from '../components/tagWiki/ResultCards'
+import { WikiSummaryCard, WikiTagPill } from '../components/tagWiki/ResultCards'
 import { Button, Notice, Panel } from '../components/ui'
+import { tagCategoryClass } from '../lib/tagCategories'
+import { formatTagForDisplay } from '../lib/tagManager'
 import {
   describeWikiError,
   tagWikiApi,
-  wikiErrorCode,
   WIKI_PROFILES,
   WIKI_PROFILE_LABELS,
-  type AskResult,
-  type LookupResult,
-  type SearchResult,
+  type CatalogRelationItem,
+  type TagRef,
   type TagWikiProfile,
 } from '../lib/tagWiki'
 import { usePreferences } from '../store/app'
 
-type WikiMode = 'lookup' | 'search' | 'ask'
+const CATALOG_PAGE_SIZE = 60
+const SEARCH_DEBOUNCE_MS = 300
 
-const TAB_ORDER: WikiMode[] = ['lookup', 'search', 'ask']
+const MATCH_LABELS: Record<string, string> = {
+  exact: '精确',
+  alias: '别名',
+  prefix: '前缀',
+  token: '词匹配',
+  contained: '包含',
+}
 
+/**
+ * Tag Wiki front page: a local booru-style tag directory. Users browse
+ * high-frequency tags (post_count >= threshold, maintained by the CLI) by
+ * category / semantic group or search them by name and alias; clicking a tag
+ * opens its wiki page, Chinese summary and related tags in the same view.
+ *
+ * The legacy semantic-search / AI-ask flows are retired from this page; the
+ * read-only build/status panel stays for per-profile database state.
+ */
 export function TagWiki() {
-  const [mode, setMode] = useState<WikiMode>('lookup')
   const [profile, setProfile] = useState<TagWikiProfile>('e621')
+  const [category, setCategory] = useState<string | null>(null)
+  const [group, setGroup] = useState<string | null>(null)
+  const [queryInput, setQueryInput] = useState('')
+  const [query, setQuery] = useState('')
+  const [offset, setOffset] = useState(0)
+  const [detailTitle, setDetailTitle] = useState<string | null>(null)
+  const [activeIndex, setActiveIndex] = useState(-1)
 
-  // Lookup state
-  const [lookupInput, setLookupInput] = useState('')
-  const [lookupResult, setLookupResult] = useState<LookupResult | null>(null)
+  const listRef = useRef<HTMLDivElement | null>(null)
+  const tagStyle = usePreferences((state) => state.tagStyle)
 
-  // Search state
-  const [searchQuery, setSearchQuery] = useState('')
-  const [searchTopK, setSearchTopK] = useState(8)
-  const [searchResult, setSearchResult] = useState<SearchResult | null>(null)
+  // -- data ---------------------------------------------------------------
 
-  // Ask state
-  const [askQuery, setAskQuery] = useState('')
-  const [askTopK, setAskTopK] = useState(8)
-  const [askResult, setAskResult] = useState<AskResult | null>(null)
+  const categoriesQuery = useQuery({
+    queryKey: ['tag-wiki', 'catalog-categories', profile],
+    queryFn: () => tagWikiApi.catalogCategories(profile),
+    retry: 1,
+  })
 
-  const [generalError, setGeneralError] = useState<{ message: string; code?: string } | null>(null)
+  const browseQuery = useQuery({
+    queryKey: ['tag-wiki', 'catalog-browse', profile, category, group, query, offset],
+    queryFn: () =>
+      tagWikiApi.catalogTags({ profile, category, group, q: query || null, offset, limit: CATALOG_PAGE_SIZE }),
+    retry: 1,
+  })
 
-  // Out-of-order response guard: a fast stale response must never overwrite a
-  // newer one when the user fires queries back to back. Only the request with
-  // the latest sequence number may land.
-  const lookupSeq = useRef(0)
-  const searchSeq = useRef(0)
-  const askSeq = useRef(0)
+  const detailQuery = useQuery({
+    queryKey: ['tag-wiki', 'catalog-detail', profile, detailTitle],
+    queryFn: () => tagWikiApi.catalogTag(detailTitle!, profile),
+    enabled: Boolean(detailTitle),
+    retry: 1,
+  })
 
-  const setPage = usePreferences((state) => state.setPage)
+  // -- derived ------------------------------------------------------------
 
-  /** Surface the shared error envelope: show the backend's Chinese message and
-   * special-case the 409 wiki codes with actionable guidance. */
-  const handleError = (err: unknown, defaultMsg: string) => {
-    setGeneralError({ code: wikiErrorCode(err) ?? undefined, message: describeWikiError(err, defaultMsg) })
+  const categories = categoriesQuery.data
+  const browse = browseQuery.data
+  const items = useMemo(() => browse?.items ?? [], [browse])
+  const activeCategory = categories?.categories.find((c) => c.category === category) ?? null
+  const searching = query.trim().length > 0
+
+  // -- effects ------------------------------------------------------------
+
+  // Debounced search: typing never fires a request per keystroke.
+  useEffect(() => {
+    const handle = window.setTimeout(() => setQuery(queryInput.trim()), SEARCH_DEBOUNCE_MS)
+    return () => window.clearTimeout(handle)
+  }, [queryInput])
+
+  const resetPaging = () => {
+    setOffset(0)
+    setActiveIndex(-1)
   }
 
-  // Lookup mutation
-  const lookupMutation = useMutation({
-    mutationFn: (tag: string) => tagWikiApi.lookup(tag, profile),
-  })
+  const switchProfile = (next: TagWikiProfile) => {
+    if (next === profile) return
+    setProfile(next)
+    setCategory(null)
+    setGroup(null)
+    setQueryInput('')
+    setQuery('')
+    setDetailTitle(null)
+    resetPaging()
+  }
 
-  // Search mutation
-  const searchMutation = useMutation({
-    mutationFn: () =>
-      tagWikiApi.search({ query: searchQuery.trim(), top_k: searchTopK, profile }),
-  })
+  const selectCategory = (next: string | null) => {
+    setCategory(next)
+    setGroup(null)
+    setDetailTitle(null)
+    resetPaging()
+  }
 
-  // Ask mutation
-  const askMutation = useMutation({
-    mutationFn: () => tagWikiApi.ask({ query: askQuery.trim(), top_k: askTopK, profile }),
-  })
+  const selectGroup = (next: string | null) => {
+    setGroup(next)
+    setDetailTitle(null)
+    resetPaging()
+  }
 
-  const runLookup = (tag: string) => {
-    const trimmed = tag.trim()
-    if (!trimmed) return
-    setLookupInput(trimmed)
-    setMode('lookup')
-    setGeneralError(null)
-    const seq = ++lookupSeq.current
-    lookupMutation.mutate(trimmed, {
-      onSuccess: (data) => {
-        if (seq !== lookupSeq.current) return
-        setLookupResult(data)
-        setGeneralError(null)
-      },
-      onError: (err) => {
-        if (seq !== lookupSeq.current) return
-        setLookupResult(null)
-        handleError(err, '查询标签 Wiki 失败')
-      },
+  const openTag = (name: string) => {
+    setActiveIndex(-1)
+    setDetailTitle(name)
+  }
+
+  const closeDetail = () => {
+    setDetailTitle(null)
+    setActiveIndex(-1)
+  }
+
+  const submitSearch = () => {
+    setQuery(queryInput.trim())
+    resetPaging()
+  }
+
+  const clearSearch = () => {
+    setQueryInput('')
+    setQuery('')
+    resetPaging()
+  }
+
+  // Keyboard navigation over the tag list: ArrowDown/ArrowUp move the active
+  // row, Enter opens the active tag, Escape jumps back to the list from the
+  // detail view.
+  const moveActive = (delta: number) => {
+    if (!items.length) return
+    setActiveIndex((prev) => {
+      const next = prev + delta
+      if (next < 0) return items.length - 1
+      if (next >= items.length) return 0
+      return next
     })
   }
 
-  const runSearch = () => {
-    if (!searchQuery.trim() || searchMutation.isPending) return
-    const seq = ++searchSeq.current
-    searchMutation.mutate(undefined, {
-      onSuccess: (data) => {
-        if (seq !== searchSeq.current) return
-        setSearchResult(data)
-        setGeneralError(null)
-      },
-      onError: (err) => {
-        if (seq !== searchSeq.current) return
-        setSearchResult(null)
-        handleError(err, '语义搜索失败')
-      },
-    })
+  useEffect(() => {
+    if (activeIndex < 0) return
+    const node = listRef.current?.querySelector<HTMLElement>(`[data-catalog-index="${activeIndex}"]`)
+    node?.focus()
+  }, [activeIndex, items])
+
+  const onSearchKeyDown = (event: React.KeyboardEvent<HTMLInputElement>) => {
+    if (event.key === 'ArrowDown') {
+      event.preventDefault()
+      moveActive(1)
+    } else if (event.key === 'ArrowUp') {
+      event.preventDefault()
+      moveActive(-1)
+    } else if (event.key === 'Enter') {
+      event.preventDefault()
+      if (activeIndex >= 0 && items[activeIndex]) {
+        openTag(items[activeIndex].name)
+      } else {
+        submitSearch()
+      }
+    } else if (event.key === 'Escape') {
+      if (detailTitle) {
+        event.preventDefault()
+        closeDetail()
+      }
+    }
   }
 
-  const runAsk = () => {
-    if (!askQuery.trim() || askMutation.isPending) return
-    const seq = ++askSeq.current
-    askMutation.mutate(undefined, {
-      onSuccess: (data) => {
-        if (seq !== askSeq.current) return
-        setAskResult(data)
-        setGeneralError(null)
-      },
-      onError: (err) => {
-        if (seq !== askSeq.current) return
-        setAskResult(null)
-        handleError(err, 'AI 问答失败')
-      },
-    })
+  // -- render helpers -----------------------------------------------------
+
+  const renderPillRow = (
+    title: string,
+    relations: CatalogRelationItem[],
+    reverse?: Set<string>,
+  ) => {
+    if (!relations.length) return null
+    return (
+      <div className="tw-implications-box">
+        <div className="tw-box-title">{title}</div>
+        <div className="tw-pill-row">
+          {relations.map((rel) =>
+            rel.tag ? (
+              <span key={`${title}-${rel.name}`} className="tw-catalog-relation">
+                <WikiTagPill tag={rel.tag as TagRef} onClick={openTag} />
+                {reverse?.has(rel.name) && <em className="tw-catalog-reverse">反向</em>}
+              </span>
+            ) : (
+              <button type="button" key={`${title}-${rel.name}`} className="tm-chip" onClick={() => openTag(rel.name)}>
+                {rel.name}
+              </button>
+            ),
+          )}
+        </div>
+      </div>
+    )
   }
 
-  const maxScore = searchResult?.items.length
-    ? Math.max(...searchResult.items.map((it) => it.score), 0.001)
-    : 1
+  const detail = detailQuery.data
+  const detailTag = detail?.tag
+  const detailPage = detail?.page
 
-  const focusAdjacentTab = (delta: number) => {
-    const idx = TAB_ORDER.indexOf(mode)
-    const next = TAB_ORDER[(idx + delta + TAB_ORDER.length) % TAB_ORDER.length] ?? 'lookup'
-    setMode(next)
-    setGeneralError(null)
-    document.getElementById(`tw-tab-${next}`)?.focus()
-  }
+  const total = browse?.total ?? 0
+  const rangeStart = total === 0 ? 0 : offset + 1
+  const rangeEnd = Math.min(offset + CATALOG_PAGE_SIZE, total)
+  const rangeLabel = `第 ${rangeStart.toLocaleString('zh-CN')}–${rangeEnd.toLocaleString('zh-CN')} 个，共 ${total.toLocaleString('zh-CN')} 个`
+  const hasPrev = offset > 0
+  const hasNext = offset + CATALOG_PAGE_SIZE < total
 
   return (
     <div className="tag-wiki-page">
       <header className="page-header">
         <div className="page-title-group">
           <h1 className="page-title">Tag Wiki</h1>
-          <p className="page-subtitle">本地标签百科与语义检索 · 查含义 / 语义检索 / AI 问答</p>
+          <p className="page-subtitle">本地标签目录 · 按分类浏览 / 按名称与别名搜索 / 查看词条与关联</p>
         </div>
         <div className="tw-profile-switch" role="group" aria-label="Wiki 语料库">
           {WIKI_PROFILES.map((name) => (
@@ -162,10 +241,7 @@ export function TagWiki() {
               type="button"
               className={`tw-profile-btn ${profile === name ? 'tw-profile-active' : ''}`}
               aria-pressed={profile === name}
-              onClick={() => {
-                setProfile(name)
-                setGeneralError(null)
-              }}
+              onClick={() => switchProfile(name)}
             >
               {WIKI_PROFILE_LABELS[name]}
             </button>
@@ -173,385 +249,272 @@ export function TagWiki() {
         </div>
       </header>
 
-      {/* Top collapsible Build Panel */}
+      {/* Read-only per-profile database status; maintenance is CLI-only. */}
       <BuildPanel profile={profile} />
 
-      {/* Main Mode Tabs */}
-      <Panel className="tw-main-panel">
-        <div className="tw-tab-nav" role="tablist" aria-label="Wiki 查询模式">
-          <button
-            type="button"
-            role="tab"
-            id="tw-tab-lookup"
-            aria-selected={mode === 'lookup'}
-            aria-controls="tw-pane-lookup"
-            className={`tw-tab-btn ${mode === 'lookup' ? 'tw-tab-active' : ''}`}
-            onKeyDown={(e) => {
-              if (e.key === 'ArrowRight') focusAdjacentTab(1)
-              else if (e.key === 'ArrowLeft') focusAdjacentTab(-1)
-            }}
-            onClick={() => {
-              setMode('lookup')
-              setGeneralError(null)
-            }}
-          >
-            <BookOpen size={16} aria-hidden="true" />
-            <span>查含义</span>
-          </button>
-          <button
-            type="button"
-            role="tab"
-            id="tw-tab-search"
-            aria-selected={mode === 'search'}
-            aria-controls="tw-pane-search"
-            className={`tw-tab-btn ${mode === 'search' ? 'tw-tab-active' : ''}`}
-            onKeyDown={(e) => {
-              if (e.key === 'ArrowRight') focusAdjacentTab(1)
-              else if (e.key === 'ArrowLeft') focusAdjacentTab(-1)
-            }}
-            onClick={() => {
-              setMode('search')
-              setGeneralError(null)
-            }}
-          >
-            <Search size={16} aria-hidden="true" />
-            <span>语义搜索</span>
-          </button>
-          <button
-            type="button"
-            role="tab"
-            id="tw-tab-ask"
-            aria-selected={mode === 'ask'}
-            aria-controls="tw-pane-ask"
-            className={`tw-tab-btn ${mode === 'ask' ? 'tw-tab-active' : ''}`}
-            onKeyDown={(e) => {
-              if (e.key === 'ArrowRight') focusAdjacentTab(1)
-              else if (e.key === 'ArrowLeft') focusAdjacentTab(-1)
-            }}
-            onClick={() => {
-              setMode('ask')
-              setGeneralError(null)
-            }}
-          >
-            <Bot size={16} aria-hidden="true" />
-            <span>AI 问答</span>
-          </button>
-        </div>
+      <Panel className="tw-main-panel tw-catalog-panel">
+        <div className="tw-catalog-layout">
+          {/* Sidebar: first-level official categories */}
+          <aside className="tw-catalog-sidebar" aria-label="分类浏览">
+            <div className="tw-catalog-sidebar-title">
+              <LayoutGrid size={14} aria-hidden="true" />
+              <span>分类</span>
+            </div>
+            <button
+              type="button"
+              className={`tw-catalog-cat ${category === null ? 'tw-catalog-cat-active' : ''}`}
+              onClick={() => selectCategory(null)}
+            >
+              <span>全部标签</span>
+              <strong>{categories?.tag_count ?? '…'}</strong>
+            </button>
+            {(categories?.categories ?? []).map((cat) => (
+              <button
+                key={cat.category}
+                type="button"
+                className={`tw-catalog-cat ${category === cat.category ? 'tw-catalog-cat-active' : ''}`}
+                onClick={() => selectCategory(cat.category)}
+              >
+                <span>{cat.label}</span>
+                <strong>{cat.tag_count.toLocaleString('zh-CN')}</strong>
+              </button>
+            ))}
+            {categoriesQuery.error && (
+              <p className="tw-catalog-sidebar-error">
+                {describeWikiError(categoriesQuery.error, '目录数据加载失败')}
+              </p>
+            )}
+          </aside>
 
-        {/* Global Error Banner / Guidance */}
-        {generalError && (
-          <div className="tw-error-container">
-            <Notice tone={generalError.code === 'wiki_ask_unavailable' ? 'warning' : 'danger'}>
-              <div className="tw-error-row">
-                <AlertCircle size={16} />
-                <span>{generalError.message}</span>
-                {generalError.code === 'wiki_ask_unavailable' && (
-                  <Button
-                    size="sm"
-                    variant="outline"
-                    onClick={() => setPage('providers')}
-                  >
-                    前往「在线模型」页
-                  </Button>
-                )}
-              </div>
-            </Notice>
-          </div>
-        )}
-
-        {/* Tab 1: 查含义 */}
-        {mode === 'lookup' && (
-          <div
-            className="tw-tab-pane"
-            role="tabpanel"
-            id="tw-pane-lookup"
-            aria-labelledby="tw-tab-lookup"
-          >
+          {/* Main column: search + groups + list/detail */}
+          <div className="tw-catalog-main">
             <form
-              className="tw-lookup-form"
+              className="tw-search-bar tw-catalog-search"
+              role="search"
               onSubmit={(e) => {
                 e.preventDefault()
-                runLookup(lookupInput)
+                submitSearch()
               }}
             >
-              <div className="tw-search-bar">
-                <input
-                  type="text"
-                  placeholder="输入标签英文名 (如 solo, anthro, rating:explicit)…"
-                  value={lookupInput}
-                  onChange={(e) => setLookupInput(e.target.value)}
-                  className="tw-query-input"
-                  aria-label="标签名称"
-                />
-                <Button
-                  type="submit"
-                  disabled={!lookupInput.trim() || lookupMutation.isPending}
-                  icon={lookupMutation.isPending ? <LoaderCircle size={14} className="spin" /> : <Search size={14} />}
-                >
-                  {lookupMutation.isPending ? '查询中…' : '查询'}
-                </Button>
-              </div>
-            </form>
-
-            {lookupMutation.isPending && (
-              <div className="tw-loading-state">
-                <LoaderCircle size={24} className="spin" />
-                <span>正在查询标签词条与摘要…</span>
-              </div>
-            )}
-
-            {lookupResult && !lookupMutation.isPending && (
-              <LookupResultCard
-                key={lookupResult.query}
-                result={lookupResult}
-                onTagClick={(tag) => runLookup(tag)}
+              <input
+                type="text"
+                className="tw-query-input"
+                placeholder="搜索标签名称或别名（如 solo、anthro、smooch）…"
+                value={queryInput}
+                onChange={(e) => setQueryInput(e.target.value)}
+                onKeyDown={onSearchKeyDown}
+                aria-label="搜索标签"
               />
-            )}
-
-            {!lookupResult && !lookupMutation.isPending && !generalError && (
-              <div className="tw-empty-pane">
-                <BookOpen size={36} className="muted" />
-                <p>输入任意 {WIKI_PROFILE_LABELS[profile]} 标签名称，即刻查询其官方百科条目、隐含关联以及 AI 提炼的中文用法指南。</p>
-              </div>
-            )}
-          </div>
-        )}
-
-        {/* Tab 2: 语义搜索 */}
-        {mode === 'search' && (
-          <div
-            className="tw-tab-pane"
-            role="tabpanel"
-            id="tw-pane-search"
-            aria-labelledby="tw-tab-search"
-          >
-            <form
-              className="tw-search-form"
-              onSubmit={(e) => {
-                e.preventDefault()
-                runSearch()
-              }}
-            >
-              <div className="tw-textarea-wrap">
-                <textarea
-                  placeholder="输入自然语言描述或画风/特征意图 (例如: 带有发光符文的暗黑魔法背景，或者某种姿势描写)…"
-                  value={searchQuery}
-                  onChange={(e) => setSearchQuery(e.target.value)}
-                  rows={3}
-                  className="tw-query-textarea"
-                  aria-label="语义搜索内容"
-                />
-              </div>
-
-              <div className="tw-search-actions">
-                <div className="tw-slider-group">
-                  <label htmlFor="tw-topk-range">返回结果数量: <strong>{searchTopK}</strong></label>
-                  <input
-                    id="tw-topk-range"
-                    type="range"
-                    min={2}
-                    max={30}
-                    step={1}
-                    value={searchTopK}
-                    onChange={(e) => setSearchTopK(Number(e.target.value))}
-                  />
-                </div>
-
-                <Button
-                  type="submit"
-                  disabled={!searchQuery.trim() || searchMutation.isPending}
-                  icon={searchMutation.isPending ? <LoaderCircle size={14} className="spin" /> : <Search size={14} />}
-                >
-                  {searchMutation.isPending ? '搜索中…' : '检索 Wiki 章节'}
+              <Button
+                type="submit"
+                disabled={browseQuery.isFetching}
+                icon={browseQuery.isFetching ? <LoaderCircle size={14} className="spin" /> : <Search size={14} />}
+              >
+                搜索
+              </Button>
+              {searching && (
+                <Button type="button" variant="outline" onClick={clearSearch}>
+                  清除
                 </Button>
-              </div>
+              )}
             </form>
 
-            {searchMutation.isPending && (
-              <div className="tw-loading-state">
-                <LoaderCircle size={24} className="spin" />
-                <span>正在执行向量 + 关键字混合检索…</span>
+            {/* Second-level semantic groups for the selected category */}
+            {activeCategory && !detailTitle && (
+              <div className="tw-catalog-groups" aria-label="语义分组">
+                <button
+                  type="button"
+                  className={`tm-chip ${group === null ? 'tw-chip-active' : ''}`}
+                  onClick={() => selectGroup(null)}
+                >
+                  全部 {activeCategory.label} ({activeCategory.tag_count.toLocaleString('zh-CN')})
+                </button>
+                {activeCategory.groups.map((grp) => (
+                  <button
+                    key={grp.key}
+                    type="button"
+                    className={`tm-chip ${group === grp.key ? 'tw-chip-active' : ''}`}
+                    onClick={() => selectGroup(grp.key)}
+                  >
+                    {grp.label} ({grp.tag_count.toLocaleString('zh-CN')})
+                  </button>
+                ))}
               </div>
             )}
 
-            {searchResult && !searchMutation.isPending && (
-              <div className="tw-search-results">
-                {/* Suggested Tags row */}
-                {searchResult.suggested_tags && searchResult.suggested_tags.length > 0 && (
-                  <div className="tw-suggested-tags-box">
-                    <div className="tw-box-title">
-                      <Sparkles size={14} />
-                      <span>推荐候选标签</span>
-                    </div>
-                    <div className="tw-pill-row">
-                      {searchResult.suggested_tags.map((st) => (
-                        <WikiTagPill
-                          key={st.name}
-                          tag={st}
-                          onClick={(tagName) => runLookup(tagName)}
-                        />
-                      ))}
-                    </div>
-                  </div>
-                )}
-
-                {/* Chunk hits */}
-                <div className="tw-chunk-list">
-                  <div className="tw-box-title">
-                    命中章节 ({searchResult.items.length})
-                  </div>
-                  {searchResult.items.length === 0 ? (
-                    <p className="muted">未检索到匹配的 Wiki 章节，请尝试更简短或更具特征的描述。</p>
-                  ) : (
-                    searchResult.items.map((hit, idx) => (
-                      <ChunkHitCard
-                        key={`${hit.page_title}-${idx}`}
-                        hit={hit}
-                        maxScore={maxScore}
-                        onTagClick={(t) => runLookup(t)}
-                      />
-                    ))
+            {detailTitle ? (
+              /* -- Detail view (same page; filters stay untouched) -- */
+              <div className="tw-catalog-detail">
+                <div className="tw-catalog-detail-header">
+                  <Button variant="outline" icon={<ChevronLeft size={14} />} onClick={closeDetail}>
+                    返回列表
+                  </Button>
+                  {searching && (
+                    <span className="muted tw-catalog-filter-note">搜索词「{query}」与筛选已保留</span>
                   )}
                 </div>
-              </div>
-            )}
 
-            {!searchResult && !searchMutation.isPending && !generalError && (
-              <div className="tw-empty-pane">
-                <Search size={36} className="muted" />
-                <p>使用自然语言检索整库 Wiki 章节，自动融合向量相似度与 SQLite FTS5 关键词匹配，并推荐相关标签。</p>
-              </div>
-            )}
-          </div>
-        )}
-
-        {/* Tab 3: AI 问答 */}
-        {mode === 'ask' && (
-          <div
-            className="tw-tab-pane"
-            role="tabpanel"
-            id="tw-pane-ask"
-            aria-labelledby="tw-tab-ask"
-          >
-            <form
-              className="tw-ask-form"
-              onSubmit={(e) => {
-                e.preventDefault()
-                runAsk()
-              }}
-            >
-              <div className="tw-textarea-wrap">
-                <textarea
-                  placeholder="向 AI 提问关于标签规则、分类含义或打标规范的问题 (例如: 怎样正确区分 feral 和 anthro 标签？)…"
-                  value={askQuery}
-                  onChange={(e) => setAskQuery(e.target.value)}
-                  rows={3}
-                  className="tw-query-textarea"
-                  aria-label="AI 问答内容"
-                />
-              </div>
-
-              <div className="tw-search-actions">
-                <div className="tw-slider-group">
-                  <label htmlFor="tw-ask-topk">参考章节数: <strong>{askTopK}</strong></label>
-                  <input
-                    id="tw-ask-topk"
-                    type="range"
-                    min={2}
-                    max={15}
-                    step={1}
-                    value={askTopK}
-                    onChange={(e) => setAskTopK(Number(e.target.value))}
-                  />
-                </div>
-
-                <Button
-                  type="submit"
-                  disabled={!askQuery.trim() || askMutation.isPending}
-                  icon={askMutation.isPending ? <LoaderCircle size={14} className="spin" /> : <Send size={14} />}
-                >
-                  {askMutation.isPending ? '思考与检索中…' : '提问'}
-                </Button>
-              </div>
-            </form>
-
-            {askMutation.isPending && (
-              <div className="tw-loading-state">
-                <LoaderCircle size={24} className="spin" />
-                <span>正在检索相关 Wiki 知识并生成回答…</span>
-              </div>
-            )}
-
-            {askResult && !askMutation.isPending && (
-              <div className="tw-ask-result-card">
-                <div className="tw-ask-answer-section">
-                  <div className="tw-ask-answer-header">
-                    <Bot size={16} aria-hidden="true" />
-                    <strong>AI 答复</strong>
+                {detailQuery.isPending && (
+                  <div className="tw-loading-state">
+                    <LoaderCircle size={20} className="spin" />
+                    <span>正在加载标签词条…</span>
                   </div>
-                  <div className="tw-ask-answer-text">
-                    {askResult.answer.split('\n').map((line, idx) => (
-                      <p key={idx}>{line}</p>
+                )}
+                {detailQuery.error && (
+                  <Notice tone="danger">
+                    <span>{describeWikiError(detailQuery.error, '加载标签详情失败')}</span>
+                  </Notice>
+                )}
+
+                {detailTag && (
+                  <div className="tw-catalog-detail-body">
+                    <div className="tw-lookup-header">
+                      <div className="tw-lookup-identity">
+                        <WikiTagPill
+                          tag={{
+                            name: detailTag.name,
+                            category: detailTag.category,
+                            post_count: detailTag.post_count,
+                            translation: detailTag.translation ?? null,
+                            alias_of: detailTag.alias_of ?? null,
+                          }}
+                          clickable={false}
+                        />
+                        <span className={`tm-pill ${tagCategoryClass(detailTag.category)} tw-catalog-group-badge`}>
+                          {detailTag.group_label}
+                        </span>
+                        {!detailTag.has_wiki && (
+                          <span className="muted tw-catalog-filter-note">
+                            <Database size={12} aria-hidden="true" /> 暂无 Wiki 词条
+                          </span>
+                        )}
+                      </div>
+                    </div>
+
+                    {detailTag.alias_of && (
+                      <p className="tw-alias-notice">
+                        别名，标准标签为{' '}
+                        <button type="button" className="tw-link-button" onClick={() => openTag(detailTag.alias_of!)}>
+                          {formatTagForDisplay(detailTag.alias_of, tagStyle)}
+                        </button>
+                      </p>
+                    )}
+
+                    {detailPage?.summary && <WikiSummaryCard summary={detailPage.summary} onTagClick={openTag} />}
+
+                    {renderPillRow('隐含标签（需要搭配）', detail?.implications ?? [], new Set(
+                      (detail?.implications ?? []).filter((rel) => rel.direction === 'reverse').map((rel) => rel.name),
                     ))}
-                  </div>
-                </div>
+                    {renderPillRow('Wiki 页面关联', detail?.wiki_links ?? [])}
 
-                {askResult.tags && askResult.tags.length > 0 && (
-                  <div className="tw-ask-meta-row">
-                    <span className="tw-meta-label">提及标签</span>
-                    <div className="tw-chip-row">
-                      {askResult.tags.map((t) => (
-                        <button
-                          type="button"
-                          key={t}
-                          className="tm-chip"
-                          onClick={() => runLookup(t)}
-                        >
-                          {t}
-                        </button>
-                      ))}
-                    </div>
-                  </div>
-                )}
-
-                {askResult.sources && askResult.sources.length > 0 && (
-                  <div className="tw-ask-meta-row">
-                    <span className="tw-meta-label">参考来源</span>
-                    <div className="tw-chip-row">
-                      {askResult.sources.map((s) => (
-                        <button
-                          type="button"
-                          key={s}
-                          className="tm-chip tw-chip-source"
-                          onClick={() => runLookup(s)}
-                          title={`查看来源词条 ${s}`}
-                        >
-                          § {s}
-                        </button>
-                      ))}
-                    </div>
-                  </div>
-                )}
-
-                {(askResult.provider_id || askResult.model) && (
-                  <div className="tw-ask-footnote">
-                    <small className="muted">
-                      由在线模型提供: {askResult.provider_id ? `${askResult.provider_id} / ` : ''}
-                      {askResult.model}
-                    </small>
+                    {detailPage?.sections && detailPage.sections.length > 0 && (
+                      <div className="tw-sections">
+                        <div className="tw-box-title">
+                          <FileText size={12} aria-hidden="true" /> Wiki 原文摘要
+                        </div>
+                        {detailPage.sections.slice(0, 4).map((sec, idx) => (
+                          <div className="tw-section" key={`${sec.heading}-${idx}`}>
+                            {sec.heading && <strong>{sec.heading}</strong>}
+                            <p className="tw-catalog-section-text">{sec.text}</p>
+                          </div>
+                        ))}
+                      </div>
+                    )}
                   </div>
                 )}
               </div>
-            )}
+            ) : (
+              /* -- Directory list -- */
+              <div className="tw-catalog-list-wrap">
+                <div className="tw-catalog-list-meta">
+                  <span>
+                    {searching ? `搜索「${query}」` : '全部标签'}
+                    {group ? ` · ${items[0]?.group_label ?? ''}` : ''} · 共 {total.toLocaleString('zh-CN')} 个
+                    {categories?.min_post_count ? `（post_count ≥ ${categories.min_post_count}）` : ''}
+                  </span>
+                  <span className="tw-catalog-hint">↑↓ 选择 · Enter 打开</span>
+                </div>
 
-            {!askResult && !askMutation.isPending && !generalError && (
-              <div className="tw-empty-pane">
-                <HelpCircle size={36} className="muted" />
-                <p>基于本地 {WIKI_PROFILE_LABELS[profile]} Wiki 数据库的 RAG 知识问答。解答标签含义对比、搭配规则与打标建议。</p>
+                {browseQuery.isPending && (
+                  <div className="tw-loading-state">
+                    <LoaderCircle size={20} className="spin" />
+                    <span>正在加载标签目录…</span>
+                  </div>
+                )}
+
+                {!browseQuery.isPending && items.length === 0 && (
+                  <div className="tw-empty-pane">
+                    <Search size={32} className="muted" />
+                    <p>
+                      {searching
+                        ? '没有匹配的标签。目录只收录高频标签（post_count ≥ 100），请尝试更短的名称或官方写法。'
+                        : '这个分类下还没有标签。'}
+                    </p>
+                  </div>
+                )}
+
+                <div className="tw-catalog-list" ref={listRef} role="listbox" aria-label="标签列表">
+                  {items.map((item, index) => (
+                    <button
+                      type="button"
+                      role="option"
+                      aria-selected={index === activeIndex}
+                      data-catalog-index={index}
+                      key={item.name}
+                      className={`tw-catalog-item ${index === activeIndex ? 'tw-catalog-item-active' : ''}`}
+                      onClick={() => openTag(item.name)}
+                    >
+                      <WikiTagPill
+                        tag={{
+                          name: item.name,
+                          category: item.category,
+                          post_count: item.post_count,
+                          translation: item.translation ?? null,
+                          alias_of: item.alias_of ?? null,
+                        }}
+                        clickable={false}
+                      />
+                      <span className="tw-catalog-item-group">{item.group_label}</span>
+                      {item.match && <em className="tw-catalog-match">{MATCH_LABELS[item.match] ?? item.match}</em>}
+                      {item.has_wiki && (
+                        <span className="tw-catalog-wiki-badge" title="已有本地 Wiki 词条">
+                          <FileText size={12} aria-hidden="true" /> Wiki
+                        </span>
+                      )}
+                    </button>
+                  ))}
+                </div>
+
+                {total > CATALOG_PAGE_SIZE && (
+                  <div className="tw-catalog-pagination">
+                    <Button
+                      variant="outline"
+                      disabled={!hasPrev || browseQuery.isFetching}
+                      icon={<ChevronLeft size={14} />}
+                      onClick={() => {
+                        setOffset(Math.max(0, offset - CATALOG_PAGE_SIZE))
+                        setActiveIndex(-1)
+                      }}
+                    >
+                      上一页
+                    </Button>
+                    <span className="muted">{rangeLabel}</span>
+                    <Button
+                      variant="outline"
+                      disabled={!hasNext || browseQuery.isFetching}
+                      onClick={() => {
+                        setOffset(offset + CATALOG_PAGE_SIZE)
+                        setActiveIndex(-1)
+                      }}
+                    >
+                      下一页 <ChevronRight size={14} />
+                    </Button>
+                  </div>
+                )}
               </div>
             )}
           </div>
-        )}
+        </div>
       </Panel>
     </div>
   )

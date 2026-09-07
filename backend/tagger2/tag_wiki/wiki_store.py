@@ -3,6 +3,11 @@
 This module provides the local persistence for the e621 tag wiki mirror,
 storing pages, parsed chunks, content hashes, embeddings (as float32 little-endian
 vectors), wiki-link relationships, and generated Chinese summaries.
+
+Schema v2 additionally holds the read-only tag catalog (``catalog_tags`` /
+``catalog_relations`` / ``catalog_meta``): a booru-style directory of
+high-frequency tags maintained exclusively by
+``scripts/build_tag_wiki_catalog.py`` and served by the ``/catalog`` API.
 """
 
 from __future__ import annotations
@@ -21,7 +26,45 @@ import numpy as np
 
 from ..workflow.contracts import utc_now
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+
+# v2 additive migration: the read-only tag catalog (booru-style directory of
+# high-frequency tags) written by scripts/build_tag_wiki_catalog.py. The
+# tables live in the same per-profile database as pages/chunks/summaries but
+# are fully independent: the catalog is rebuilt wholesale by the CLI while
+# user-facing reads only ever see rows written by that CLI.
+CATALOG_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS catalog_tags (
+    name TEXT PRIMARY KEY,
+    category TEXT NOT NULL DEFAULT '',
+    group_key TEXT NOT NULL DEFAULT '',
+    post_count INTEGER NOT NULL DEFAULT 0,
+    has_wiki INTEGER NOT NULL DEFAULT 0,
+    alias_of TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_catalog_tags_group
+    ON catalog_tags(category, group_key, post_count DESC);
+CREATE INDEX IF NOT EXISTS idx_catalog_tags_post_count
+    ON catalog_tags(post_count DESC, name);
+
+CREATE TABLE IF NOT EXISTS catalog_relations (
+    tag_name TEXT NOT NULL,
+    related_name TEXT NOT NULL,
+    relation_type TEXT NOT NULL,
+    score REAL NOT NULL DEFAULT 0,
+    source TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (tag_name, related_name, relation_type)
+);
+CREATE INDEX IF NOT EXISTS idx_catalog_relations_tag
+    ON catalog_relations(tag_name, relation_type, score DESC);
+CREATE INDEX IF NOT EXISTS idx_catalog_relations_related
+    ON catalog_relations(related_name, relation_type, score DESC);
+
+CREATE TABLE IF NOT EXISTS catalog_meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+"""
 
 _URL_PATTERN = re.compile(r"https?://\S+")
 _THUMB_PATTERN = re.compile(r"\bthumb\s*#\d+\b")
@@ -196,22 +239,40 @@ class WikiStore:
 
     def _init_schema(self, conn: sqlite3.Connection) -> None:
         conn.executescript(SCHEMA_SQL)
-        row = conn.execute(
-            "SELECT version FROM schema_migrations ORDER BY version DESC LIMIT 1"
-        ).fetchone()
-        if row is None:
-            conn.execute(
-                "INSERT INTO schema_migrations (version, checksum, applied_at)"
-                " VALUES (?, ?, ?)",
-                (SCHEMA_VERSION, "schema-v1", utc_now()),
-            )
-        elif int(row["version"]) > SCHEMA_VERSION:
-            raise WikiStoreError(
-                f"tag wiki database version {row['version']} is newer than supported"
-            )
+        self._migrate_schema(conn)
 
         # Probe FTS5 support
         self._setup_fts(conn)
+
+    def _migrate_schema(self, conn: sqlite3.Connection) -> None:
+        """Apply additive schema migrations up to ``SCHEMA_VERSION``.
+
+        v1 -> v2 adds the tag-catalog tables (``catalog_tags``,
+        ``catalog_relations``, ``catalog_meta``). Everything is
+        ``CREATE ... IF NOT EXISTS`` so re-running on a fresh v2 database is
+        a no-op and upgrading a v1 file never touches existing rows.
+        """
+
+        row = conn.execute(
+            "SELECT version FROM schema_migrations ORDER BY version DESC LIMIT 1"
+        ).fetchone()
+        current = int(row["version"]) if row is not None else None
+        if current is not None and current > SCHEMA_VERSION:
+            raise WikiStoreError(
+                f"tag wiki database version {current} is newer than supported"
+            )
+        if current == SCHEMA_VERSION:
+            # Still run the additive DDL: a v2 marker row could predate the
+            # catalog tables if a migration was interrupted mid-way.
+            conn.executescript(CATALOG_SCHEMA_SQL)
+            return
+        conn.executescript(CATALOG_SCHEMA_SQL)
+        conn.execute(
+            "INSERT INTO schema_migrations (version, checksum, applied_at)"
+            " VALUES (?, ?, ?)"
+            " ON CONFLICT(version) DO NOTHING",
+            (SCHEMA_VERSION, f"schema-v{SCHEMA_VERSION}", utc_now()),
+        )
 
     def _setup_fts(self, conn: sqlite3.Connection) -> None:
         if self._fts_enabled is not None:
@@ -914,6 +975,263 @@ class WikiStore:
                             return missing
         return missing
 
+    # -- tag catalog (read-only directory; written only by the build CLI) ----
+
+    def replace_catalog(
+        self,
+        tags: Sequence[Mapping[str, Any]],
+        relations: Sequence[Mapping[str, Any]] = (),
+        meta: Mapping[str, Any] | None = None,
+    ) -> int:
+        """Atomically rebuild the catalog: clear, bulk-write, store meta.
+
+        Tags are mappings with ``name`` plus optional ``category``,
+        ``group_key``, ``post_count``, ``has_wiki`` and ``alias_of``.
+        Relations carry ``tag_name``/``related_name``/``relation_type`` and
+        optional ``score``/``source``; duplicates collapse silently. The
+        whole swap happens in one transaction so readers never observe a
+        half-written catalog. Returns the number of tags written.
+        """
+
+        with self.connection() as conn:
+            conn.execute("DELETE FROM catalog_relations")
+            conn.execute("DELETE FROM catalog_tags")
+            seen: set[str] = set()
+            written = 0
+            for tag in tags:
+                name = normalize_title(str(tag.get("name", "")))
+                if not name or name in seen:
+                    continue
+                seen.add(name)
+                conn.execute(
+                    "INSERT INTO catalog_tags"
+                    " (name, category, group_key, post_count, has_wiki, alias_of)"
+                    " VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        name,
+                        str(tag.get("category", "") or ""),
+                        str(tag.get("group_key", "") or ""),
+                        max(0, int(tag.get("post_count") or 0)),
+                        1 if tag.get("has_wiki") else 0,
+                        str(tag["alias_of"]) if tag.get("alias_of") else None,
+                    ),
+                )
+                written += 1
+            seen_relations: set[tuple[str, str, str]] = set()
+            for relation in relations:
+                tag_name = normalize_title(str(relation.get("tag_name", "")))
+                related_name = normalize_title(str(relation.get("related_name", "")))
+                relation_type = str(relation.get("relation_type", "") or "")
+                if not tag_name or not related_name or not relation_type:
+                    continue
+                if tag_name == related_name:
+                    continue
+                key = (tag_name, related_name, relation_type)
+                if key in seen_relations:
+                    continue
+                seen_relations.add(key)
+                conn.execute(
+                    "INSERT OR IGNORE INTO catalog_relations"
+                    " (tag_name, related_name, relation_type, score, source)"
+                    " VALUES (?, ?, ?, ?, ?)",
+                    (
+                        tag_name,
+                        related_name,
+                        relation_type,
+                        float(relation.get("score") or 0.0),
+                        str(relation.get("source", "") or ""),
+                    ),
+                )
+            for meta_key, meta_value in (meta or {}).items():
+                conn.execute(
+                    "INSERT INTO catalog_meta (key, value) VALUES (?, ?)"
+                    " ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    (str(meta_key), str(meta_value)),
+                )
+        return written
+
+    def catalog_built(self) -> bool:
+        """Whether the catalog CLI has written at least one generation."""
+
+        return self.catalog_tag_count() > 0
+
+    def catalog_meta(self) -> dict[str, Any]:
+        """All ``catalog_meta`` rows, integer-coerced where possible."""
+
+        result: dict[str, Any] = {}
+        with self.connection() as conn:
+            rows = conn.execute("SELECT key, value FROM catalog_meta").fetchall()
+        for row in rows:
+            value: Any = str(row["value"])
+            try:
+                value = int(value)
+            except (TypeError, ValueError):
+                pass
+            result[str(row["key"])] = value
+        return result
+
+    def catalog_tag_count(self) -> int:
+        with self.connection() as conn:
+            row = conn.execute("SELECT COUNT(*) FROM catalog_tags").fetchone()
+        return int(row[0]) if row else 0
+
+    def catalog_relation_count(self) -> int:
+        with self.connection() as conn:
+            row = conn.execute("SELECT COUNT(*) FROM catalog_relations").fetchone()
+        return int(row[0]) if row else 0
+
+    def catalog_categories_stats(self) -> list[dict[str, Any]]:
+        """Per (category, group_key) tag counts for the browse sidebar."""
+
+        with self.connection() as conn:
+            rows = conn.execute(
+                "SELECT category, group_key, COUNT(*) AS tag_count,"
+                " SUM(has_wiki) AS wiki_count"
+                " FROM catalog_tags"
+                " GROUP BY category, group_key"
+                " ORDER BY category ASC, tag_count DESC, group_key ASC"
+            ).fetchall()
+        return [
+            {
+                "category": str(row["category"]),
+                "group_key": str(row["group_key"]),
+                "tag_count": int(row["tag_count"]),
+                "wiki_count": int(row["wiki_count"] or 0),
+            }
+            for row in rows
+        ]
+
+    @staticmethod
+    def _catalog_filters(
+        category: str | None, group: str | None, q: str | None
+    ) -> tuple[list[str], list[Any]]:
+        """Shared WHERE fragments for the catalog read queries."""
+
+        clauses: list[str] = []
+        params: list[Any] = []
+        if category:
+            clauses.append("category = ?")
+            params.append(category)
+        if group:
+            clauses.append("group_key = ?")
+            params.append(group)
+        if q:
+            # Tags contain underscores, so LIKE wildcards in the query must
+            # be literal matches; escape and bind an ESCAPE character.
+            escaped = q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            clauses.append("name LIKE ? ESCAPE '\\'")
+            params.append(f"%{escaped}%")
+        return clauses, params
+
+    def catalog_browse(
+        self,
+        *,
+        category: str | None = None,
+        group: str | None = None,
+        q: str | None = None,
+        offset: int = 0,
+        limit: int = 60,
+    ) -> tuple[int, list[dict[str, Any]]]:
+        """Page through catalog tags, post_count desc then name asc.
+
+        Returns ``(total_matching, items)``; ``q`` is a case-insensitive
+        substring filter over the canonical name (ranking refinement happens
+        in the service layer, which needs alias information the store does
+        not hold).
+        """
+
+        clauses, params = self._catalog_filters(category, group, q)
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self.connection() as conn:
+            total = int(
+                conn.execute(
+                    f"SELECT COUNT(*) FROM catalog_tags{where}", params
+                ).fetchone()[0]
+            )
+            rows = conn.execute(
+                "SELECT name, category, group_key, post_count, has_wiki, alias_of"
+                f" FROM catalog_tags{where}"
+                " ORDER BY post_count DESC, name ASC"
+                " LIMIT ? OFFSET ?",
+                [*params, max(0, limit), max(0, offset)],
+            ).fetchall()
+        return total, [_catalog_tag_row(row) for row in rows]
+
+    def catalog_get_tag(self, name: str) -> dict[str, Any] | None:
+        """One catalog tag by canonical (normalized) name."""
+
+        key = normalize_title(str(name))
+        if not key:
+            return None
+        with self.connection() as conn:
+            row = conn.execute(
+                "SELECT name, category, group_key, post_count, has_wiki, alias_of"
+                " FROM catalog_tags WHERE name = ?",
+                (key,),
+            ).fetchone()
+        return _catalog_tag_row(row) if row is not None else None
+
+    def catalog_relations_for(
+        self, name: str, *, relation_type: str | None = None, limit: int | None = None
+    ) -> list[dict[str, Any]]:
+        """Relations touching ``name`` in both directions.
+
+        Forward rows have ``tag_name = name`` (direction ``forward``);
+        reverse rows have ``related_name = name`` (direction ``reverse``).
+        Ordered by score desc then related/tag name for stable output.
+        """
+
+        key = normalize_title(str(name))
+        if not key:
+            return []
+        type_clause = " AND relation_type = ?" if relation_type else ""
+        type_params = [relation_type] if relation_type else []
+        sql = (
+            "SELECT tag_name, related_name, relation_type, score, source,"
+            " 'forward' AS direction FROM catalog_relations"
+            f" WHERE tag_name = ?{type_clause}"
+            " UNION ALL "
+            "SELECT tag_name, related_name, relation_type, score, source,"
+            " 'reverse' AS direction FROM catalog_relations"
+            f" WHERE related_name = ?{type_clause}"
+        )
+        limit_clause = f" LIMIT {int(limit)}" if limit is not None else ""
+        with self.connection() as conn:
+            rows = conn.execute(
+                sql + " ORDER BY score DESC, related_name ASC, tag_name ASC" + limit_clause,
+                [key, *type_params, key, *type_params],
+            ).fetchall()
+        return [
+            {
+                "tag_name": str(row["tag_name"]),
+                "related_name": str(row["related_name"]),
+                "relation_type": str(row["relation_type"]),
+                "score": float(row["score"] or 0.0),
+                "source": str(row["source"]),
+                "direction": str(row["direction"]),
+            }
+            for row in rows
+        ]
+
+    def iter_page_links(self) -> Iterator[tuple[str, str]]:
+        """Yield every stored ``(page_title, link_title)`` wiki-link pair.
+
+        Streaming source for the catalog CLI: the page-link table can hold
+        hundreds of thousands of pairs, so the caller must be able to filter
+        without materializing everything through a list first.
+        """
+
+        with self.connection() as conn:
+            cursor = conn.execute(
+                "SELECT page_title, link_title FROM page_links ORDER BY page_title ASC"
+            )
+            while True:
+                batch = cursor.fetchmany(2048)
+                if not batch:
+                    break
+                for row in batch:
+                    yield str(row["page_title"]), str(row["link_title"])
+
     def close(self) -> None:
         """Close memory connection if open."""
 
@@ -945,7 +1263,21 @@ def _summary_dict(row: sqlite3.Row) -> dict[str, Any]:
     }
 
 
+def _catalog_tag_row(row: sqlite3.Row) -> dict[str, Any]:
+    """Shape one ``catalog_tags`` row for the service/API layers."""
+
+    return {
+        "name": str(row["name"]),
+        "category": str(row["category"]),
+        "group_key": str(row["group_key"]),
+        "post_count": int(row["post_count"] or 0),
+        "has_wiki": bool(row["has_wiki"]),
+        "alias_of": str(row["alias_of"]) if row["alias_of"] else None,
+    }
+
+
 __all__ = [
+    "CATALOG_SCHEMA_SQL",
     "SCHEMA_SQL",
     "SCHEMA_VERSION",
     "WikiStore",

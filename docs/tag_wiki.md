@@ -1,10 +1,11 @@
-# Tag Wiki：本地 E621 标签百科与智能检索
+# Tag Wiki：本地标签目录（Catalog）+ e621 标签百科与检索
 
-Tag Wiki 是一个完全本地化的 e621 标签百科镜像 + 检索系统，解决三个问题：
+Tag Wiki 面向用户的主界面是一个**本地高频 TAG 目录**（类似官方 booru Wiki 的浏览体验）：按官方分类 / 语义分组浏览、按名称与别名模糊搜索、点开查看 Wiki 词条、中文摘要与关联标签。目录只收录 `post_count >= 100` 的高频标签，由维护端 CLI 生成，用户端只读。
 
-1. **查含义** —— 这个 tag 是什么意思？（中文摘要 + 英文原文 + 隐含搭配）
-2. **语义搜索** —— 我想表达某个动作/画面，应该用什么 tag？（中文自然语言 → 向量检索英文 wiki → 推荐 tag）
-3. **AI 问答** —— 把检索到的 wiki 内容交给已配置的在线大模型，生成带出处的中文回答（RAG）。
+保留但不再是首页默认入口的功能：
+
+1. **查含义**（`/lookup`）—— TagManager「查 Wiki」抽屉等既有消费者继续使用。
+2. **语义搜索 / AI 问答**（`/search`、`/ask`）—— API 与后端管线保持可用，但前端首页不再提供入口。
 
 除「AI 问答」和「中文摘要翻译」需要联网调用你配置的 Provider 外，其余功能全部离线可用。
 
@@ -72,6 +73,34 @@ runtime\python.exe scripts\fetch_danbooru_wiki.py --status
 - Provider：请求可显式指定 `provider_id`/`model`，否则用第一个启用且已配置密钥的 Provider（与标签管理器翻译一致）；无可用 Provider 返回 409 `wiki_ask_unavailable`。
 - 并发：默认 4 路并行（`concurrency` 可调 1-12），汇总进度实时可见；中断后重跑自动续传。
 
+## 标签目录（Catalog，schema v2）
+
+Tag Wiki 首页的数据来自 catalog 表（`catalog_tags` / `catalog_relations` / `catalog_meta`，wiki 数据库 schema v1 → v2 增量迁移，老库打开即自动升级，页面/chunk/摘要不受影响）。**用户端与发行端严格只读**——目录唯一的写入口是维护端 CLI：
+
+```bat
+runtime\python.exe scripts\build_tag_wiki_catalog.py                     :: 全部 profile（e621 + danbooru）
+runtime\python.exe scripts\build_tag_wiki_catalog.py --profile e621 --min-post-count 200
+runtime\python.exe scripts\build_tag_wiki_catalog.py --dry-run           :: 只打印统计不写库
+runtime\python.exe scripts\build_tag_wiki_catalog.py --status            :: 查看各 profile 目录元数据
+```
+
+构建过程（无模型调用、默认不联网）：
+
+1. 加载运行时分类快照（`classify-snapshot-v1`，与打标/分类共用），取全部 `post_count >= --min-post-count`（默认 100）的 canonical tag；别名不入目录，查询时经 TagDatabase 归一。
+2. 用确定性两级分类（`backend/tagger2/tag_wiki/taxonomy.py`）打分组：一级为官方 category；`general` 类按可维护的英语 token 规则 + overrides 划分语义组（`appearance_body` 外观体型 / `action_pose` 动作姿势 / `body_part` 身体部位 / `clothing` 服装 / `sexual` 性内容 / `other_general` 兜底；species/character/copyright/meta/artist 等官方分类直接映射到同名稳定组）。改规则后请递增 `TAXONOMY_VERSION`。
+3. 组合关系（**不做在线共现抓取**）：tag-database implications（正向入库、查询时反查反向）+ 本地 wiki `page_links`；关系两端都必须在目录内，UI 上的关联标签必然可点且高频。
+4. 单事务整体重建（`WikiStore.replace_catalog`）并写入 meta（阈值、taxonomy version、生成时间、数量统计）；可重复执行，wiki 正文/向量/摘要永不被触碰。
+
+目录 API（同 `/api/v1/tag-wiki` 前缀，只读，frozen 模式可用）：
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| GET | `/catalog/categories` | 分类树（各组数量、目录 meta） |
+| GET | `/catalog/tags` | 浏览/搜索：`category` `group` `q` `offset` `limit`；`q` 支持 精确 canonical > 精确别名 > 前缀 > 词前缀 > 包含 排序（同级按 post_count 降序、名称升序），每项带 `match` 标注 |
+| GET | `/catalog/tags/{title}` | 目录词条详情：tag 信息 + 原 wiki 页（章节/中文摘要）+ 关系（`implications` / `wiki_links` / `cooccurrences` 分组，含方向；每组按目标热度排序后截断至 30 条，防止枢纽标签的数百条关联淹没详情） |
+
+错误码：`wiki_catalog_missing`（409，目录未生成——先跑上面的 CLI）、`wiki_catalog_tag_not_found`（404，目录中无此标签，通常低于收录阈值）。目录未生成时旧 `/lookup`、`/page` 完全不受影响；`/lookup` 的 `related_tags` 行为保持原样（不按频次过滤）。
+
 ## API 一览（`/api/v1/tag-wiki`，同全局 authorize 依赖）
 
 | 方法 | 路径 | 说明 |
@@ -85,26 +114,26 @@ runtime\python.exe scripts\fetch_danbooru_wiki.py --status
 | POST | `/ask` | `{query, top_k, provider_id?, model?}` → RAG 中文回答 + 推荐 tags + 来源 |
 | GET | `/page/{title}` | 单个 wiki 页全文（章节化） |
 
-错误使用全局形状 `{code, message, fields, request_id, retryable}`。稳定 code：`wiki_not_built`、`wiki_busy`、`wiki_embed_model_unavailable`、`wiki_search_unavailable`、`wiki_ask_unavailable`、`wiki_tag_db_unavailable`、`wiki_page_not_found`（完整清单见 `backend/tagger2/tag_wiki/contracts.py`）。
+错误使用全局形状 `{code, message, fields, request_id, retryable}`。稳定 code：`wiki_not_built`、`wiki_busy`、`wiki_embed_model_unavailable`、`wiki_search_unavailable`、`wiki_ask_unavailable`、`wiki_tag_db_unavailable`、`wiki_page_not_found`、`wiki_catalog_missing`、`wiki_catalog_tag_not_found`（完整清单见 `backend/tagger2/tag_wiki/contracts.py`）。
 
 ## 前端
 
-- 侧边栏「创作与处理」组新增 **Tag Wiki** 页：只读状态面板（Wiki 页数/章节数/已向量化/已翻译摘要/Dump 日期/检索状态徽标）+ 三个查询模式 Tab。构建、重建向量与中文翻译是维护者/CLI 专属操作（`scripts/build_tag_wiki.py`、`scripts/reembed_tag_wiki.py`），前端不提供维护入口；成品包 frozen 模式下后端同样拒绝（403）。
-- TagManager 的标签编辑/展示栏与工作台 TagCloud 的 tag 药丸上有 **BookOpen 图标按钮**，点开 `WikiDrawer` 快查（含义摘要 + 隐含搭配 + 相关 tag）。
-- 客户端 `frontend/src/lib/tagWiki.ts` 的类型与 `contracts.py` 的 TypedDict 一一对应。
+- 侧边栏「创作与处理」组新增 **Tag Wiki** 页：只读状态面板（Wiki 页数/章节数/已向量化/已翻译摘要/Dump 日期/检索状态徽标）+ 高频标签目录（左侧分类侧栏、二级语义组筛选、60 个/页可翻页的标签列表、防抖搜索框支持 ↑↓/Enter 键盘导航、同页词条详情含中文摘要/Wiki 章节摘要/隐含与关联标签，返回列表后筛选保留）。构建、重建向量与中文翻译是维护者/CLI 专属操作（`scripts/build_tag_wiki.py`、`scripts/build_tag_wiki_catalog.py`、`scripts/reembed_tag_wiki.py`），前端不提供维护入口；成品包 frozen 模式下后端同样拒绝（403）。
+- TagManager 的标签编辑/展示栏与工作台 TagCloud 的 tag 药丸上有 **BookOpen 图标按钮**，点开 `WikiDrawer` 快查（含义摘要 + 隐含搭配 + 相关 tag）——抽屉继续走旧 `/lookup` API，与目录页互不影响。
+- 客户端 `frontend/src/lib/tagWiki.ts` 的类型与 `contracts.py` 的 TypedDict 一一对应（旧 lookup/search/ask 类型保留）。
 
 ## 目录与存储
 
 ```
 data/tag_wiki/
-├── tag_wiki.sqlite3            # e621：pages / chunks(+向量) / page_links / summaries / FTS5
+├── tag_wiki.sqlite3            # e621：pages / chunks(+向量) / page_links / summaries / FTS5 / catalog_*(v2)
 ├── tag_wiki_danbooru.sqlite3   # danbooru 镜像（同 schema，独立库）
 ├── danbooru/                   # danbooru API 抓取的原始 JSONL 缓存 + state.json 断点
 ├── downloads/                  # wiki_pages-*.csv.gz 缓存（保留最新）
-└── models/                     # intfloat__multilingual-e5-small 快照
+└── models/                     # 嵌入模型快照
 ```
 
-模块布局遵循 tag-manager 模板：`contracts.py`（pydantic 请求模型 + 响应 TypedDict）、`wiki_store.py`（SQLite，WAL + RLock + schema_migrations）、`importer.py`（e621 下载 + DText 解析 + 增量导入）、`danbooru_importer.py`（danbooru JSON API 分页抓取 + 增量导入）、`embedder.py`（ONNX/torch/OpenAI 兼容远程三后端）、`searcher.py`（RRF 融合检索）、`translator.py`（摘要批任务）、`service.py`（编排 + 后台任务）、`api.py`（路由）。接线位于 `main.py` 的 `Runtime.__init__`（共享 tag 数据库与 provider 工厂，注入 `_tag_wiki_vocab`）与 `create_app`（SPA catch-all 之前挂载路由）。
+模块布局遵循 tag-manager 模板：`contracts.py`（pydantic 请求模型 + 响应 TypedDict）、`wiki_store.py`（SQLite，WAL + RLock + schema_migrations，v2 起 catalog 表）、`importer.py`（e621 下载 + DText 解析 + 增量导入）、`danbooru_importer.py`（danbooru JSON API 分页抓取 + 增量导入）、`embedder.py`（ONNX/torch/OpenAI 兼容远程三后端）、`searcher.py`（RRF 融合检索）、`translator.py`（摘要批任务）、`taxonomy.py`（目录两级分类，纯规则）、`service.py`（编排 + 后台任务 + 目录只读查询）、`api.py`（路由）。接线位于 `main.py` 的 `Runtime.__init__`（共享 tag 数据库与 provider 工厂，注入 `_tag_wiki_vocab`）与 `create_app`（SPA catch-all 之前挂载路由）。
 
 ## 运行参数
 
@@ -147,8 +176,8 @@ frozen = false
 ## 测试
 
 ```bash
-python -m pytest backend/tests/test_tag_wiki_store.py backend/tests/test_tag_wiki_importer.py backend/tests/test_tag_wiki_danbooru.py backend/tests/test_tag_wiki_embedder.py backend/tests/test_tag_wiki_searcher.py backend/tests/test_tag_wiki_service.py -q
+python -m pytest backend/tests/test_tag_wiki_store.py backend/tests/test_tag_wiki_importer.py backend/tests/test_tag_wiki_danbooru.py backend/tests/test_tag_wiki_embedder.py backend/tests/test_tag_wiki_searcher.py backend/tests/test_tag_wiki_service.py backend/tests/test_tag_wiki_catalog.py -q
 npm --prefix frontend test -- --run
 ```
 
-测试全程离线：下载/网络代码通过 httpx 假对象覆盖，嵌入模型用 4 维假向量替身。
+测试全程离线：下载/网络代码通过 httpx 假对象覆盖，嵌入模型用 4 维假向量替身；catalog 各层（store 迁移/读写、taxonomy 规则、构建 CLI、service 排序与关系分组、API 契约与 profile 隔离）由 `test_tag_wiki_catalog.py` 覆盖。

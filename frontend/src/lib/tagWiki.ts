@@ -177,6 +177,80 @@ export interface AskRequest {
   profile?: TagWikiProfile
 }
 
+// --- Tag Catalog (read-only booru-style tag directory; schema v2) ---
+
+export interface CatalogGroupInfo {
+  key: string
+  label: string
+  tag_count: number
+}
+
+export interface CatalogCategoryInfo {
+  category: string
+  label: string
+  tag_count: number
+  groups: CatalogGroupInfo[]
+}
+
+export interface CatalogCategoriesResponse {
+  profile: TagWikiProfile
+  built: boolean
+  generated_at?: string | null
+  taxonomy_version?: number
+  min_post_count?: number
+  tag_count: number
+  relation_count: number
+  categories: CatalogCategoryInfo[]
+}
+
+export interface CatalogTagItem {
+  name: string
+  translation?: string | null
+  category: string
+  group_key: string
+  group_label: string
+  post_count: number
+  has_wiki: boolean
+  alias_of?: string | null
+  match?: 'exact' | 'alias' | 'prefix' | 'token' | 'contained'
+}
+
+export interface CatalogBrowseResponse {
+  profile: TagWikiProfile
+  category: string | null
+  group: string | null
+  q: string | null
+  total: number
+  offset: number
+  limit: number
+  items: CatalogTagItem[]
+}
+
+export interface CatalogRelationItem {
+  name: string
+  relation_type: 'implication' | 'wiki_link' | 'cooccurrence'
+  direction: 'forward' | 'reverse'
+  score: number
+  tag: TagRef | null
+}
+
+export interface CatalogTagDetail {
+  tag: CatalogTagItem
+  page: WikiPageInfo | null
+  implications: CatalogRelationItem[]
+  wiki_links: CatalogRelationItem[]
+  cooccurrences: CatalogRelationItem[]
+}
+
+export interface CatalogBrowseParams {
+  profile: TagWikiProfile
+  category?: string | null
+  group?: string | null
+  q?: string | null
+  offset?: number
+  limit?: number
+}
+
 // --- Tag Wiki API Client ---
 
 /** Human-readable Chinese guidance per shared wiki error code. */
@@ -190,6 +264,8 @@ const WIKI_ERROR_GUIDANCE: Record<string, string> = {
   wiki_ask_failed: 'AI 生成失败，请稍后重试或更换在线模型。',
   wiki_search_failed: '检索失败，请稍后重试。',
   wiki_lookup_failed: '查询失败，请稍后重试。',
+  wiki_catalog_missing: '标签目录尚未生成：请由维护者运行 scripts/build_tag_wiki_catalog.py 生成目录数据。',
+  wiki_catalog_tag_not_found: '标签目录中没有这个标签（可能低于 100 posts 的收录阈值）。',
 }
 
 /** Map the shared error envelope's wiki codes onto actionable Chinese guidance. */
@@ -251,4 +327,27 @@ export const tagWikiApi = {
     search.set('profile', profile)
     return request<WikiPageInfo>(`/tag-wiki/page/${encodeURIComponent(title)}?${search.toString()}`)
   },
+
+  // --- Tag Catalog (read-only) ---
+
+  catalogCategories: (profile: TagWikiProfile = 'e621') =>
+    request<CatalogCategoriesResponse>(
+      `/tag-wiki/catalog/categories?${new URLSearchParams({ profile }).toString()}`,
+    ),
+
+  catalogTags: (params: CatalogBrowseParams) => {
+    const search = new URLSearchParams()
+    search.set('profile', params.profile)
+    if (params.category) search.set('category', params.category)
+    if (params.group) search.set('group', params.group)
+    if (params.q) search.set('q', params.q)
+    if (params.offset != null) search.set('offset', String(params.offset))
+    if (params.limit != null) search.set('limit', String(params.limit))
+    return request<CatalogBrowseResponse>(`/tag-wiki/catalog/tags?${search.toString()}`)
+  },
+
+  catalogTag: (title: string, profile: TagWikiProfile = 'e621') =>
+    request<CatalogTagDetail>(
+      `/tag-wiki/catalog/tags/${encodeURIComponent(title)}?${new URLSearchParams({ profile }).toString()}`,
+    ),
 }

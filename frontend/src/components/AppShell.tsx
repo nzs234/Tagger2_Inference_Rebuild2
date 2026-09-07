@@ -18,7 +18,7 @@ const navGroups: Array<{ label: string; items: NavItem[] }> = [
       { id: 'batch', label: '批量任务', icon: Database, hint: '目录扫描与历史' },
       { id: 'dataset-workflow', label: '数据集工作流', icon: Workflow, hint: '事务化标注流水线' },
       { id: 'tag-manager', label: '标签管理', icon: Tag, hint: '数据集标签批量编辑' },
-      { id: 'tag-wiki', label: 'Tag Wiki', icon: BookOpen, hint: '本地 E621 标签百科与语义检索' },
+      { id: 'tag-wiki', label: 'Tag Wiki', icon: BookOpen, hint: '本地 E621 标签百科与高频目录' },
     ],
   },
   {

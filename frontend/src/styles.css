@@ -1336,6 +1336,56 @@ button.tm-pill:disabled, .tm-pill[role="button"][aria-disabled="true"] { cursor:
 .tm-pill-wiki-btn, .tag-pill-wiki-btn { display: inline-flex; align-items: center; justify-content: center; padding: 1px 2px; margin-left: 2px; border: 0; border-radius: 3px; background: transparent; color: inherit; opacity: 0.6; cursor: pointer; transition: opacity .1s ease; }
 .tm-pill-wiki-btn:hover, .tag-pill-wiki-btn:hover { opacity: 1; background: rgb(0 0 0 / 10%); }
 
+/* Tag catalog: read-only booru-style tag directory (front page) */
+.tw-catalog-panel { padding: 0; overflow: hidden; }
+.tw-catalog-layout { display: grid; grid-template-columns: 200px minmax(0, 1fr); min-height: 420px; }
+.tw-catalog-sidebar { display: flex; flex-direction: column; gap: 2px; padding: 14px 10px; border-right: 1px solid var(--line); background: var(--surface-2); }
+.tw-catalog-sidebar-title { display: flex; align-items: center; gap: 5px; font-size: 11px; font-weight: 700; color: var(--muted); padding: 0 8px 8px; }
+.tw-catalog-cat { display: flex; align-items: center; justify-content: space-between; gap: 8px; width: 100%; padding: 7px 10px; border: 0; border-radius: 7px; background: transparent; color: var(--ink); font-size: 12px; text-align: left; cursor: pointer; }
+.tw-catalog-cat:hover { background: var(--surface-3); }
+.tw-catalog-cat strong { font-size: 10px; color: var(--muted); font-family: "Cascadia Code", monospace; }
+.tw-catalog-cat-active { background: var(--accent-soft); color: var(--accent-strong); font-weight: 700; }
+.tw-catalog-cat-active strong { color: var(--accent-strong); }
+.tw-catalog-sidebar-error { padding: 8px; font-size: 11px; color: var(--danger, #dc2626); }
+
+.tw-catalog-main { display: grid; gap: 12px; padding: 16px; align-content: start; }
+.tw-catalog-search { flex-wrap: wrap; }
+.tw-catalog-groups { display: flex; flex-wrap: wrap; gap: 6px; }
+.tw-chip-active { background: var(--accent); color: #fff; border-color: var(--accent); }
+
+.tw-catalog-list-wrap { display: grid; gap: 10px; }
+.tw-catalog-list-meta { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; font-size: 12px; color: var(--muted); }
+.tw-catalog-hint { font-size: 10px; opacity: 0.8; }
+
+.tw-catalog-list { display: grid; gap: 6px; }
+.tw-catalog-item { display: flex; align-items: center; gap: 10px; width: 100%; padding: 7px 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); text-align: left; cursor: pointer; transition: border-color .12s ease, background .12s ease; }
+.tw-catalog-item:hover { border-color: var(--accent); background: var(--surface-2); }
+.tw-catalog-item:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.tw-catalog-item-active { border-color: var(--accent); background: var(--accent-soft); }
+.tw-catalog-item-group { margin-left: auto; font-size: 10px; color: var(--muted); white-space: nowrap; }
+.tw-catalog-match { font-size: 9px; font-style: normal; padding: 1px 5px; border-radius: 4px; background: var(--surface-3); color: var(--muted); }
+.tw-catalog-wiki-badge { display: inline-flex; align-items: center; gap: 3px; font-size: 9px; font-weight: 700; padding: 2px 6px; border-radius: 999px; background: var(--teal-soft, #d1fae5); color: var(--teal-strong, #065f46); white-space: nowrap; }
+
+.tw-catalog-pagination { display: flex; align-items: center; justify-content: center; gap: 14px; padding-top: 4px; font-size: 12px; }
+
+/* Catalog detail view */
+.tw-catalog-detail { display: grid; gap: 12px; }
+.tw-catalog-detail-header { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
+.tw-catalog-detail-body { display: grid; gap: 14px; padding: 16px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface-2); }
+.tw-catalog-filter-note { display: inline-flex; align-items: center; gap: 4px; font-size: 11px; color: var(--muted); }
+.tw-catalog-group-badge { font-size: 10px; padding: 2px 8px; }
+.tw-catalog-relation { display: inline-flex; align-items: center; gap: 4px; }
+.tw-catalog-reverse { font-size: 9px; font-style: normal; color: var(--amber, #f59e0b); font-weight: 700; }
+.tw-catalog-section-text { margin: 0; font-size: 12px; line-height: 1.6; color: var(--ink); display: -webkit-box; -webkit-line-clamp: 4; -webkit-box-orient: vertical; overflow: hidden; }
+.tw-section strong { font-size: 12px; color: var(--ink); }
+
+@media (max-width: 860px) {
+  .tw-catalog-layout { grid-template-columns: 1fr; }
+  .tw-catalog-sidebar { flex-direction: row; flex-wrap: wrap; border-right: 0; border-bottom: 1px solid var(--line); padding: 10px; }
+  .tw-catalog-sidebar-title { width: 100%; padding-bottom: 4px; }
+  .tw-catalog-cat { width: auto; }
+}
+
 /* Build panel extra controls */
 .tw-build-flags { display: flex; flex-wrap: wrap; gap: 12px; }
 .tw-build-flags label { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; color: var(--muted); cursor: pointer; }

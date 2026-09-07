@@ -3,13 +3,25 @@
 Same mounting rules as every other module: the router is included before the
 SPA catch-all and behind the shared ``authorize`` dependency. All errors are
 ``TagWikiError`` instances mapped to the app-wide error payload shape.
+
+Route order matters: the specific ``/catalog/...`` routes are declared
+before the generic ``/page/{title}`` route so a page can never shadow them
+(the sets are disjoint today, but the ordering keeps that true if either
+grows).
 """
 
 from __future__ import annotations
 
 from fastapi import APIRouter, HTTPException, Query
 
-from .contracts import AskRequest, BuildRequest, SearchRequest, TranslateRequest
+from .contracts import (
+    CATALOG_DEFAULT_PAGE_SIZE,
+    CATALOG_MAX_PAGE_SIZE,
+    AskRequest,
+    BuildRequest,
+    SearchRequest,
+    TranslateRequest,
+)
 from .service import TagWikiError, TagWikiService
 
 
@@ -66,6 +78,48 @@ def create_tag_wiki_router(service: TagWikiService) -> APIRouter:
     async def ask(request: AskRequest):
         try:
             return await service.ask(request)
+        except TagWikiError as exc:
+            raise _error(exc) from exc
+
+    # -- read-only tag catalog ------------------------------------------------
+
+    @router.get("/catalog/categories")
+    async def catalog_categories(
+        profile: str = Query(default="e621", pattern="^(e621|danbooru)$"),
+    ):
+        try:
+            return await service.catalog_categories(profile=profile)
+        except TagWikiError as exc:
+            raise _error(exc) from exc
+
+    @router.get("/catalog/tags")
+    async def catalog_tags(
+        profile: str = Query(default="e621", pattern="^(e621|danbooru)$"),
+        category: str | None = Query(default=None, max_length=64),
+        group: str | None = Query(default=None, max_length=64),
+        q: str | None = Query(default=None, max_length=128),
+        offset: int = Query(default=0, ge=0),
+        limit: int = Query(default=CATALOG_DEFAULT_PAGE_SIZE, ge=1, le=CATALOG_MAX_PAGE_SIZE),
+    ):
+        try:
+            return await service.catalog_browse(
+                profile=profile,
+                category=category,
+                group=group,
+                q=q,
+                offset=offset,
+                limit=limit,
+            )
+        except TagWikiError as exc:
+            raise _error(exc) from exc
+
+    @router.get("/catalog/tags/{title}")
+    async def catalog_tag_detail(
+        title: str,
+        profile: str = Query(default="e621", pattern="^(e621|danbooru)$"),
+    ):
+        try:
+            return await service.catalog_tag_detail(title, profile=profile)
         except TagWikiError as exc:
             raise _error(exc) from exc
 

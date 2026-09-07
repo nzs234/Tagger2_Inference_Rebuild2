@@ -4,9 +4,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { TagCloud } from '../src/components/TagCloud'
 import { TagWiki } from '../src/pages/TagWiki'
 import type {
-  AskResult,
+  CatalogBrowseResponse,
+  CatalogCategoriesResponse,
+  CatalogTagDetail,
   LookupResult,
-  SearchResult,
   TagWikiStatus,
 } from '../src/lib/tagWiki'
 import { clampInt, describeWikiError } from '../src/lib/tagWiki'
@@ -32,23 +33,6 @@ const mockStatus: TagWikiStatus = {
         search_ready: true,
       },
     },
-    danbooru: {
-      database: {
-        exists: true,
-        pages: 216356,
-        chunks: 320390,
-        embedded_chunks: 320390,
-        translated_pages: 0,
-        dump_date: null,
-      },
-      index: {
-        embedding_model: 'intfloat/multilingual-e5-small',
-        embedding_model_ready: true,
-        dimension: 384,
-        fts_enabled: true,
-        search_ready: true,
-      },
-    },
   },
   database: {
     exists: true,
@@ -65,21 +49,14 @@ const mockStatus: TagWikiStatus = {
     fts_enabled: true,
     search_ready: true,
   },
-  build: {
-    state: 'idle',
-    phase: 'idle',
-    message: '就绪',
-    started_at: null,
-    updated_at: null,
-    error: null,
-  },
+  build: { state: 'idle', phase: 'idle', message: '就绪', started_at: null, updated_at: null, error: null },
   translate: {
     state: 'idle',
     done: 500,
     failed: 0,
     total: 1000,
     provider_id: 'gemini',
-    model: 'gemini-1.5-flash',
+    model: 'gemini-flash',
     message: '空闲',
     started_at: null,
     updated_at: null,
@@ -87,98 +64,175 @@ const mockStatus: TagWikiStatus = {
   },
 }
 
-const mockLookupResult: LookupResult = {
-  query: 'solo',
-  resolved: true,
-  tag: {
-    name: 'solo',
-    category: 'general',
-    post_count: 2_500_000,
-    alias_of: null,
-    translation: '单人',
+const mockCategories: CatalogCategoriesResponse = {
+  profile: 'e621',
+  built: true,
+  generated_at: '2026-09-07T00:00:00+00:00',
+  taxonomy_version: 1,
+  min_post_count: 100,
+  tag_count: 3,
+  relation_count: 2,
+  categories: [
+    {
+      category: 'general',
+      label: '通用',
+      tag_count: 2,
+      groups: [
+        { key: 'action_pose', label: '动作与姿势', tag_count: 2 },
+        { key: 'body_part', label: '身体部位', tag_count: 1 },
+      ],
+    },
+    { category: 'species', label: '物种', tag_count: 1, groups: [{ key: 'species', label: '物种', tag_count: 1 }] },
+  ],
+}
+
+const hugItem = {
+  name: 'hug',
+  translation: '拥抱',
+  category: 'general',
+  group_key: 'action_pose',
+  group_label: '动作与姿势',
+  post_count: 500,
+  has_wiki: true,
+  alias_of: null,
+}
+
+const mockBrowse: CatalogBrowseResponse = {
+  profile: 'e621',
+  category: null,
+  group: null,
+  q: null,
+  total: 3,
+  offset: 0,
+  limit: 60,
+  items: [
+    { ...hugItem },
+    {
+      name: 'solo',
+      translation: null,
+      category: 'general',
+      group_key: 'action_pose',
+      group_label: '动作与姿势',
+      post_count: 2000,
+      has_wiki: true,
+      alias_of: null,
+    },
+    {
+      name: 'blue_eyes',
+      translation: '蓝眼睛',
+      category: 'general',
+      group_key: 'body_part',
+      group_label: '身体部位',
+      post_count: 800,
+      has_wiki: false,
+      alias_of: null,
+    },
+  ],
+}
+
+function aliasBrowse(q: string): CatalogBrowseResponse {
+  return {
+    ...mockBrowse,
+    q,
+    total: 1,
+    items: [
+      {
+        name: 'kiss',
+        translation: '亲吻',
+        category: 'general',
+        group_key: 'action_pose',
+        group_label: '动作与姿势',
+        post_count: 300,
+        has_wiki: true,
+        alias_of: 'smooch',
+        match: 'alias',
+      },
+    ],
+  }
+}
+
+const hugDetail: CatalogTagDetail = {
+  tag: { ...hugItem },
+  page: {
+    title: 'hug',
+    wiki_id: 1,
+    updated_at: '2026-09-01T00:00:00Z',
+    url: 'https://e621.net/wiki_pages/1',
+    summary: {
+      meaning: '拥抱动作。',
+      usage: '用于两人相拥的场景。',
+      pairing: '常与 kiss 搭配。',
+      notes: '',
+      tags: ['kiss'],
+      provider_id: 'gemini',
+      model: 'gemini-flash',
+      updated_at: '2026-09-01T00:00:00Z',
+    },
+    sections: [{ heading: 'Usage', text: 'Use for hugging.' }],
+    related_tags: [],
   },
   implications: [
     {
-      name: '1girl',
-      category: 'general',
-      post_count: 1_800_000,
-      alias_of: null,
-      translation: '单人女性',
+      name: 'kiss',
+      relation_type: 'implication',
+      direction: 'forward',
+      score: 300,
+      tag: { name: 'kiss', category: 'general', post_count: 300, translation: '亲吻' },
     },
   ],
+  wiki_links: [
+    {
+      name: 'kiss',
+      relation_type: 'wiki_link',
+      direction: 'forward',
+      score: 300,
+      tag: { name: 'kiss', category: 'general', post_count: 300, translation: '亲吻' },
+    },
+  ],
+  cooccurrences: [],
+}
+
+const kissDetail: CatalogTagDetail = {
+  tag: {
+    name: 'kiss',
+    translation: '亲吻',
+    category: 'general',
+    group_key: 'action_pose',
+    group_label: '动作与姿势',
+    post_count: 300,
+    has_wiki: true,
+    alias_of: null,
+  },
+  page: { title: 'kiss', sections: [{ heading: '', text: 'A kiss.' }], related_tags: [], summary: null },
+  implications: [],
+  wiki_links: [],
+  cooccurrences: [],
+}
+
+// WikiDrawer (Tag Manager integration) still speaks the legacy lookup API.
+const mockLookupResult: LookupResult = {
+  query: 'solo',
+  resolved: true,
+  tag: { name: 'solo', category: 'general', post_count: 2_500_000, alias_of: null, translation: '单人' },
+  implications: [],
   page: {
     title: 'solo',
-    wiki_id: 101,
-    updated_at: '2026-09-01T12:00:00Z',
-    url: 'https://e621.net/wiki_pages/solo',
-    summary: {
-      meaning: '画面中仅包含一个独立主体。',
-      usage: '用于标记单个角色登场的场景。',
-      pairing: '通常与 1girl 或 1boy 搭配。',
-      notes: '若背景有微小杂兵则视情况而定。',
-      tags: ['solo', 'single'],
-      provider_id: 'gemini',
-      model: 'gemini-flash',
-      updated_at: '2026-09-01T12:00:00Z',
-    },
-    sections: [
-      {
-        heading: 'Overview',
-        text: 'The solo tag is applied when only one character is present in the image.',
-      },
-      {
-        heading: 'Usage Guidelines',
-        text: 'Do not use this tag if there are multiple characters.',
-      },
-    ],
-    related_tags: ['duo', 'group'],
+    summary: { meaning: '画面中仅包含一个独立主体。' },
+    sections: [{ heading: 'Overview', text: 'Only one character is present.' }],
+    related_tags: ['duo'],
   },
 }
 
-const mockSearchResult: SearchResult = {
-  query: 'solo character',
-  items: [
-    {
-      page_title: 'solo',
-      heading: 'Overview',
-      text: 'The solo tag is applied when only one character is present in the image.',
-      score: 0.95,
-      matched_by: ['vector', 'keyword'],
-      summary: mockLookupResult.page!.summary ?? null,
-      tag: mockLookupResult.tag,
-    },
-  ],
-  suggested_tags: [
-    {
-      name: 'solo',
-      category: 'general',
-      post_count: 2_500_000,
-      alias_of: null,
-      translation: '单人',
-    },
-  ],
-}
-
-const mockAskResult: AskResult = {
-  query: '如何使用 solo 标签？',
-  answer: 'solo 标签用于表示画面中只有一名角色。请注意与 duo/group 互斥。',
-  tags: ['solo', 'duo', 'group'],
-  provider_id: 'gemini',
-  model: 'gemini-1.5-flash',
-  sources: ['solo', 'duo'],
-}
-
 interface HarnessState {
-  status: TagWikiStatus
-  searchBodies: Array<Record<string, unknown>>
-  askBodies: Array<Record<string, unknown>>
-  askStatus: number
+  browseUrls: string[]
+  categoryUrls: string[]
+  detailTitles: string[]
+  categoriesStatus: number
+  totalOverride: number | null
 }
 
 function renderTagWikiPage() {
-  const client = new QueryClient({
-    defaultOptions: { queries: { retry: false } },
-  })
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
   return render(
     <QueryClientProvider client={client}>
       <TagWiki />
@@ -188,66 +242,53 @@ function renderTagWikiPage() {
 
 function setupFetch(state: HarnessState) {
   const json = (body: unknown, status = 200) =>
-    new Response(JSON.stringify(body), {
-      status,
-      headers: { 'Content-Type': 'application/json' },
-    })
+    new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } })
 
-  return vi.spyOn(globalThis, 'fetch').mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
+  return vi.spyOn(globalThis, 'fetch').mockImplementation(async (input: RequestInfo | URL) => {
     const url = new URL(String(input), 'http://localhost')
     const path = url.pathname
 
-    if (path.endsWith('/tag-wiki/status')) {
-      return json(state.status)
-    }
+    if (path.endsWith('/tag-wiki/status')) return json(mockStatus)
 
-    if (path.endsWith('/tag-wiki/lookup')) {
-      const tag = url.searchParams.get('tag')
-      if (tag === 'solo') return json(mockLookupResult)
-      return json({
-        query: tag ?? '',
-        resolved: false,
-        tag: null,
-        implications: [],
-        page: null,
-      })
-    }
-
-    if (path.endsWith('/tag-wiki/search')) {
-      state.searchBodies.push(JSON.parse(init?.body as string) as Record<string, unknown>)
-      return json(mockSearchResult)
-    }
-
-    if (path.endsWith('/tag-wiki/ask')) {
-      state.askBodies.push(JSON.parse(init?.body as string) as Record<string, unknown>)
-      if (state.askStatus !== 200) {
+    if (path.endsWith('/catalog/categories')) {
+      state.categoryUrls.push(url.searchParams.get('profile') ?? '')
+      if (state.categoriesStatus !== 200) {
         return json(
-          {
-            code: 'wiki_ask_unavailable',
-            message: '未配置或启用在线模型：AI 问答需要在线 LLM Provider。请前往「在线模型」页面配置。',
-            request_id: 'req-ask',
-            retryable: false,
-          },
-          state.askStatus,
+          { code: 'wiki_catalog_missing', message: '标签目录尚未生成', request_id: 'r', retryable: false },
+          state.categoriesStatus,
         )
       }
-      return json(mockAskResult)
+      return json({ ...mockCategories, profile: url.searchParams.get('profile') ?? 'e621' })
     }
+
+    if (path.includes('/catalog/tags/')) {
+      const title = decodeURIComponent(path.split('/catalog/tags/')[1] ?? '')
+      state.detailTitles.push(title)
+      if (title === 'kiss') return json(kissDetail)
+      if (title === 'hug') return json(hugDetail)
+      return json({ ...hugDetail, tag: { ...hugDetail.tag, name: title } })
+    }
+
+    if (path.endsWith('/catalog/tags')) {
+      state.browseUrls.push(url.searchParams.toString())
+      const q = url.searchParams.get('q')
+      const offset = Number(url.searchParams.get('offset') ?? 0)
+      if (q) return json(aliasBrowse(q))
+      const total = state.totalOverride ?? mockBrowse.total
+      return json({ ...mockBrowse, total, offset })
+    }
+
+    if (path.endsWith('/tag-wiki/lookup')) return json(mockLookupResult)
 
     return json({})
   })
 }
 
-describe('TagWiki Page & WikiDrawer', () => {
+describe('TagWiki catalog page', () => {
   let state: HarnessState
 
   beforeEach(() => {
-    state = {
-      status: mockStatus,
-      searchBodies: [],
-      askBodies: [],
-      askStatus: 200,
-    }
+    state = { browseUrls: [], categoryUrls: [], detailTitles: [], categoriesStatus: 200, totalOverride: null }
     usePreferences.setState({ page: 'tag-wiki', bilingualTags: true })
   })
 
@@ -256,105 +297,154 @@ describe('TagWiki Page & WikiDrawer', () => {
     vi.restoreAllMocks()
   })
 
-  it('renders the page heading and status chips in BuildPanel', async () => {
+  it('renders the directory: sidebar categories, tag list and threshold note', async () => {
     setupFetch(state)
     renderTagWikiPage()
 
     expect(screen.getByRole('heading', { level: 1, name: 'Tag Wiki' })).toBeInTheDocument()
-    expect(await screen.findByText(/1,250/)).toBeInTheDocument()
-    expect(screen.getByText(/3,500/)).toBeInTheDocument()
-    expect(screen.getByText('2026-09-01')).toBeInTheDocument()
+    expect(await screen.findByText('全部标签')).toBeInTheDocument()
+    expect(await screen.findByText('hug')).toBeInTheDocument()
+    expect(screen.getByText('solo')).toBeInTheDocument()
+    expect(screen.getByText(/post_count ≥ 100/)).toBeInTheDocument()
+    const groupLabels = screen.getAllByText('动作与姿势', { selector: '.tw-catalog-item-group' })
+    expect(groupLabels.length).toBeGreaterThanOrEqual(2)
   })
 
-  it('looks up a tag and displays its details and summary', async () => {
+  it('retired flows must not appear: no tabs, no semantic search, no AI ask, no maintenance', async () => {
     setupFetch(state)
     renderTagWikiPage()
 
-    const input = screen.getByLabelText('标签名称')
-    fireEvent.change(input, { target: { value: 'solo' } })
-    fireEvent.click(screen.getByRole('button', { name: '查询' }))
+    expect(await screen.findByText('hug')).toBeInTheDocument()
+    expect(screen.queryByRole('tab')).not.toBeInTheDocument()
+    expect(screen.queryByText(/语义搜索/)).not.toBeInTheDocument()
+    expect(screen.queryByText(/AI 问答/)).not.toBeInTheDocument()
+    expect(screen.queryByLabelText('语义搜索内容')).not.toBeInTheDocument()
+    expect(screen.queryByLabelText('AI 问答内容')).not.toBeInTheDocument()
+    expect(screen.queryByText('下载/更新 Wiki 数据')).not.toBeInTheDocument()
+  })
 
-    expect(await screen.findByText('画面中仅包含一个独立主体。')).toBeInTheDocument()
-    expect(screen.getByText('用法')).toBeInTheDocument()
-    expect(screen.getByText('搭配建议')).toBeInTheDocument()
-    expect(screen.getByText('注意事项')).toBeInTheDocument()
+  it('shows a second-level group filter row for the selected category', async () => {
+    setupFetch(state)
+    renderTagWikiPage()
+
+    // Sidebar button accessible name joins the label and count ("通用2").
+    fireEvent.click(await screen.findByRole('button', { name: '通用2' }))
+    expect(await screen.findByRole('button', { name: /全部 通用/ })).toBeInTheDocument()
+    // Selecting the body_part group threads it into the browse request.
+    fireEvent.click(screen.getByRole('button', { name: /身体部位/ }))
+    await waitFor(() =>
+      expect(state.browseUrls.some((u) => u.includes('group=body_part'))).toBe(true),
+    )
+  })
+
+  it('debounces the search input and requests ranked results', async () => {
+    setupFetch(state)
+    renderTagWikiPage()
+    await screen.findByText('hug')
+
+    const input = screen.getByLabelText('搜索标签')
+    fireEvent.change(input, { target: { value: 'smooch' } })
+    // No request until the debounce window elapses.
+    expect(state.browseUrls.some((u) => u.includes('q=smooch'))).toBe(false)
+
+    await waitFor(() => expect(state.browseUrls.some((u) => u.includes('q=smooch'))).toBe(true), {
+      timeout: 1500,
+    })
+    expect(await screen.findByText('kiss')).toBeInTheDocument()
+    expect(screen.getByText('别名')).toBeInTheDocument()
+  })
+
+  it('opens the same-page detail view from a list item and navigates via related pills', async () => {
+    setupFetch(state)
+    renderTagWikiPage()
+
+    fireEvent.click(await screen.findByText('hug'))
+    expect(state.detailTitles).toContain('hug')
+    expect(await screen.findByText('拥抱动作。')).toBeInTheDocument()
     expect(screen.getByText('隐含标签（需要搭配）')).toBeInTheDocument()
-    expect(screen.getByText('单人女性')).toBeInTheDocument()
+    expect(screen.getByText('Wiki 页面关联')).toBeInTheDocument()
+
+    // Related implication pill navigates within the catalog detail view.
+    // (kiss appears as implication pill, wiki-link pill and summary chip.)
+    const kissPill = screen.getAllByRole('button', { name: /亲吻/ })[0]
+    fireEvent.click(kissPill!)
+    await waitFor(() => expect(state.detailTitles).toContain('kiss'))
+    expect(await screen.findByText('A kiss.')).toBeInTheDocument()
+
+    // Back to the list: the directory is shown again.
+    fireEvent.click(screen.getByRole('button', { name: /返回列表/ }))
+    expect(await screen.findByText('solo')).toBeInTheDocument()
   })
 
-  it('performs semantic search and renders hits and suggested tags', async () => {
+  it('supports keyboard navigation: ArrowDown then Enter opens the active tag', async () => {
     setupFetch(state)
     renderTagWikiPage()
 
-    // Switch to search tab
-    fireEvent.click(screen.getByRole('tab', { name: /语义搜索/ }))
+    // Wait for the list before navigating it.
+    await screen.findByText('hug')
+    const input = screen.getByLabelText('搜索标签')
+    fireEvent.keyDown(input, { key: 'ArrowDown' })
+    const active = document.querySelector('.tw-catalog-item-active')
+    expect(active).not.toBeNull()
+    expect(active!.getAttribute('data-catalog-index')).toBe('0')
 
-    const textarea = screen.getByLabelText('语义搜索内容')
-    fireEvent.change(textarea, { target: { value: 'solo character' } })
-    fireEvent.click(screen.getByRole('button', { name: '检索 Wiki 章节' }))
-
-    await waitFor(() => expect(state.searchBodies).toHaveLength(1))
-    expect(state.searchBodies[0]).toEqual({ query: 'solo character', top_k: 8, profile: 'e621' })
-
-    expect(await screen.findByText('推荐候选标签')).toBeInTheDocument()
-    expect(screen.getByText(/The solo tag is applied when only one character is present/)).toBeInTheDocument()
+    fireEvent.keyDown(input, { key: 'Enter' })
+    await waitFor(() => expect(state.detailTitles).toContain('hug'))
+    expect(await screen.findByText('拥抱动作。')).toBeInTheDocument()
   })
 
-  it('performs AI ask and renders answer and sources', async () => {
+  it('paginates the directory with the offset parameter', async () => {
+    state.totalOverride = 120
     setupFetch(state)
     renderTagWikiPage()
 
-    // Switch to ask tab
-    fireEvent.click(screen.getByRole('tab', { name: /AI 问答/ }))
-
-    const textarea = screen.getByLabelText('AI 问答内容')
-    fireEvent.change(textarea, { target: { value: '如何使用 solo 标签？' } })
-    fireEvent.click(screen.getByRole('button', { name: '提问' }))
-
-    await waitFor(() => expect(state.askBodies).toHaveLength(1))
-    expect(await screen.findByText(/solo 标签用于表示画面中只有一名角色。/)).toBeInTheDocument()
-    expect(screen.getByText('提及标签')).toBeInTheDocument()
-    expect(screen.getByText('参考来源')).toBeInTheDocument()
+    fireEvent.click(await screen.findByRole('button', { name: /下一页/ }))
+    await waitFor(() => expect(state.browseUrls.some((u) => u.includes('offset=60'))).toBe(true))
+    expect(await screen.findByText(/第 61–120 个/)).toBeInTheDocument()
   })
 
-  it('switches the wiki profile and threads it into queries', async () => {
+  it('switches the wiki profile and threads it into catalog queries', async () => {
     setupFetch(state)
     renderTagWikiPage()
+    await screen.findByText('hug')
 
-    // Switch to the danbooru mirror: its own status chips appear and the
-    // build panel title follows the active profile.
     fireEvent.click(screen.getByRole('button', { name: 'Danbooru' }))
-    expect(await screen.findByText(/216,356/)).toBeInTheDocument()
-    expect(screen.getByText('Danbooru Wiki 数据库与翻译构建')).toBeInTheDocument()
-
-    fireEvent.click(screen.getByRole('tab', { name: /语义搜索/ }))
-    const textarea = screen.getByLabelText('语义搜索内容')
-    fireEvent.change(textarea, { target: { value: 'twintails pose' } })
-    fireEvent.click(screen.getByRole('button', { name: '检索 Wiki 章节' }))
-    await waitFor(() => expect(state.searchBodies).toHaveLength(1))
-    expect(state.searchBodies[0]).toMatchObject({ query: 'twintails pose', profile: 'danbooru' })
+    await waitFor(() => expect(state.categoryUrls).toContain('danbooru'))
+    await waitFor(() => expect(state.browseUrls.some((u) => u.includes('profile=danbooru'))).toBe(true))
   })
 
-  it('shows guidance and navigation button when 409 wiki_ask_unavailable occurs', async () => {
-    state.askStatus = 409
+  it('surfaces actionable guidance when the catalog has not been generated', async () => {
+    state.categoriesStatus = 409
     setupFetch(state)
     renderTagWikiPage()
 
-    fireEvent.click(screen.getByRole('tab', { name: /AI 问答/ }))
-    const textarea = screen.getByLabelText('AI 问答内容')
-    fireEvent.change(textarea, { target: { value: 'test ask' } })
-    fireEvent.click(screen.getByRole('button', { name: '提问' }))
+    // react-query retries once (default 1s backoff) before surfacing the error.
+    expect(await screen.findByText(/标签目录尚未生成/, {}, { timeout: 4000 })).toBeInTheDocument()
+    expect(screen.getByText(/build_tag_wiki_catalog\.py/)).toBeInTheDocument()
+  })
+})
 
-    expect(await screen.findByText(/未配置或启用在线模型/)).toBeInTheDocument()
-    const navBtn = screen.getByRole('button', { name: '前往「在线模型」页' })
-    expect(navBtn).toBeInTheDocument()
+describe('TagWiki WikiDrawer (legacy lookup consumers keep working)', () => {
+  beforeEach(() => {
+    usePreferences.setState({ page: 'tag-wiki', bilingualTags: true })
+  })
 
-    fireEvent.click(navBtn)
-    expect(usePreferences.getState().page).toBe('providers')
+  afterEach(() => {
+    cleanup()
+    vi.restoreAllMocks()
   })
 
   it('opens WikiDrawer from a TagCloud pill and fetches content', async () => {
-    setupFetch(state)
+    const json = (body: unknown, status = 200) =>
+      new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } })
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input: RequestInfo | URL) => {
+      const path = new URL(String(input), 'http://localhost').pathname
+      if (path.endsWith('/tag-wiki/status')) return json(mockStatus)
+      if (path.endsWith('/tag-wiki/lookup')) return json(mockLookupResult)
+      if (path.endsWith('/catalog/categories')) return json(mockCategories)
+      if (path.endsWith('/catalog/tags')) return json(mockBrowse)
+      return json({})
+    })
     const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
 
     render(
@@ -378,8 +468,11 @@ describe('TagWiki shared helpers', () => {
       describeWikiError(new ApiError('busy', 409, 'wiki_busy'), 'fallback'),
     ).toBe('已有构建或翻译任务正在进行中，请等待其完成后再试。')
     expect(
-      describeWikiError(new ApiError('db', 409, 'wiki_tag_db_unavailable'), 'fallback'),
-    ).toContain('本地标签数据库缺失')
+      describeWikiError(new ApiError('missing', 409, 'wiki_catalog_missing'), 'fallback'),
+    ).toContain('标签目录尚未生成')
+    expect(
+      describeWikiError(new ApiError('nf', 404, 'wiki_catalog_tag_not_found'), 'fallback'),
+    ).toContain('100 posts')
     // Unknown codes surface the backend message; non-Api errors use the fallback.
     expect(describeWikiError(new ApiError('boom', 500, 'wiki_build_failed'), 'fallback')).toBe('boom')
     expect(describeWikiError(new Error('x'), 'fallback')).toBe('fallback')
@@ -391,61 +484,5 @@ describe('TagWiki shared helpers', () => {
     expect(clampInt(99_999, 1, 50_000)).toBe(50_000)
     expect(clampInt(2.6, 0, 1_000_000)).toBe(3)
     expect(clampInt(Number.NaN, 0, 1_000_000)).toBe(0)
-  })
-})
-
-describe('TagWiki lookup card section state', () => {
-  it('resets expanded sections when the lookup target changes', async () => {
-    const duoResult: LookupResult = {
-      query: 'duo',
-      resolved: true,
-      tag: {
-        name: 'duo',
-        category: 'general',
-        post_count: 900_000,
-        alias_of: null,
-        translation: '双人',
-      },
-      implications: [],
-      page: {
-        title: 'duo',
-        wiki_id: 102,
-        updated_at: '2026-09-01T12:00:00Z',
-        url: null,
-        summary: null,
-        sections: [
-          { heading: 'Overview', text: 'Two characters are present in the image.' },
-          { heading: 'Usage Guidelines', text: 'Use duo instead of duo_focus when only two characters exist.' },
-        ],
-        related_tags: ['group'],
-      },
-    }
-    const json = (body: unknown, status = 200) =>
-      new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } })
-    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input: RequestInfo | URL) => {
-      const url = new URL(String(input), 'http://localhost')
-      if (url.pathname.endsWith('/tag-wiki/status')) return json(mockStatus)
-      if (url.pathname.endsWith('/tag-wiki/lookup')) {
-        const tag = url.searchParams.get('tag')
-        return json(tag === 'duo' ? duoResult : mockLookupResult)
-      }
-      return json({})
-    })
-
-    renderTagWikiPage()
-
-    fireEvent.change(screen.getByLabelText('标签名称'), { target: { value: 'solo' } })
-    fireEvent.click(screen.getByRole('button', { name: '查询' }))
-    const soloUsage = await screen.findByRole('button', { name: 'Usage Guidelines' })
-    expect(soloUsage).toHaveAttribute('aria-expanded', 'false')
-
-    fireEvent.click(soloUsage)
-    expect(soloUsage).toHaveAttribute('aria-expanded', 'true')
-
-    // Following a related tag swaps the card; the new card must start with
-    // its sections collapsed instead of inheriting the previous state.
-    fireEvent.click(screen.getByRole('button', { name: 'duo' }))
-    const duoUsage = await screen.findByRole('button', { name: 'Usage Guidelines' })
-    await waitFor(() => expect(duoUsage).toHaveAttribute('aria-expanded', 'false'))
   })
 })

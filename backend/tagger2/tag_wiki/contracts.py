@@ -21,14 +21,24 @@ dependency):
 - ``POST /search``                -> :class:`SearchDict`
 - ``POST /ask``                   -> :class:`AskDict`
 - ``GET  /page/{title}``          -> :class:`PageDict`
+- ``GET  /catalog/categories``    -> :class:`CatalogCategoriesDict`
+- ``GET  /catalog/tags``          -> :class:`CatalogBrowseDict`
+- ``GET  /catalog/tags/{title}``  -> :class:`CatalogTagDetailDict`
+
+The ``/catalog`` endpoints serve the read-only booru-style tag directory
+(high-frequency tags only, grouped by a deterministic two-level taxonomy).
+They are maintained by ``scripts/build_tag_wiki_catalog.py`` and answer 409
+``wiki_catalog_missing`` until that CLI has produced the catalog tables.
 
 Errors use the app-wide shape ``{code, message, fields, request_id,
 retryable}``. Notable codes: ``wiki_not_built`` (409, no wiki database yet),
 ``wiki_busy`` (409, a build or translate run is already active),
 ``wiki_embed_model_unavailable`` (409, the embedding model must be downloaded),
 ``wiki_search_unavailable`` (409, chunks exist but none are embedded),
-``wiki_ask_unavailable`` (409, no online provider configured) and
-``wiki_tag_db_unavailable`` (409, the classification snapshot is missing).
+``wiki_ask_unavailable`` (409, no online provider configured),
+``wiki_tag_db_unavailable`` (409, the classification snapshot is missing),
+``wiki_catalog_missing`` (409, the tag catalog has not been generated yet) and
+``wiki_catalog_tag_not_found`` (404, a requested catalog tag does not exist).
 """
 
 from __future__ import annotations
@@ -68,6 +78,18 @@ ERROR_WIKI_ASK_FAILED = "wiki_ask_failed"
 ERROR_WIKI_BUILD_FAILED = "wiki_build_failed"
 ERROR_WIKI_TRANSLATE_FAILED = "wiki_translate_failed"
 ERROR_WIKI_FROZEN = "wiki_frozen"
+ERROR_WIKI_CATALOG_MISSING = "wiki_catalog_missing"
+ERROR_WIKI_CATALOG_TAG_NOT_FOUND = "wiki_catalog_tag_not_found"
+
+# The catalog directory only lists tags at or above this many posts; the
+# build CLI accepts a higher threshold via --min-post-count but never lower.
+CATALOG_MIN_POST_COUNT = 100
+
+# Default page size and hard caps for GET /catalog/tags.
+CATALOG_DEFAULT_PAGE_SIZE = 60
+CATALOG_MAX_PAGE_SIZE = 200
+# Upper bound on candidates fetched for one ranked fuzzy search page.
+CATALOG_SEARCH_CANDIDATE_CAP = 1000
 
 
 class BuildRequest(BaseModel):
@@ -259,17 +281,128 @@ class StatusDict(TypedDict, total=False):
     translate: TranslateStatusDict
 
 
+# -- tag catalog (read-only booru-style tag directory) -----------------------
+
+
+class CatalogGroupInfo(TypedDict, total=False):
+    """One second-level semantic group inside a catalog category."""
+
+    key: str
+    label: str
+    tag_count: int
+
+
+class CatalogCategoryInfo(TypedDict, total=False):
+    """One first-level category with its semantic groups."""
+
+    category: str
+    label: str
+    tag_count: int
+    groups: list[CatalogGroupInfo]
+
+
+class CatalogCategoriesDict(TypedDict, total=False):
+    """Response of ``GET /catalog/categories``."""
+
+    profile: str
+    built: bool
+    generated_at: str | None
+    taxonomy_version: int
+    min_post_count: int
+    tag_count: int
+    relation_count: int
+    categories: list[CatalogCategoryInfo]
+
+
+class CatalogTagItem(TypedDict, total=False):
+    """One catalog tag as listed by browse/search results."""
+
+    name: str
+    translation: str | None
+    category: str
+    group_key: str
+    group_label: str
+    post_count: int
+    has_wiki: bool
+    alias_of: str | None
+    match: Literal["exact", "alias", "prefix", "token", "contained"]
+
+
+class CatalogBrowseDict(TypedDict, total=False):
+    """Response of ``GET /catalog/tags``."""
+
+    profile: str
+    category: str | None
+    group: str | None
+    q: str | None
+    total: int
+    offset: int
+    limit: int
+    items: list[CatalogTagItem]
+
+
+class CatalogRelationItem(TypedDict, total=False):
+    """One related catalog tag, grouped by relation type in the detail view."""
+
+    name: str
+    relation_type: Literal["implication", "wiki_link", "cooccurrence"]
+    direction: Literal["forward", "reverse"]
+    score: float
+    tag: TagRef | None
+
+
+class CatalogTagDetailDict(TypedDict, total=False):
+    """Response of ``GET /catalog/tags/{title}``.
+
+    Each relation bucket is capped server-side (popularity-sorted, then
+    truncated) so a hub tag's hundreds of wiki links cannot flood the
+    detail response; the cap is a UI-serving decision, the stored catalog
+    keeps every relation.
+    """
+
+    tag: CatalogTagItem
+    page: WikiPageInfo | None
+    implications: list[CatalogRelationItem]
+    wiki_links: list[CatalogRelationItem]
+    cooccurrences: list[CatalogRelationItem]
+
+
+class CatalogMetaDict(TypedDict, total=False):
+    """Catalog generation metadata as stored by the build CLI."""
+
+    built: bool
+    profile: str
+    generated_at: str | None
+    taxonomy_version: int
+    min_post_count: int
+    tag_count: int
+    relation_count: int
+
+
 __all__ = [
     "AskDict",
     "AskRequest",
     "BuildRequest",
     "BuildStatusDict",
+    "CATALOG_DEFAULT_PAGE_SIZE",
+    "CATALOG_MAX_PAGE_SIZE",
+    "CATALOG_MIN_POST_COUNT",
+    "CATALOG_SEARCH_CANDIDATE_CAP",
+    "CatalogBrowseDict",
+    "CatalogCategoriesDict",
+    "CatalogGroupInfo",
+    "CatalogMetaDict",
+    "CatalogRelationItem",
+    "CatalogTagDetailDict",
+    "CatalogTagItem",
     "ChunkHit",
     "DEFAULT_EMBED_MODEL_REPO",
     "ERROR_WIKI_ASK_FAILED",
     "ERROR_WIKI_ASK_UNAVAILABLE",
     "ERROR_WIKI_BUILD_FAILED",
     "ERROR_WIKI_BUSY",
+    "ERROR_WIKI_CATALOG_MISSING",
+    "ERROR_WIKI_CATALOG_TAG_NOT_FOUND",
     "ERROR_WIKI_EMBED_MODEL_UNAVAILABLE",
     "ERROR_WIKI_FROZEN",
     "ERROR_WIKI_LOOKUP_FAILED",
