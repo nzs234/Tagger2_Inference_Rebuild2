@@ -17,9 +17,7 @@ from fastapi import APIRouter, HTTPException, Query
 from .contracts import (
     CATALOG_DEFAULT_PAGE_SIZE,
     CATALOG_MAX_PAGE_SIZE,
-    AskRequest,
     BuildRequest,
-    SearchRequest,
     TranslateRequest,
 )
 from .service import TagWikiError, TagWikiService
@@ -64,20 +62,6 @@ def create_tag_wiki_router(service: TagWikiService) -> APIRouter:
     ):
         try:
             return await service.lookup(tag, profile=profile)
-        except TagWikiError as exc:
-            raise _error(exc) from exc
-
-    @router.post("/search")
-    async def search(request: SearchRequest):
-        try:
-            return await service.search(request)
-        except TagWikiError as exc:
-            raise _error(exc) from exc
-
-    @router.post("/ask")
-    async def ask(request: AskRequest):
-        try:
-            return await service.ask(request)
         except TagWikiError as exc:
             raise _error(exc) from exc
 

@@ -2,7 +2,7 @@ import { useState } from 'react'
 import { ChevronDown, ChevronRight, ExternalLink, Sparkles } from 'lucide-react'
 import { tagCategoryClass, tagCategoryLabel } from '../../lib/tagCategories'
 import { formatPostCount, formatTagForDisplay } from '../../lib/tagManager'
-import type { ChunkHit, LookupResult, TagRef, WikiSummaryInfo } from '../../lib/tagWiki'
+import type { LookupResult, TagRef, WikiSummaryInfo } from '../../lib/tagWiki'
 import { usePreferences } from '../../store/app'
 
 /** Render a single TagRef as a colored pill */
@@ -267,77 +267,6 @@ export function LookupResultCard({
               </button>
             ))}
           </div>
-        </div>
-      )}
-    </div>
-  )
-}
-
-/** Search chunk hit card */
-export function ChunkHitCard({
-  hit,
-  maxScore = 1,
-  onTagClick,
-}: {
-  hit: ChunkHit
-  maxScore?: number
-  onTagClick?: (tag: string) => void
-}) {
-  const normScore = maxScore > 0 ? Math.min(100, Math.round((hit.score / maxScore) * 100)) : 0
-
-  return (
-    <div className="tw-chunk-card">
-      <div className="tw-chunk-header">
-        <div className="tw-chunk-title-group">
-          {hit.tag ? (
-            <WikiTagPill tag={hit.tag} onClick={onTagClick} />
-          ) : (
-            <button
-              type="button"
-              className="tw-page-title-button"
-              onClick={() => onTagClick?.(hit.page_title)}
-            >
-              {hit.page_title}
-            </button>
-          )}
-          {hit.heading && <span className="tw-chunk-heading">§ {hit.heading}</span>}
-        </div>
-
-        <div className="tw-chunk-meta">
-          <div className="tw-matched-badges">
-            {hit.matched_by.map((m) => (
-              <span key={m} className={`tw-match-badge tw-match-${m}`}>
-                {m === 'vector' ? '向量' : m === 'keyword' ? '关键词' : m}
-              </span>
-            ))}
-          </div>
-          <div className="tw-score-indicator" title={`相关度分值: ${hit.score.toFixed(3)}`}>
-            <div className="tw-score-bar-bg">
-              <div className="tw-score-bar-fill" style={{ width: `${normScore}%` }} />
-            </div>
-            <span className="tw-score-number">{normScore}%</span>
-          </div>
-        </div>
-      </div>
-
-      <div className="tw-chunk-text">
-        <p>{hit.text}</p>
-      </div>
-
-      {hit.summary && (
-        <div className="tw-chunk-summary-brief">
-          {hit.summary.meaning && (
-            <p>
-              <strong>含义：</strong>
-              {hit.summary.meaning}
-            </p>
-          )}
-          {hit.summary.usage && (
-            <p>
-              <strong>用法：</strong>
-              {hit.summary.usage}
-            </p>
-          )}
         </div>
       )}
     </div>

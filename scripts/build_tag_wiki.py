@@ -1,16 +1,15 @@
 """Build, update and pre-translate the local tag wiki from the CLI.
 
-Runs the exact same pipeline as the Tag Wiki UI buttons (download dump ->
-import -> embedding model -> vector index, optionally followed by the Chinese
-summary translation job), so server operators can bootstrap or refresh the
-feature without opening the browser. Safe to re-run: imports are incremental,
-only un-embedded chunks are vectorized and already-translated pages are
-skipped.
+Runs the exact same pipeline as the maintenance endpoints (download dump ->
+import -> prune, optionally followed by the Chinese summary translation
+job), so server operators can bootstrap or refresh the feature without
+opening the browser. Safe to re-run: imports are incremental and
+already-translated pages are skipped. After a corpus refresh, regenerate
+the browse catalog with ``scripts/build_tag_wiki_catalog.py``.
 
 Usage::
 
     .\\runtime\\python.exe scripts/build_tag_wiki.py --build
-    .\\runtime\\python.exe scripts/build_tag_wiki.py --build --force-reembed
     .\\runtime\\python.exe scripts\\build_tag_wiki.py --translate --scope popular \\
         --min-post-count 1000 --max-pages 2000 --provider cpa --concurrency 8
 
@@ -18,15 +17,13 @@ Flag semantics (offline control):
 
 - ``--no-download`` reuses the newest cached dump under
   ``data/tag_wiki/downloads/`` and skips the e621 dump refresh check.
-- ``--skip-reindex`` skips re-importing the dump into SQLite. The dump
-  refresh check, pruning, the embedding model check and the vector pass
-  still run, so pair it with ``--no-download`` for a fully offline index
+- ``--skip-reindex`` skips re-importing the dump into SQLite. The pruning
+  sweep still runs; pair it with ``--no-download`` for a fully offline
   refresh.
-- ``--force-reembed`` re-embeds every chunk even when its content hash is
-  unchanged (full vector pass).
 
-``--translate`` requires a configured online provider (same resolution as the
-UI: explicit --provider, else the first enabled provider holding a key).
+``--translate`` requires a configured online provider (same resolution as
+the maintenance API: explicit --provider, else the first enabled provider
+holding a key).
 
 Exit codes: 0 success (including "nothing to do"), 1 the started job
 finished in an error state, 2 the job could not be started (one is already
@@ -87,7 +84,6 @@ async def _run_build(service: Any, args: argparse.Namespace) -> int:
                 profile=args.profile,
                 download_dump=not args.no_download,
                 reindex=not args.skip_reindex,
-                force_reembed=args.force_reembed,
             )
         )
     except TagWikiError as exc:
@@ -180,11 +176,10 @@ def _build_parser() -> argparse.ArgumentParser:
         "--skip-reindex",
         action="store_true",
         help=(
-            "skip re-importing the dump (the dump refresh check, pruning, model "
-            "check and the vector pass still run; add --no-download to avoid the network)"
+            "skip re-importing the dump (the pruning sweep still runs; add "
+            "--no-download to avoid the network)"
         ),
     )
-    parser.add_argument("--force-reembed", action="store_true", help="re-embed every chunk even when unchanged")
     parser.add_argument("--translate", action="store_true", help="pre-translate wiki pages into structured Chinese summaries")
     parser.add_argument("--scope", choices=["model_vocab", "popular", "all"], default="model_vocab")
     parser.add_argument("--min-post-count", type=int, default=1000)

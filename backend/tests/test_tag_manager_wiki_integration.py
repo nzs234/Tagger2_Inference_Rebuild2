@@ -419,15 +419,10 @@ def test_translation_learned_in_tag_manager_is_visible_in_wiki(dual) -> None:
 
     seed_page(dual.wiki.store, "solo", text="Only one character is present.")
     seed_page(dual.wiki.store, "hug", text="Use for hugging.")
-    search = dual.client.post(
-        "/api/v1/tag-wiki/search", json={"query": "hugging", "top_k": 5}
-    )
-    assert search.status_code == 200
-    suggested = {tag["name"]: tag["translation"] for tag in search.json()["suggested_tags"]}
-    assert suggested.get("hug") == "拥抱"
-    # Frontend ChunkHit shape.
-    hit = search.json()["items"][0]
-    assert set(hit) >= {"page_title", "heading", "text", "score", "matched_by", "summary", "tag"}
+    page = dual.client.get("/api/v1/tag-wiki/page/hug")
+    assert page.status_code == 200
+    assert page.json()["title"] == "hug"
+    assert page.json()["summary"] is None or "meaning" in (page.json()["summary"] or {})
 
     # The manager's own image detail now carries the learned map as well.
     session_id = dual.client.post(
@@ -561,7 +556,6 @@ def test_validation_rejects_illegal_payloads_on_both_routers(dual) -> None:
         ("/api/v1/tag-manager/tag-db", None, {"profile": "gelbooru", "query": "x"}),
         ("/api/v1/tag-manager/translations/translate", "post", {"profile": "e621", "tags": []}),
         ("/api/v1/tag-manager/translations/translate", "post", {"profile": "e621", "tags": ["   "]}),
-        ("/api/v1/tag-wiki/search", "post", {"query": "x", "profile": "gelbooru"}),
         ("/api/v1/tag-wiki/translate", "post", {"scope": "unknown"}),
     ]
     for path, method, payload in cases:
@@ -594,13 +588,6 @@ def test_provider_failures_map_to_retryable_502s(dual) -> None:
     assert unusable.status_code == 502
     assert unusable.json()["detail"]["code"] == "tag_translate_failed"
 
-    # Wiki ask surfaces its own code on the same failure mode.
-    dual.provider.reply = ""
-    dual.provider.error = RuntimeError("boom")
-    ask = dual.client.post("/api/v1/tag-wiki/ask", json={"query": "拥抱用什么tag"})
-    assert ask.status_code == 502
-    assert ask.json()["detail"]["code"] == "wiki_ask_failed"
-    assert ask.json()["detail"]["retryable"] is True
     dual.provider.error = None
 
 
@@ -764,10 +751,9 @@ def test_runtime_routes_exchange_updates_end_to_end(runtime_client, tmp_path: Pa
     # The learned translation crosses the module boundary immediately.
     assert [tag["translation"] for tag in payload["implications"]] == ["拥抱"]
 
-    search = runtime_client.post("/api/v1/tag-wiki/search", json={"query": "hugging", "top_k": 5})
-    assert search.status_code == 200
-    suggested = {tag["name"]: tag["translation"] for tag in search.json()["suggested_tags"]}
-    assert suggested.get("hug") == "拥抱"
+    page = runtime_client.get("/api/v1/tag-wiki/page/hug")
+    assert page.status_code == 200
+    assert page.json()["title"] == "hug"
 
     info = runtime_client.get("/api/v1/tag-manager/tag-db/info").json()
     assert info["translations"]["e621"]["user_entries"] == 1
@@ -819,7 +805,7 @@ def test_runtime_serves_one_flat_error_envelope(runtime_client, tmp_path: Path) 
     )
 
     validation = runtime_client.post(
-        "/api/v1/tag-wiki/search", json={"query": "x", "profile": "gelbooru"}
+        "/api/v1/tag-wiki/translate", json={"scope": "unknown", "profile": "gelbooru"}
     )
     body = assert_flat(validation, 422, "validation_error")
     assert body["fields"] and "profile" in body["fields"]

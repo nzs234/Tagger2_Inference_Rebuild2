@@ -8,7 +8,7 @@ import tomllib
 import warnings
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Literal, Mapping
+from typing import Any, Mapping
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -143,14 +143,7 @@ def _read_toml_config(config_path: Path, project_root: Path) -> dict[str, Any]:
     if not isinstance(tag_wiki, Mapping):
         raise ValueError("configuration section [tag_wiki] must be a table")
     tag_wiki_fields = {
-        "embed_model_repo": "tag_wiki_embed_repo",
         "min_post_count": "tag_wiki_min_post_count",
-        "embed_backend": "tag_wiki_embed_backend",
-        "embed_endpoint": "tag_wiki_embed_endpoint",
-        "embed_api_key": "tag_wiki_embed_api_key",
-        "embed_model": "tag_wiki_embed_model",
-        "embed_passage_prefix": "tag_wiki_embed_passage_prefix",
-        "embed_query_prefix": "tag_wiki_embed_query_prefix",
         "frozen": "tag_wiki_frozen",
     }
     for source_name, field_name in tag_wiki_fields.items():
@@ -217,26 +210,10 @@ class AppConfig(BaseModel):
     image_extensions: frozenset[str] = DEFAULT_IMAGE_EXTENSIONS
     roots: list[RootSettings] = Field(default_factory=list)
 
-    # [tag_wiki] — local e621 wiki mirror. The literal mirrors the feature
-    # default (tag_wiki.contracts.DEFAULT_EMBED_MODEL_REPO); config.py must
-    # not import feature modules.
-    tag_wiki_embed_repo: str = "intfloat/multilingual-e5-small"
+    # [tag_wiki] — local booru wiki mirror (page/summary database plus the
+    # read-only high-frequency tag catalog).
     tag_wiki_min_post_count: int = Field(default=1000, ge=0)
-    # Embedding backend: "local" runs ONNX/PyTorch weights from
-    # data/tag_wiki/models; "openai" calls an OpenAI-compatible embeddings
-    # server (LM Studio at tag_wiki_embed_endpoint) — used for rebuilding the
-    # vectors with a stronger model on the maintainer's machine.
-    tag_wiki_embed_backend: Literal["local", "openai"] = "local"
-    tag_wiki_embed_endpoint: str = "http://127.0.0.1:1234/v1"
-    tag_wiki_embed_api_key: str = ""
-    # Remote model id as served by the endpoint; empty = auto-detect the
-    # first model listed by the server. The *_prefix fields override the
-    # per-model defaults (nomic → search_document:/search_query:, e5 →
-    # passage:/query:, everything else → none).
-    tag_wiki_embed_model: str = ""
-    tag_wiki_embed_passage_prefix: str | None = None
-    tag_wiki_embed_query_prefix: str | None = None
-    # Packaged builds ship pre-built wiki/vector databases: true rejects the
+    # Packaged builds ship pre-built wiki databases: true rejects the
     # /build and /translate endpoints with 403 so end users cannot mutate the
     # bundle. The maintainer sets false locally to run builds.
     tag_wiki_frozen: bool = False

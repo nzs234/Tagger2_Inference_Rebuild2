@@ -22,18 +22,18 @@
 
 基础发行包继续包含构建完成的 **Tag Wiki 数据库**（`data/tag_wiki/`）：
 
-- `tag_wiki.sqlite3`（e621 镜像：页面 / 章节 / 向量 / 中文摘要 / 高频标签目录）
+- `tag_wiki.sqlite3`（e621 镜像：页面 / 章节 / 中文摘要 / 高频标签目录）
 - `tag_wiki_danbooru.sqlite3`（danbooru 镜像，同 schema）
 
 打包时通过 SQLite `VACUUM INTO` 生成干净紧凑的快照（scripts/snapshot_wiki_databases.py），
 解压即用、无需重建语料。两个库同时携带维护端生成的高频标签目录（`catalog_*` 表，仅收录
 `post_count >= 100` 的标签，由 `scripts/build_tag_wiki_catalog.py` 生成）；打包脚本会校验目录
-完整并在冒烟测试中验证 Tag Wiki 页面可用。V1.10.3 起两个库的向量均由 **Qwen3-Embedding-0.6B（ONNX，1024 维）**
-生成；包内同时携带该模型的 tokenizer/config 文件（`data/tag_wiki/models/shawnw3i__Qwen3-Embedding-0.6B-ONNX/`），
-与发行页单独提供的 `Tagger2_Qwen3-Embedding-0.6B-ONNX_model.onnx` 资产配套使用：
-将该文件下载后放入上述目录（重命名为 `model.onnx`）即可启用本地语义检索，无需 LM Studio 或在线服务。
+完整并在冒烟测试中验证 Tag Wiki 页面可用。
 发行包的 `config/app.toml` 在打包阶段强制 `frozen = true`：Wiki 构建/重建/翻译入口对最终用户关闭
 （后端 403、前端隐藏维护面板），数据维护由发布者完成后随包分发。
+说明：V1.10.4 及更早版本的包曾内置向量库并单独提供 Qwen3 嵌入模型权重资产用于本地语义检索；
+自移除嵌入模型栈的版本起，包内不再包含向量数据，也无需下载任何模型资产，Tag Wiki 页面
+（高频标签目录浏览/搜索 + 词条详情）完全离线可用。
 
 资源位于 `data/workflows/resources/`，每个资源都带有独立 manifest 和内容指纹。
 分类快照与 tokenizer 属模型类大文件（合计约 131 MB），自 V1.10 起不随包发行：首次使用时应用自动从

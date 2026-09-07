@@ -9,8 +9,8 @@ import {
 } from '../../lib/tagWiki'
 import { Notice } from '../ui'
 
-// Data maintenance (dump download, reindex, re-embedding, translation) is a
-// maintainer/CLI job; the UI is intentionally read-only status + query.
+// Data maintenance (dump download, reindex, catalog generation, translation)
+// is a maintainer/CLI job; the UI is intentionally read-only status + browse.
 export function BuildPanel({ profile }: { profile: TagWikiProfile }) {
   const [collapsed, setCollapsed] = useState(false)
 
@@ -24,11 +24,11 @@ export function BuildPanel({ profile }: { profile: TagWikiProfile }) {
   const status = statusQuery.data
   const frozen = status?.frozen === true
 
-  // Per-mirror database/index view; the top-level keys mirror e621 for
-  // older backends.
+  // Per-mirror database/catalog view; the top-level database key mirrors
+  // e621 for older backends.
   const profileStatus = status?.profiles?.[profile]
   const db = profileStatus?.database ?? status?.database
-  const idx = profileStatus?.index ?? status?.index
+  const catalog = profileStatus?.catalog
 
   return (
     <div className="tw-build-panel">
@@ -75,12 +75,6 @@ export function BuildPanel({ profile }: { profile: TagWikiProfile }) {
               <strong>{db?.chunks ? db.chunks.toLocaleString('zh-CN') : 0}</strong>
             </div>
             <div className="tw-chip-item">
-              <span className="tw-chip-label">已向量化</span>
-              <strong>
-                {db?.embedded_chunks ? db.embedded_chunks.toLocaleString('zh-CN') : 0}
-              </strong>
-            </div>
-            <div className="tw-chip-item">
               <span className="tw-chip-label">已翻译摘要</span>
               <strong>
                 {db?.translated_pages ? db.translated_pages.toLocaleString('zh-CN') : 0}
@@ -91,9 +85,11 @@ export function BuildPanel({ profile }: { profile: TagWikiProfile }) {
               <strong>{db?.dump_date ?? '未同步'}</strong>
             </div>
             <div className="tw-chip-item">
-              <span className="tw-chip-label">检索状态</span>
-              <strong className={idx?.search_ready ? 'tw-text-success' : 'tw-text-warning'}>
-                {idx?.search_ready ? '就绪' : '未就绪'}
+              <span className="tw-chip-label">标签目录</span>
+              <strong className={catalog?.built ? 'tw-text-success' : 'tw-text-warning'}>
+                {catalog?.built
+                  ? `${(catalog.tag_count ?? 0).toLocaleString('zh-CN')} 个`
+                  : '未生成'}
               </strong>
             </div>
           </div>

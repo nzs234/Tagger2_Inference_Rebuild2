@@ -4,7 +4,7 @@ The importer mirrors the download conventions of ``scripts/`` against
 ``https://e621.net/db_export/`` (a descriptive User-Agent header is required by
 e621), parses the gzipped CSV lazily, and feeds normalized pages into
 :class:`~tagger2.tag_wiki.wiki_store.WikiStore`. Because the store rewrites all
-chunks (dropping their embeddings) on every ``upsert_page``, the importer
+chunks on every ``upsert_page``, the importer
 implements the incremental logic itself: a dump row whose stored ``updated_at``
 and raw body are unchanged is skipped entirely.
 
@@ -367,7 +367,7 @@ _WORD_RE = re.compile(r"[A-Za-z0-9]{2,}")
 
 
 def _is_substantive(text: str, min_chars: int) -> bool:
-    """Whether one chunk carries enough content to be worth embedding.
+    """Whether one chunk carries enough content to be worth keeping.
 
     A chunk must reach ``min_chars`` characters AND contain at least three
     word-like tokens. This drops the degenerate fragments that made up ~8% of
@@ -395,7 +395,7 @@ def parse_dtext_sections(
     are split at paragraph boundaries (``\\n\\n``; an oversized single paragraph
     is hard-split) keeping the same heading, and empty-text sections are
     dropped. Chunks shorter than ``min_chunk_chars`` are dropped as well: tiny
-    fragments embed into degenerate vectors that pollute semantic search
+    fragments are degenerate content that pollutes section reading
     (pass ``min_chunk_chars=0`` to keep everything).
     """
 

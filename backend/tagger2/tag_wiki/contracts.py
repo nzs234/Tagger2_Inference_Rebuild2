@@ -18,8 +18,6 @@ dependency):
 - ``POST /translate`` (202)       -> :class:`TranslateStatusDict`
 - ``GET  /translate/progress``    -> :class:`TranslateStatusDict`
 - ``GET  /lookup?tag=&profile=``  -> :class:`LookupDict`
-- ``POST /search``                -> :class:`SearchDict`
-- ``POST /ask``                   -> :class:`AskDict`
 - ``GET  /page/{title}``          -> :class:`PageDict`
 - ``GET  /catalog/categories``    -> :class:`CatalogCategoriesDict`
 - ``GET  /catalog/tags``          -> :class:`CatalogBrowseDict`
@@ -33,9 +31,7 @@ They are maintained by ``scripts/build_tag_wiki_catalog.py`` and answer 409
 Errors use the app-wide shape ``{code, message, fields, request_id,
 retryable}``. Notable codes: ``wiki_not_built`` (409, no wiki database yet),
 ``wiki_busy`` (409, a build or translate run is already active),
-``wiki_embed_model_unavailable`` (409, the embedding model must be downloaded),
-``wiki_search_unavailable`` (409, chunks exist but none are embedded),
-``wiki_ask_unavailable`` (409, no online provider configured),
+``wiki_ask_unavailable`` (409, no online provider configured for translate),
 ``wiki_tag_db_unavailable`` (409, the classification snapshot is missing),
 ``wiki_catalog_missing`` (409, the tag catalog has not been generated yet) and
 ``wiki_catalog_tag_not_found`` (404, a requested catalog tag does not exist).
@@ -49,12 +45,8 @@ from pydantic import BaseModel, ConfigDict, Field
 
 TagWikiProfile = Literal["e621", "danbooru"]
 
-# The embedding model is downloaded through the Hugging Face Hub into
-# ``data/tag_wiki/models/<repo>``; see embedder.py for the onnx/torch fallback.
-DEFAULT_EMBED_MODEL_REPO = "intfloat/multilingual-e5-small"
-
-# Chunk text is capped at this many characters (a section longer than the cap
-# is split into paragraph chunks) so e5's 512-token window is not truncated.
+# Chunk text is capped at this many characters (a section longer than the
+# cap is split into paragraph chunks at import time).
 MAX_CHUNK_CHARS = 1200
 
 # Chunks shorter than this are dropped at import time (together with a
@@ -67,14 +59,11 @@ MIN_CHUNK_CHARS = 16
 # Error codes shared by the service and the frontend.
 ERROR_WIKI_NOT_BUILT = "wiki_not_built"
 ERROR_WIKI_BUSY = "wiki_busy"
-ERROR_WIKI_EMBED_MODEL_UNAVAILABLE = "wiki_embed_model_unavailable"
-ERROR_WIKI_SEARCH_UNAVAILABLE = "wiki_search_unavailable"
 ERROR_WIKI_ASK_UNAVAILABLE = "wiki_ask_unavailable"
 ERROR_WIKI_TAG_DB_UNAVAILABLE = "wiki_tag_db_unavailable"
 ERROR_WIKI_PAGE_NOT_FOUND = "wiki_page_not_found"
 ERROR_WIKI_LOOKUP_FAILED = "wiki_lookup_failed"
 ERROR_WIKI_SEARCH_FAILED = "wiki_search_failed"
-ERROR_WIKI_ASK_FAILED = "wiki_ask_failed"
 ERROR_WIKI_BUILD_FAILED = "wiki_build_failed"
 ERROR_WIKI_TRANSLATE_FAILED = "wiki_translate_failed"
 ERROR_WIKI_FROZEN = "wiki_frozen"
@@ -105,11 +94,8 @@ class BuildRequest(BaseModel):
     # build reuses the newest dump file already cached under
     # ``data/tag_wiki/downloads/`` (if any).
     download_dump: bool = True
-    # Re-import pages from the dump (incremental by updated_at) and rebuild
-    # missing embeddings/FTS rows.
+    # Re-import pages from the dump (incremental by updated_at).
     reindex: bool = True
-    # Re-embed every chunk even when its content hash is unchanged.
-    force_reembed: bool = False
 
 
 class TranslateRequest(BaseModel):
@@ -132,28 +118,6 @@ class TranslateRequest(BaseModel):
     concurrency: int = Field(default=4, ge=1, le=12)
     provider_id: str | None = Field(default=None, max_length=128)
     model: str | None = Field(default=None, max_length=256)
-
-
-class SearchRequest(BaseModel):
-    """Semantic + keyword search over wiki chunks."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    query: str = Field(min_length=1, max_length=2000)
-    top_k: int = Field(default=8, ge=1, le=50)
-    profile: TagWikiProfile = "e621"
-
-
-class AskRequest(BaseModel):
-    """Retrieval-augmented question over the local wiki."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    query: str = Field(min_length=1, max_length=2000)
-    top_k: int = Field(default=8, ge=1, le=50)
-    provider_id: str | None = Field(default=None, max_length=128)
-    model: str | None = Field(default=None, max_length=256)
-    profile: TagWikiProfile = "e621"
 
 
 # -- shared response shapes -------------------------------------------------
@@ -209,42 +173,11 @@ class LookupDict(TypedDict):
     page: WikiPageInfo | None
 
 
-class ChunkHit(TypedDict):
-    """One retrieved wiki chunk."""
-
-    page_title: str
-    heading: str
-    text: str
-    score: float
-    matched_by: list[str]
-    summary: WikiSummaryInfo | None
-    tag: TagRef | None
-
-
-class SearchDict(TypedDict):
-    """Response of ``POST /search``."""
-
-    query: str
-    items: list[ChunkHit]
-    suggested_tags: list[TagRef]
-
-
-class AskDict(TypedDict):
-    """Response of ``POST /ask``."""
-
-    query: str
-    answer: str
-    tags: list[str]
-    provider_id: str
-    model: str
-    sources: list[str]
-
-
 class BuildStatusDict(TypedDict, total=False):
     """Build pipeline status as reported by ``GET /status``."""
 
     state: Literal["idle", "running", "error"]
-    phase: Literal["idle", "download", "parse", "model", "embed", "done"]
+    phase: Literal["idle", "download", "parse", "done"]
     message: str
     started_at: str | None
     updated_at: str | None
@@ -380,8 +313,6 @@ class CatalogMetaDict(TypedDict, total=False):
 
 
 __all__ = [
-    "AskDict",
-    "AskRequest",
     "BuildRequest",
     "BuildStatusDict",
     "CATALOG_DEFAULT_PAGE_SIZE",
@@ -395,29 +326,22 @@ __all__ = [
     "CatalogRelationItem",
     "CatalogTagDetailDict",
     "CatalogTagItem",
-    "ChunkHit",
-    "DEFAULT_EMBED_MODEL_REPO",
-    "ERROR_WIKI_ASK_FAILED",
     "ERROR_WIKI_ASK_UNAVAILABLE",
     "ERROR_WIKI_BUILD_FAILED",
     "ERROR_WIKI_BUSY",
     "ERROR_WIKI_CATALOG_MISSING",
     "ERROR_WIKI_CATALOG_TAG_NOT_FOUND",
-    "ERROR_WIKI_EMBED_MODEL_UNAVAILABLE",
     "ERROR_WIKI_FROZEN",
     "ERROR_WIKI_LOOKUP_FAILED",
     "ERROR_WIKI_NOT_BUILT",
     "ERROR_WIKI_PAGE_NOT_FOUND",
     "ERROR_WIKI_SEARCH_FAILED",
-    "ERROR_WIKI_SEARCH_UNAVAILABLE",
     "ERROR_WIKI_TAG_DB_UNAVAILABLE",
     "ERROR_WIKI_TRANSLATE_FAILED",
     "LookupDict",
     "MAX_CHUNK_CHARS",
     "MIN_CHUNK_CHARS",
     "PageSection",
-    "SearchDict",
-    "SearchRequest",
     "StatusDict",
     "TagRef",
     "TagWikiProfile",

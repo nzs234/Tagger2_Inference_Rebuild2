@@ -187,14 +187,14 @@ def test_skip_reindex_help_documents_real_semantics() -> None:
 @pytest.mark.parametrize(
     "argv,expected",
     [
-        (["--build"], dict(download_dump=True, reindex=True, force_reembed=False)),
+        (["--build"], dict(download_dump=True, reindex=True)),
         (
             ["--build", "--skip-reindex"],
-            dict(download_dump=True, reindex=False, force_reembed=False),
+            dict(download_dump=True, reindex=False),
         ),
         (
-            ["--build", "--no-download", "--force-reembed"],
-            dict(download_dump=False, reindex=True, force_reembed=True),
+            ["--build", "--no-download"],
+            dict(download_dump=False, reindex=True),
         ),
     ],
 )
@@ -204,11 +204,9 @@ def test_flags_map_to_build_request(argv: list[str], expected: dict[str, Any]) -
     request = BuildRequest(
         download_dump=not args.no_download,
         reindex=not args.skip_reindex,
-        force_reembed=args.force_reembed,
     )
     assert request.download_dump is expected["download_dump"]
     assert request.reindex is expected["reindex"]
-    assert request.force_reembed is expected["force_reembed"]
 
 
 # -- build command ---------------------------------------------------------------

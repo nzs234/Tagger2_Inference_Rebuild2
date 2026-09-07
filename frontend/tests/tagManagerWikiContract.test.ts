@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { ApiError } from '../src/lib/api'
 import { tagManagerApi } from '../src/lib/tagManager'
-import { describeWikiError, tagWikiApi, type LookupResult, type SearchResult, type TagWikiStatus } from '../src/lib/tagWiki'
+import { describeWikiError, tagWikiApi, type LookupResult, type TagWikiStatus } from '../src/lib/tagWiki'
 
 /**
  * Contract tests for the tag-manager / tag-wiki HTTP boundary.
@@ -57,58 +57,18 @@ const BACKEND_LOOKUP: LookupResult = {
   },
 }
 
-const BACKEND_SEARCH: SearchResult = {
-  query: 'hugging',
-  items: [
-    {
-      page_title: 'hug',
-      heading: 'Usage',
-      text: 'Use for hugging.',
-      score: 1,
-      matched_by: ['keyword'],
-      summary: null,
-      tag: { name: 'hug', category: 'general', post_count: 500, alias_of: null, translation: '拥抱' },
-    },
-  ],
-  suggested_tags: [
-    { name: 'hug', category: 'general', post_count: 500, alias_of: null, translation: '拥抱' },
-  ],
-}
-
 const BACKEND_STATUS: TagWikiStatus = {
   profiles: {
     e621: {
-      database: { exists: true, pages: 2, chunks: 2, embedded_chunks: 0, translated_pages: 0, dump_date: null },
-      index: {
-        embedding_model: 'intfloat/multilingual-e5-small',
-        embedding_model_ready: false,
-        dimension: null,
-        fts_enabled: true,
-        search_ready: true,
-        min_post_count: 1000,
-      },
+      database: { exists: true, pages: 2, chunks: 2, translated_pages: 0, dump_date: null },
+      catalog: { built: true, tag_count: 49891, relation_count: 235561, min_post_count: 100, generated_at: null },
     },
     danbooru: {
-      database: { exists: true, pages: 1, chunks: 1, embedded_chunks: 0, translated_pages: 0, dump_date: null },
-      index: {
-        embedding_model: 'intfloat/multilingual-e5-small',
-        embedding_model_ready: false,
-        dimension: null,
-        fts_enabled: true,
-        search_ready: true,
-        min_post_count: 1000,
-      },
+      database: { exists: true, pages: 1, chunks: 1, translated_pages: 0, dump_date: null },
+      catalog: { built: true, tag_count: 77576, relation_count: 308906, min_post_count: 100, generated_at: null },
     },
   },
-  database: { exists: true, pages: 2, chunks: 2, embedded_chunks: 0, translated_pages: 0, dump_date: null },
-  index: {
-    embedding_model: 'intfloat/multilingual-e5-small',
-    embedding_model_ready: false,
-    dimension: null,
-    fts_enabled: true,
-    search_ready: true,
-    min_post_count: 1000,
-  },
+  database: { exists: true, pages: 2, chunks: 2, translated_pages: 0, dump_date: null },
   build: { state: 'idle', phase: 'done', message: '构建完成', started_at: null, updated_at: null, error: null },
   translate: {
     state: 'idle', done: 0, failed: 0, total: 0, provider_id: '', model: '',
@@ -152,11 +112,7 @@ describe('shared error envelope handling', () => {
       'wiki_not_built',
       'wiki_busy',
       'wiki_ask_unavailable',
-      'wiki_search_unavailable',
-      'wiki_embed_model_unavailable',
       'wiki_tag_db_unavailable',
-      'wiki_ask_failed',
-      'wiki_search_failed',
       'wiki_lookup_failed',
     ] as const
     for (const code of codes) {
@@ -190,24 +146,6 @@ describe('backend response shapes satisfy the typed clients', () => {
     expect(lookup.page?.summary?.meaning).toContain('一个主体')
   })
 
-  it('consumes the wiki search contract (ChunkHit + suggested TagRefs)', async () => {
-    vi.stubGlobal('fetch', vi.fn().mockImplementation(async (_input: RequestInfo | URL, init?: RequestInit) => {
-      expect(init?.method).toBe('POST')
-      // Defaults (top_k/profile) are applied server-side and stay off the wire.
-      expect(JSON.parse(init?.body as string)).toEqual({ query: 'hugging' })
-      return jsonResponse(BACKEND_SEARCH)
-    }))
-
-    const search = await tagWikiApi.search({ query: 'hugging' })
-
-    // Explicit length guard + non-null assertion (noUncheckedIndexedAccess).
-    expect(search.items).toHaveLength(1)
-    const hit = search.items[0]!
-    expect(hit.matched_by).toContain('keyword')
-    expect(hit.tag?.translation).toBe('拥抱')
-    expect(search.suggested_tags[0]?.name).toBe('hug')
-  })
-
   it('consumes the wiki status contract with per-profile documents', async () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(jsonResponse(BACKEND_STATUS)))
 
@@ -216,7 +154,8 @@ describe('backend response shapes satisfy the typed clients', () => {
     expect(Object.keys(status.profiles ?? {}).sort()).toEqual(['danbooru', 'e621'])
     // Backward-compatible top-level e621 view stays aligned with profiles.e621.
     expect(status.database).toEqual(status.profiles?.e621?.database)
-    expect(status.index.search_ready).toBe(true)
+    expect(status.profiles?.e621?.catalog?.built).toBe(true)
+    expect(status.profiles?.danbooru?.catalog?.tag_count).toBeGreaterThan(0)
     expect(status.build.phase).toBe('done')
     expect(status.translate.state).toBe('idle')
   })

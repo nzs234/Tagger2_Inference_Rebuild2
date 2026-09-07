@@ -54,33 +54,8 @@ export interface LookupResult {
   page: WikiPageInfo | null
 }
 
-export interface ChunkHit {
-  page_title: string
-  heading: string
-  text: string
-  score: number
-  matched_by: ('vector' | 'keyword' | string)[]
-  summary: WikiSummaryInfo | null
-  tag: TagRef | null
-}
-
-export interface SearchResult {
-  query: string
-  items: ChunkHit[]
-  suggested_tags: TagRef[]
-}
-
-export interface AskResult {
-  query: string
-  answer: string
-  tags: string[]
-  provider_id: string
-  model: string
-  sources: string[]
-}
-
 export type BuildState = 'idle' | 'running' | 'error'
-export type BuildPhase = 'idle' | 'download' | 'parse' | 'model' | 'embed' | 'done'
+export type BuildPhase = 'idle' | 'download' | 'parse' | 'done'
 
 export interface BuildStatus {
   state: BuildState
@@ -112,32 +87,28 @@ export interface WikiDatabaseStatus {
   exists: boolean
   pages: number
   chunks: number
-  embedded_chunks: number
   translated_pages: number
   dump_date: string | null
 }
 
-export interface WikiIndexStatus {
-  embedding_model: string
-  embedding_backend?: 'local' | 'openai'
-  embedding_model_ready: boolean
-  dimension: number | null
-  fts_enabled: boolean
-  search_ready: boolean
-  min_post_count?: number
+export interface WikiCatalogStatus {
+  built: boolean
+  tag_count: number
+  relation_count: number
+  min_post_count?: number | null
+  generated_at?: string | null
 }
 
 export interface TagWikiProfileStatus {
   database: WikiDatabaseStatus
-  index: WikiIndexStatus
+  catalog?: WikiCatalogStatus
 }
 
 export interface TagWikiStatus {
-  /** Per-mirror database/index documents; keys follow TagWikiProfile. */
+  /** Per-mirror database/catalog documents; keys follow TagWikiProfile. */
   profiles?: Partial<Record<TagWikiProfile, TagWikiProfileStatus>>
   /** Backward-compatible top-level view of the e621 profile. */
   database: WikiDatabaseStatus
-  index: WikiIndexStatus
   build: BuildStatus
   translate: TranslateStatus
   /** Finished-product mode: bundled databases are read-only, build/translate
@@ -149,7 +120,6 @@ export interface BuildRequest {
   profile?: TagWikiProfile
   download_dump?: boolean
   reindex?: boolean
-  force_reembed?: boolean
 }
 
 export interface TranslateRequest {
@@ -161,20 +131,6 @@ export interface TranslateRequest {
   concurrency?: number
   provider_id?: string
   model?: string
-}
-
-export interface SearchRequest {
-  query: string
-  top_k?: number
-  profile?: TagWikiProfile
-}
-
-export interface AskRequest {
-  query: string
-  top_k?: number
-  provider_id?: string
-  model?: string
-  profile?: TagWikiProfile
 }
 
 // --- Tag Catalog (read-only booru-style tag directory; schema v2) ---
@@ -255,14 +211,10 @@ export interface CatalogBrowseParams {
 
 /** Human-readable Chinese guidance per shared wiki error code. */
 const WIKI_ERROR_GUIDANCE: Record<string, string> = {
-  wiki_not_built: 'Wiki 数据库尚未构建。请前往「Tag Wiki」页面在构建面板中点击「下载/更新 Wiki 数据」。',
+  wiki_not_built: 'Wiki 数据库尚未构建：数据由维护者通过 CLI 构建后随包分发。',
   wiki_busy: '已有构建或翻译任务正在进行中，请等待其完成后再试。',
-  wiki_ask_unavailable: '未配置或启用在线模型：AI 问答需要在线 LLM Provider。请前往「在线模型」页面配置。',
-  wiki_search_unavailable: '检索未就绪：尚未生成向量索引。请在构建面板重新构建索引。',
-  wiki_embed_model_unavailable: 'Embedding 向量模型不可用，请检查本地模型缓存或网络连接。',
+  wiki_ask_unavailable: '未配置或启用在线模型：中文摘要翻译需要在线 LLM Provider。请前往「在线模型」页面配置。',
   wiki_tag_db_unavailable: '本地标签数据库缺失，无法解析标签分类。请先完成标签库构建后再试。',
-  wiki_ask_failed: 'AI 生成失败，请稍后重试或更换在线模型。',
-  wiki_search_failed: '检索失败，请稍后重试。',
   wiki_lookup_failed: '查询失败，请稍后重试。',
   wiki_catalog_missing: '标签目录尚未生成：请由维护者运行 scripts/build_tag_wiki_catalog.py 生成目录数据。',
   wiki_catalog_tag_not_found: '标签目录中没有这个标签（可能低于 100 posts 的收录阈值）。',
@@ -309,18 +261,6 @@ export const tagWikiApi = {
     search.set('profile', profile)
     return request<LookupResult>(`/tag-wiki/lookup?${search.toString()}`)
   },
-
-  search: (body: SearchRequest) =>
-    request<SearchResult>('/tag-wiki/search', {
-      method: 'POST',
-      body: JSON.stringify(body),
-    }),
-
-  ask: (body: AskRequest) =>
-    request<AskResult>('/tag-wiki/ask', {
-      method: 'POST',
-      body: JSON.stringify(body),
-    }),
 
   page: (title: string, profile: TagWikiProfile = 'e621') => {
     const search = new URLSearchParams()

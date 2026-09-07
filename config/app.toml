@@ -29,6 +29,3 @@ allow_unsafe_pickle = false
 
 [tag_wiki]
 frozen = false
-# 本地 Qwen3-Embedding-0.6B ONNX 模型（开发端重建与用户端查询使用同一模型）
-embed_backend = "local"
-embed_model_repo = "shawnw3i/Qwen3-Embedding-0.6B-ONNX"

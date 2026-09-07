@@ -175,31 +175,43 @@ def seed_e621_catalog(store: WikiStore) -> None:
 # -- store: schema migration -------------------------------------------------
 
 
-def test_fresh_store_gets_v2_and_catalog_tables(tmp_path: Path) -> None:
+def test_fresh_store_gets_v3_and_catalog_tables(tmp_path: Path) -> None:
     store = WikiStore(tmp_path / "wiki.sqlite3")
     with store.connection() as conn:
         version = int(conn.execute(
             "SELECT version FROM schema_migrations ORDER BY version DESC LIMIT 1"
         ).fetchone()["version"])
-    assert version == 2
+        chunk_columns = {row[1] for row in conn.execute("PRAGMA table_info(chunks)")}
+        tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    assert version == 3
+    assert "embedding" not in chunk_columns
+    assert "chunks_fts" not in tables
     assert store.catalog_built() is False
     assert store.catalog_tag_count() == 0
     assert store.catalog_relation_count() == 0
     store.close()
 
 
-def test_v1_database_migrates_to_v2_without_losing_pages(tmp_path: Path) -> None:
-    """A v1 file upgrades additively: pages survive, catalog tables appear."""
+def test_v1_database_migrates_to_v3_without_losing_pages(tmp_path: Path) -> None:
+    """A v1 file upgrades in steps: pages survive, catalog tables appear and
+    the retired vector structures are dropped."""
 
     path = tmp_path / "wiki.sqlite3"
     store = WikiStore(path)
     _page(store, "hug", links=["kiss"])
     store.upsert_summary("hug", {"meaning": "拥抱"})
-    # Simulate a real v1 database: drop the v2 tables and rewind the marker.
+    # Simulate a real v1 database: drop the v2 tables, restore the retired
+    # vector structures and rewind the marker.
     with store.connection() as conn:
         conn.execute("DROP TABLE catalog_relations")
         conn.execute("DROP TABLE catalog_tags")
         conn.execute("DROP TABLE catalog_meta")
+        conn.execute("DROP TRIGGER IF EXISTS chunks_ai")
+        conn.execute("DROP TRIGGER IF EXISTS chunks_ad")
+        conn.execute("DROP TRIGGER IF EXISTS chunks_au")
+        conn.execute("DROP TABLE IF EXISTS chunks_fts")
+        conn.execute("ALTER TABLE chunks ADD COLUMN embedding BLOB")
+        conn.execute("INSERT INTO meta (key, value) VALUES ('embedding_dim', '1024')")
         conn.execute("DELETE FROM schema_migrations")
         conn.execute(
             "INSERT INTO schema_migrations (version, checksum, applied_at)"
@@ -215,8 +227,14 @@ def test_v1_database_migrates_to_v2_without_losing_pages(tmp_path: Path) -> None
         remaining = conn.execute(
             "SELECT COUNT(*) FROM schema_migrations WHERE version = 1"
         ).fetchone()[0]
-    assert version == 2
+        chunk_columns = {row[1] for row in conn.execute("PRAGMA table_info(chunks)")}
+        tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        meta_keys = {row[0] for row in conn.execute("SELECT key FROM meta")}
+    assert version == 3
     assert remaining == 1  # the v1 marker row is preserved history
+    assert "embedding" not in chunk_columns
+    assert "chunks_fts" not in tables
+    assert "embedding_dim" not in meta_keys
     assert reopened.catalog_built() is False
     page = reopened.get_page("hug")
     assert page is not None and page["summary"]["meaning"] == "拥抱"
