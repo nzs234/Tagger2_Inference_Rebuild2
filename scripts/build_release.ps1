@@ -173,6 +173,7 @@ try {
       "frontend_lint",
       "frontend_build",
       "playwright",
+      "release_catalog_check",
       "release_bootstrap_smoke",
       "release_health_smoke",
       "release_image_capability_smoke"
@@ -298,6 +299,61 @@ try {
     --data-dir (Join-Path $root "data") `
     --dest $wikiDbStage
   if ($LASTEXITCODE -ne 0) { throw "Could not snapshot the wiki databases" }
+
+  # The staged databases must carry the high-frequency tag catalog (the
+  # browse UI's only data source). A maintainer who rebuilt the wiki corpus
+  # but skipped scripts/build_tag_wiki_catalog.py would otherwise ship a
+  # package whose Tag Wiki page answers 409 wiki_catalog_missing.
+  & $gatePython -c @'
+import sqlite3
+import sys
+from pathlib import Path
+
+data_dir = Path(sys.argv[1])
+failures = []
+for name in ("tag_wiki.sqlite3", "tag_wiki_danbooru.sqlite3"):
+    conn = sqlite3.connect(data_dir / name)
+    try:
+        tables = {
+            row[0]
+            for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        }
+        if not {"catalog_tags", "catalog_relations", "catalog_meta"} <= tables:
+            failures.append(f"{name}: catalog tables missing; run scripts/build_tag_wiki_catalog.py")
+            continue
+        tag_count = conn.execute("SELECT COUNT(*) FROM catalog_tags").fetchone()[0]
+        if tag_count == 0:
+            failures.append(f"{name}: catalog is empty; run scripts/build_tag_wiki_catalog.py")
+            continue
+        below_100 = conn.execute(
+            "SELECT COUNT(*) FROM catalog_tags WHERE post_count < 100"
+        ).fetchone()[0]
+        if below_100:
+            failures.append(f"{name}: {below_100} catalog tags below post_count 100")
+        meta = dict(conn.execute("SELECT key, value FROM catalog_meta").fetchall())
+        threshold = int(meta.get("min_post_count") or 0)
+        if threshold < 100:
+            failures.append(f"{name}: catalog min_post_count is {threshold}, below the required 100")
+        below_meta = conn.execute(
+            "SELECT COUNT(*) FROM catalog_tags WHERE post_count < ?", (threshold,)
+        ).fetchone()[0]
+        if below_meta:
+            failures.append(f"{name}: {below_meta} catalog tags below their own threshold {threshold}")
+        dangling = conn.execute(
+            "SELECT COUNT(*) FROM catalog_relations r"
+            " WHERE r.tag_name NOT IN (SELECT name FROM catalog_tags)"
+            " OR r.related_name NOT IN (SELECT name FROM catalog_tags)"
+        ).fetchone()[0]
+        if dangling:
+            failures.append(f"{name}: {dangling} catalog relations point outside the catalog")
+        print(f"release catalog check: {name}: {tag_count} tags, threshold {threshold}")
+    finally:
+        conn.close()
+if failures:
+    print("; ".join(failures), file=sys.stderr)
+    sys.exit(1)
+'@ $wikiDbStage
+  if ($LASTEXITCODE -ne 0) { throw "Staged wiki databases failed the tag-catalog check" }
 
   # The shipped app.toml mirrors the maintainer's working config; the packaged
   # build must always be read-only for end users: frozen=true rejects the
@@ -480,6 +536,20 @@ try {
     try {
       & $python -c "from fastapi.testclient import TestClient; from tagger2.main import app; c=TestClient(app); r=c.get('/api/v1/health'); assert r.status_code == 200, (r.status_code, r.text); image=c.get('/api/v1/image-generation/capabilities'); assert image.status_code == 200, (image.status_code, image.text); assert image.json().get('schema_version') == 'image-capabilities-v1'; print('release smoke: health and image capabilities 200')"
       if ($LASTEXITCODE -ne 0) { throw "Release smoke test failed with exit code $LASTEXITCODE" }
+      & $python -c @'
+from fastapi.testclient import TestClient
+from tagger2.main import app
+
+client = TestClient(app)
+for profile in ("e621", "danbooru"):
+    response = client.get("/api/v1/tag-wiki/catalog/categories", params={"profile": profile})
+    assert response.status_code == 200, (profile, response.status_code, response.text[:200])
+    payload = response.json()
+    assert payload.get("categories"), (profile, "catalog categories are empty")
+    assert payload.get("tag_count", 0) > 0, (profile, "catalog tag_count is zero")
+print("release smoke: tag-wiki catalog serves both profiles")
+'@
+      if ($LASTEXITCODE -ne 0) { throw "Release catalog smoke test failed with exit code $LASTEXITCODE" }
     } finally {
       Pop-Location
       Remove-Item Env:PYTHONPATH -ErrorAction SilentlyContinue

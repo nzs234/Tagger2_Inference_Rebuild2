@@ -91,6 +91,8 @@ runtime\python.exe scripts\build_tag_wiki_catalog.py --status            :: 查�
 3. 组合关系（**不做在线共现抓取**）：tag-database implications（正向入库、查询时反查反向）+ 本地 wiki `page_links`；关系两端都必须在目录内，UI 上的关联标签必然可点且高频。
 4. 单事务整体重建（`WikiStore.replace_catalog`）并写入 meta（阈值、taxonomy version、生成时间、数量统计）；可重复执行，wiki 正文/向量/摘要永不被触碰。
 
+**维护顺序**：每次重建 wiki 语料（`build_tag_wiki.py`）或分类快照后，发行前必须重跑本 CLI 生成目录。`scripts/build_release.ps1` 会在打包阶段校验两个 staged 库的目录（表存在、非空、无 `post_count < 100` 的标签、meta 阈值 ≥ 100、无目录外关系端点），并在冒烟测试中对两个 profile 调用 `/catalog/categories`——目录缺失或过低频会直接终止打包。
+
 目录 API（同 `/api/v1/tag-wiki` 前缀，只读，frozen 模式可用）：
 
 | 方法 | 路径 | 说明 |

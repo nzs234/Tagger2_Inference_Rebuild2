@@ -22,11 +22,13 @@
 
 基础发行包继续包含构建完成的 **Tag Wiki 数据库**（`data/tag_wiki/`）：
 
-- `tag_wiki.sqlite3`（e621 镜像：页面 / 章节 / 向量 / 中文摘要）
+- `tag_wiki.sqlite3`（e621 镜像：页面 / 章节 / 向量 / 中文摘要 / 高频标签目录）
 - `tag_wiki_danbooru.sqlite3`（danbooru 镜像，同 schema）
 
 打包时通过 SQLite `VACUUM INTO` 生成干净紧凑的快照（scripts/snapshot_wiki_databases.py），
-解压即用、无需重建语料。V1.10.3 起两个库的向量均由 **Qwen3-Embedding-0.6B（ONNX，1024 维）**
+解压即用、无需重建语料。两个库同时携带维护端生成的高频标签目录（`catalog_*` 表，仅收录
+`post_count >= 100` 的标签，由 `scripts/build_tag_wiki_catalog.py` 生成）；打包脚本会校验目录
+完整并在冒烟测试中验证 Tag Wiki 页面可用。V1.10.3 起两个库的向量均由 **Qwen3-Embedding-0.6B（ONNX，1024 维）**
 生成；包内同时携带该模型的 tokenizer/config 文件（`data/tag_wiki/models/shawnw3i__Qwen3-Embedding-0.6B-ONNX/`），
 与发行页单独提供的 `Tagger2_Qwen3-Embedding-0.6B-ONNX_model.onnx` 资产配套使用：
 将该文件下载后放入上述目录（重命名为 `model.onnx`）即可启用本地语义检索，无需 LM Studio 或在线服务。
