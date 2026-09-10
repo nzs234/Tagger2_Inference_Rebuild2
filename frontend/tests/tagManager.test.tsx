@@ -76,6 +76,7 @@ interface HarnessState {
   undoCalls: number
   redoCalls: number
   deleteCalls: number
+  cancelCalls: number
   tagDbQueries: string[]
   imageQueries: string[]
   detail: TagManagerImageDetail
@@ -176,6 +177,15 @@ function setupFetch(state: HarnessState) {
       return json({ items: state.sessions })
     }
     if (/\/tag-manager\/datasets\/ds-1\/refresh$/.test(path)) return json({ ...session, status: 'indexing' }, 202)
+    if (/\/tag-manager\/datasets\/ds-1\/cancel$/.test(path)) {
+      // Cancelling settles the scan immediately: the session keeps whatever was
+      // already indexed and becomes ready again.
+      state.cancelCalls += 1
+      state.sessions = state.sessions.map((item) => (
+        item.id === 'ds-1' ? { ...item, status: 'ready' as const } : item
+      ))
+      return json(state.sessions.find((item) => item.id === 'ds-1'))
+    }
     if (/\/tag-manager\/datasets\/ds-1\/batch\/preview$/.test(path)) {
       return json(state.previewResult)
     }
@@ -260,6 +270,7 @@ describe('TagManager page', () => {
       undoCalls: 0,
       redoCalls: 0,
       deleteCalls: 0,
+      cancelCalls: 0,
       tagDbQueries: [],
       imageQueries: [],
       detail: { ...detail },
@@ -379,6 +390,8 @@ describe('TagManager page', () => {
     const tagInput = screen.getByRole('combobox', { name: '批量标签' })
     fireEvent.change(tagInput, { target: { value: '1g' } })
     await screen.findByRole('option', { name: /1girl/ })
+    // Enter alone commits the typed text; the arrow key picks the suggestion.
+    fireEvent.keyDown(tagInput, { key: 'ArrowDown' })
     fireEvent.keyDown(tagInput, { key: 'Enter' })
     expect(screen.getByRole('button', { name: '移除 1girl' })).toBeInTheDocument()
 
@@ -420,6 +433,30 @@ describe('TagManager page', () => {
     expect(screen.getByRole('button', { name: '撤销' })).toBeDisabled()
     expect(screen.getByRole('button', { name: '重做' })).toBeDisabled()
     expect(screen.getByRole('button', { name: '刷新' })).toBeDisabled()
+  })
+
+  it('shows the scanned count while indexing and cancels the scan', async () => {
+    state.sessions = [{ ...session, status: 'indexing', scanned_count: 12 }]
+    setupFetch(state)
+    renderPage()
+
+    expect(await screen.findByText('正在索引图片（已扫描 12 张）…')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '取消扫描' })).toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: '取消扫描' }))
+    await waitFor(() => expect(state.cancelCalls).toBe(1))
+    expect(await screen.findByText('已取消扫描')).toBeInTheDocument()
+    // The session settled back to ready: progress copy and cancel control go.
+    await waitFor(() => expect(screen.queryByRole('button', { name: '取消扫描' })).not.toBeInTheDocument())
+    expect(screen.queryByText('正在索引图片（已扫描 12 张）…')).not.toBeInTheDocument()
+  })
+
+  it('offers no cancel control once the session is ready', async () => {
+    setupFetch(state)
+    renderPage()
+    await screen.findByAltText('a.png')
+
+    expect(screen.queryByRole('button', { name: '取消扫描' })).not.toBeInTheDocument()
   })
 
   it('adds a high-frequency tag to the include filter from the stats panel', async () => {
@@ -584,6 +621,7 @@ describe('TagManager page', () => {
     const tagInput = screen.getByRole('combobox', { name: '批量标签' })
     fireEvent.change(tagInput, { target: { value: '1g' } })
     await screen.findByRole('option', { name: /1girl/ })
+    fireEvent.keyDown(tagInput, { key: 'ArrowDown' })
     fireEvent.keyDown(tagInput, { key: 'Enter' })
     fireEvent.click(screen.getByRole('button', { name: '执行' }))
     const previewDialog = await screen.findByRole('alertdialog', { name: '批量操作预览' })
@@ -930,6 +968,7 @@ describe('TagManager page', () => {
     const tagInput = screen.getByRole('combobox', { name: '批量标签' })
     fireEvent.change(tagInput, { target: { value: '1g' } })
     await screen.findByRole('option', { name: /1girl/ })
+    fireEvent.keyDown(tagInput, { key: 'ArrowDown' })
     fireEvent.keyDown(tagInput, { key: 'Enter' })
     fireEvent.click(screen.getByRole('button', { name: '执行' }))
     fireEvent.click(await screen.findByRole('button', { name: '确认执行' }))
@@ -1184,6 +1223,35 @@ describe('TagManager page', () => {
     expect(state.patchBodies).toHaveLength(0)
   })
 
+  it('resets the batch form when the active session changes', async () => {
+    state.sessions = [session, { ...session, id: 'ds-2', name: 'dogs', relative_path: 'dogs' }]
+    setupFetch(state)
+    renderPage()
+    await screen.findByAltText('a.png')
+
+    // Stage a non-default batch against ds-1: replace op, a tag, an explicit
+    // scope pick — exactly the residue that must not survive a switch.
+    fireEvent.change(screen.getByRole('combobox', { name: '批量操作类型' }), { target: { value: 'replace' } })
+    const tagInput = screen.getByRole('combobox', { name: '批量标签' })
+    fireEvent.change(tagInput, { target: { value: '1g' } })
+    await screen.findByRole('option', { name: /1girl/ })
+    fireEvent.keyDown(tagInput, { key: 'ArrowDown' })
+    fireEvent.keyDown(tagInput, { key: 'Enter' })
+    expect(screen.getByRole('button', { name: '移除 1girl' })).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: '选中图片（0）' }))
+    expect(screen.getByRole('button', { name: '选中图片（0）' })).toHaveAttribute('aria-pressed', 'true')
+
+    fireEvent.change(screen.getByRole('combobox', { name: '现有会话' }), { target: { value: 'ds-2' } })
+    await waitFor(() => expect(screen.getByRole('combobox', { name: '现有会话' })).toHaveValue('ds-2'))
+    await screen.findByAltText('a.png')
+
+    // The bar remounted per session: default op, empty tags, no explicit scope.
+    expect(screen.getByRole('combobox', { name: '批量操作类型' })).toHaveValue('add')
+    expect(screen.queryByRole('button', { name: '移除 1girl' })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '当前过滤结果（3）' })).toHaveAttribute('aria-pressed', 'true')
+    expect(screen.getByRole('button', { name: '选中图片（0）' })).not.toHaveAttribute('aria-pressed', 'true')
+  })
+
   it('blocks closing the editor while a save is in flight', async () => {
     setupFetch(state)
     renderPage()
@@ -1232,6 +1300,23 @@ describe('TagManager page', () => {
 
     fireEvent.keyDown(addInput, { key: 'Escape' })
     expect(screen.queryByRole('option', { name: /hakurei_reimu/ })).not.toBeInTheDocument()
+    expect(screen.getByRole('dialog', { name: 'a.png' })).toBeInTheDocument()
+  })
+
+  it('closes only the wiki drawer with one Escape while it covers the editor', async () => {
+    setupFetch(state)
+    renderPage()
+    await screen.findByAltText('a.png')
+
+    fireEvent.dblClick(screen.getByTitle('a.png'))
+    await screen.findByRole('dialog', { name: 'a.png' })
+    fireEvent.click(screen.getByRole('button', { name: '查看 solo 的 Wiki' }))
+    expect(await screen.findByRole('dialog', { name: 'solo' })).toBeInTheDocument()
+
+    // One Escape unwinds exactly one layer: the wiki drawer closes and the
+    // editor underneath stays open (regression: both closed together).
+    fireEvent.keyDown(document, { key: 'Escape' })
+    expect(screen.queryByRole('dialog', { name: 'solo' })).not.toBeInTheDocument()
     expect(screen.getByRole('dialog', { name: 'a.png' })).toBeInTheDocument()
   })
 
@@ -1292,6 +1377,7 @@ describe('TagManager page', () => {
     const tagInput = screen.getByRole('combobox', { name: '批量标签' })
     fireEvent.change(tagInput, { target: { value: '1g' } })
     await screen.findByRole('option', { name: /1girl/ })
+    fireEvent.keyDown(tagInput, { key: 'ArrowDown' })
     fireEvent.keyDown(tagInput, { key: 'Enter' })
     fireEvent.click(screen.getByRole('button', { name: '执行' }))
     fireEvent.click(await screen.findByRole('button', { name: '确认执行' }))

@@ -404,12 +404,27 @@ const dialogFocusableSelector = [
 ].join(',')
 const dialogRoleSelector = '[role="dialog"], [role="alertdialog"]'
 
+/**
+ * Open dialog layers, newest last.  Every layer listens on `document`, and
+ * same-node keydown listeners fire in registration order — so without this
+ * bookkeeping the OUTER dialog's handler would run before the inner one's and
+ * one Escape would tear down the whole stack (e.g. the wiki drawer stacked on
+ * the image editor closed the editor too).  Only the topmost open layer reacts;
+ * layers always mount bottom-up in practice (a nested dialog is rendered by an
+ * interaction inside its parent), so "pushed last" is exactly "visually top".
+ */
+const dialogLayerStack: object[] = []
+
 export function DialogLayer({ children, onClose, className = 'drawer-backdrop', closeOnBackdrop = true }: DialogLayerProps) {
   const backdropRef = useRef<HTMLDivElement>(null)
   const closeRef = useRef(onClose)
   closeRef.current = onClose
+  // Identity of this layer inside `dialogLayerStack`; stable across renders.
+  const layerToken = useRef<object>({})
 
   useEffect(() => {
+    const layer = layerToken.current
+    dialogLayerStack.push(layer)
     const previousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null
     const appShell = document.querySelector<HTMLElement>('.app-shell')
     const alreadyInert = appShell?.hasAttribute('inert') ?? false
@@ -434,6 +449,8 @@ export function DialogLayer({ children, onClose, className = 'drawer-backdrop', 
       // A nested control that already consumed Escape (e.g. the tag
       // autocomplete closing its dropdown) must not also close the dialog.
       if (event.defaultPrevented) return
+      // Covered by a dialog opened later: it owns Escape and the focus trap.
+      if (dialogLayerStack[dialogLayerStack.length - 1] !== layer) return
       const backdrop = backdropRef.current
       const dialog = backdrop?.querySelector<HTMLElement>(dialogRoleSelector)
       if (!dialog) return
@@ -469,6 +486,8 @@ export function DialogLayer({ children, onClose, className = 'drawer-backdrop', 
     document.addEventListener('keydown', onKeyDown)
 
     return () => {
+      const index = dialogLayerStack.indexOf(layer)
+      if (index >= 0) dialogLayerStack.splice(index, 1)
       window.clearTimeout(focusDialog)
       document.removeEventListener('keydown', onKeyDown)
       if (appShell && !alreadyInert) appShell.removeAttribute('inert')

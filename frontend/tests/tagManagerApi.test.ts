@@ -77,6 +77,16 @@ describe('tag manager API client', () => {
     expect(deleteInit.method).toBe('DELETE')
   })
 
+  it('posts the cancel-scan endpoint and parses the idempotent result', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ cancelled: true }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    await expect(tagManagerApi.cancelScan('ds-1')).resolves.toEqual({ cancelled: true })
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit]
+    expect(url).toBe('/api/v1/tag-manager/datasets/ds-1/cancel')
+    expect(init.method).toBe('POST')
+  })
+
   it('serialises image filters, sorting, and pagination into query parameters', () => {
     const query = imageFilterQuery({
       offset: 120,

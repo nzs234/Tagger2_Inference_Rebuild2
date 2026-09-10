@@ -19,7 +19,10 @@ from typing import Any
 from ..tag_text import canonical_tag_key
 from ..workflow.contracts import utc_now
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+
+# v1 -> v2 migration checksum (scanned_count scan-progress column).
+_MIGRATION_CHECKSUM_V2 = "schema-v2-scan-progress"
 
 # Host parameters per chunked IN () query: a 2000-image batch must stay
 # inside SQLite's variable budget regardless of the build's compile limits.
@@ -86,6 +89,7 @@ CREATE TABLE IF NOT EXISTS dataset_sessions (
     status TEXT NOT NULL CHECK (status IN ('indexing', 'ready', 'error')),
     error TEXT,
     image_count INTEGER NOT NULL DEFAULT 0,
+    scanned_count INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -168,7 +172,7 @@ class TagManagerStore:
             self._memory_conn.execute(
                 "INSERT INTO schema_migrations (version, checksum, applied_at)"
                 " VALUES (?, ?, ?)",
-                (SCHEMA_VERSION, "schema-v1", utc_now()),
+                (SCHEMA_VERSION, _MIGRATION_CHECKSUM_V2, utc_now()),
             )
             self._memory_conn.commit()
         else:
@@ -187,15 +191,38 @@ class TagManagerStore:
             row = conn.execute(
                 "SELECT version FROM schema_migrations ORDER BY version DESC LIMIT 1"
             ).fetchone()
-            if row is None:
+            applied = int(row["version"]) if row is not None else 0
+            if applied > SCHEMA_VERSION:
+                raise TagManagerStoreError(
+                    f"tag manager database version {applied} is newer than supported"
+                )
+            if applied < SCHEMA_VERSION:
+                self._migrate(conn, applied)
                 conn.execute(
                     "INSERT INTO schema_migrations (version, checksum, applied_at)"
                     " VALUES (?, ?, ?)",
-                    (SCHEMA_VERSION, "schema-v1", utc_now()),
+                    (SCHEMA_VERSION, _MIGRATION_CHECKSUM_V2, utc_now()),
                 )
-            elif int(row["version"]) > SCHEMA_VERSION:
-                raise TagManagerStoreError(
-                    f"tag manager database version {row['version']} is newer than supported"
+
+    @staticmethod
+    def _migrate(conn: sqlite3.Connection, applied: int) -> None:
+        """Bring an older database up to SCHEMA_VERSION in place.
+
+        ALTER is used instead of a rebuild so every existing session, image
+        and journal row survives the upgrade.  The PRAGMA check keeps the step
+        idempotent — a database stamped by an interrupted upgrade may already
+        carry the column without its version row.
+        """
+
+        if applied < 2:
+            columns = {
+                str(column[1])
+                for column in conn.execute("PRAGMA table_info(dataset_sessions)").fetchall()
+            }
+            if "scanned_count" not in columns:
+                conn.execute(
+                    "ALTER TABLE dataset_sessions"
+                    " ADD COLUMN scanned_count INTEGER NOT NULL DEFAULT 0"
                 )
 
     @contextlib.contextmanager
@@ -270,6 +297,7 @@ class TagManagerStore:
         status: str | None = None,
         error: str | None = None,
         image_count: int | None = None,
+        scanned_count: int | None = None,
     ) -> None:
         fields: list[str] = ["updated_at = ?"]
         values: list[Any] = [utc_now()]
@@ -282,6 +310,9 @@ class TagManagerStore:
         if image_count is not None:
             fields.append("image_count = ?")
             values.append(image_count)
+        if scanned_count is not None:
+            fields.append("scanned_count = ?")
+            values.append(scanned_count)
         values.append(session_id)
         with self.connection() as conn:
             conn.execute(
@@ -750,6 +781,10 @@ def _session_dict(row: sqlite3.Row) -> dict[str, Any]:
         "status": str(row["status"]),
         "error": row["error"],
         "image_count": int(row["image_count"]),
+        # Images processed so far by the current scan; 0 when idle.  Kept
+        # separate from ``image_count`` so a running scan can report progress
+        # without disturbing the dataset size the grid is built from.
+        "scanned_count": int(row["scanned_count"]),
         "created_at": str(row["created_at"]),
         "updated_at": str(row["updated_at"]),
     }

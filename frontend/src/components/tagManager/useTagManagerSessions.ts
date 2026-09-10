@@ -130,6 +130,17 @@ export function useTagManagerSessions({ notify, fail, onSessionRemoved, onSessio
     },
     onError: (error) => fail(error, '重新扫描失败'),
   })
+  const cancelScanMutation = useMutation({
+    mutationFn: (id: string) => tagManagerApi.cancelScan(id),
+    // The backend settles the session (typically to `ready` with whatever the
+    // scan had indexed so far); refetching both queries repaints that state.
+    onSuccess: () => {
+      notify('success', '已取消扫描')
+      void queryClient.invalidateQueries({ queryKey: ['tag-manager', 'datasets'] })
+      void queryClient.invalidateQueries({ queryKey: ['tag-manager', 'dataset', activeId] })
+    },
+    onError: (error) => fail(error, '取消扫描失败'),
+  })
   const deleteMutation = useMutation({
     mutationFn: (id: string) => tagManagerApi.deleteDataset(id),
     onSuccess: () => {
@@ -179,6 +190,7 @@ export function useTagManagerSessions({ notify, fail, onSessionRemoved, onSessio
     selectSession,
     createMutation,
     refreshMutation,
+    cancelScanMutation,
     deleteMutation,
     batchMutation,
     undoMutation,

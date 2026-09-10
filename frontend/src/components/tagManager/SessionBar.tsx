@@ -1,4 +1,4 @@
-import { AlertTriangle, CheckCircle2, FolderOpen, LoaderCircle, Redo2, RefreshCw, Trash2, Undo2 } from 'lucide-react'
+import { AlertTriangle, Ban, CheckCircle2, FolderOpen, LoaderCircle, Redo2, RefreshCw, Trash2, Undo2 } from 'lucide-react'
 import { useState } from 'react'
 import type { RootInfo } from '../../types'
 import { Button, Field, Panel } from '../ui'
@@ -20,7 +20,7 @@ function SessionStatusBadge({ session }: { session: TagManagerSession }) {
   </span>
 }
 
-export function SessionBar({ sessions, activeSession, writableRoots, active, creating, refreshing, deleting, undoPending, redoPending, actionsDisabled, canUndo, canRedo, onSelect, onCreate, onRefresh, onDelete, onUndo, onRedo }: {
+export function SessionBar({ sessions, activeSession, writableRoots, active, creating, refreshing, deleting, undoPending, redoPending, cancelling, actionsDisabled, canUndo, canRedo, onSelect, onCreate, onRefresh, onCancelScan, onDelete, onUndo, onRedo }: {
   sessions: TagManagerSession[]
   activeSession?: TagManagerSession
   writableRoots: RootInfo[]
@@ -30,6 +30,8 @@ export function SessionBar({ sessions, activeSession, writableRoots, active, cre
   deleting: boolean
   undoPending: boolean
   redoPending: boolean
+  /** True while the cancel-scan request is in flight. */
+  cancelling: boolean
   /** True while the session is missing or still indexing. */
   actionsDisabled: boolean
   /** Session detail's can_undo: false when the journal has no undoable entry. */
@@ -39,6 +41,8 @@ export function SessionBar({ sessions, activeSession, writableRoots, active, cre
   onSelect: (id: string) => void
   onCreate: (body: TagManagerCreateRequest) => void
   onRefresh: () => void
+  /** Aborts the running index scan (only reachable while status is indexing). */
+  onCancelScan: () => void
   onDelete: () => void
   onUndo: () => void
   onRedo: () => void
@@ -54,6 +58,16 @@ export function SessionBar({ sessions, activeSession, writableRoots, active, cre
     eyebrow="SESSION"
     actions={<div className="tm-session-actions">
       <Button size="sm" variant="secondary" icon={refreshing ? <LoaderCircle className="spin" size={14} /> : <RefreshCw size={14} />} disabled={actionsDisabled || refreshing} onClick={onRefresh}>刷新</Button>
+      {/* Deliberately not gated on actionsDisabled: its whole purpose is to
+          abort the indexing that makes actionsDisabled true in the first
+          place, so it only exists (and is only enabled) while indexing. */}
+      {activeSession?.status === 'indexing' && <Button
+        size="sm"
+        variant="secondary"
+        icon={cancelling ? <LoaderCircle className="spin" size={14} /> : <Ban size={14} />}
+        disabled={cancelling}
+        onClick={onCancelScan}
+      >取消扫描</Button>}
       <Button size="sm" variant="secondary" icon={<Undo2 size={14} />} disabled={actionsDisabled || undoPending || !canUndo} onClick={onUndo}>撤销</Button>
       <Button size="sm" variant="secondary" icon={<Redo2 size={14} />} disabled={actionsDisabled || redoPending || !canRedo} onClick={onRedo}>重做</Button>
       <Button size="sm" variant="danger" icon={<Trash2 size={14} />} disabled={!activeSession || deleting} onClick={onDelete}>删除会话</Button>
@@ -65,7 +79,10 @@ export function SessionBar({ sessions, activeSession, writableRoots, active, cre
           {sessions.length === 0 && <option value="">暂无会话</option>}
           {sessions.map((session) => (
             <option key={session.id} value={session.id}>
-              {session.name} · {sessionStatusLabel(session.status)} · {session.image_count} 张
+              {/* The auto-derived name ("数据集") is shared by every unnamed
+                  session, so the option carries root + relative path — the
+                  same identity the status line below the select shows. */}
+              {session.root_id}/{session.relative_path || '(根目录)'} · {sessionStatusLabel(session.status)} · {session.image_count} 张
             </option>
           ))}
         </select>

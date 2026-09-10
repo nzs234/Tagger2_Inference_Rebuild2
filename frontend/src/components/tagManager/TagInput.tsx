@@ -12,10 +12,12 @@ import { tagCategoryClass, tagCategoryLabel } from '../../lib/tagCategories'
 import { usePreferences } from '../../store/app'
 
 /**
- * Debounced tag-database autocomplete input. Enter commits the first
- * suggestion (Alt/Option+Enter behaves the same); clicking a suggestion
- * commits that entry. When the lookup has no matches the raw text is committed
- * without a category.
+ * Debounced tag-database autocomplete input. Enter commits the typed text
+ * verbatim — a dataset tag typed in full must never be hijacked into the
+ * first suggestion — while a suggestion is only committed after it was
+ * explicitly picked with the arrow keys (Alt/Option+Enter behaves the same);
+ * clicking a suggestion commits that entry. When the lookup has no matches
+ * the raw text is committed without a category.
  */
 export function TagInput({ profile, label, placeholder, disabled, onAdd }: {
   profile: TagManagerProfile
@@ -57,7 +59,9 @@ export function TagInput({ profile, label, placeholder, disabled, onAdd }: {
         const result = await tagManagerApi.tagDb(profile, query, 20)
         if (requestId.current !== id) return
         setSuggestions(result.items)
-        setActiveIndex(result.items.length > 0 ? 0 : -1)
+        // Suggestions never pre-select the first row: until the user moves the
+        // highlight explicitly, Enter commits the typed text (see onKeyDown).
+        setActiveIndex(-1)
         setOpen(result.items.length > 0)
       } catch {
         if (requestId.current === id) {
@@ -106,6 +110,11 @@ export function TagInput({ profile, label, placeholder, disabled, onAdd }: {
           // Alt/Option+Enter must stay usable for keyboard users (and macOS
           // muscle memory), so it commits exactly like plain Enter.
           event.preventDefault()
+          // Typed text wins by default: a dataset tag typed in full must reach
+          // the sidecar verbatim instead of being hijacked into the first
+          // (unselected) suggestion.  Only a suggestion explicitly picked with
+          // the arrow keys — or an empty input, where no typed text exists —
+          // commits the highlighted entry with its category.
           const selected = open && activeIndex >= 0 ? suggestions[activeIndex] : undefined
           commit(selected ? selected.name : text, selected?.category)
         } else if (event.key === 'Escape' && open) {

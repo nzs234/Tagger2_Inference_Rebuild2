@@ -241,9 +241,12 @@ test('main chain: filter, select, batch replace, edit, save-and-next, undo', asy
   await expect(page.locator('.tm-badge-missing')).toContainText('无 sidecar')
 
   // --- Include-tag filter through the debounced autocomplete ---
+  // Enter commits the typed text unless a suggestion is explicitly picked
+  // (ArrowDown), so the e2e selects the 1girl suggestion like a keyboard user.
   const includeInput = page.getByRole('combobox', { name: '包含标签' })
   await includeInput.fill('1g')
   await expect(page.getByRole('option', { name: /1girl/ })).toBeVisible()
+  await includeInput.press('ArrowDown')
   await includeInput.press('Enter')
   await expect(page.getByRole('button', { name: '移除筛选 1girl' })).toBeVisible()
   await expect.poll(() => recorded.imageQueries.at(-1)).toContain('include_tags=1girl')
@@ -273,6 +276,8 @@ test('main chain: filter, select, batch replace, edit, save-and-next, undo', asy
   const batchTagInput = page.getByRole('combobox', { name: '批量标签' })
   await batchTagInput.fill('1g')
   await expect(page.getByRole('option', { name: /1girl/ })).toBeVisible()
+  // Pick the suggestion explicitly: plain Enter now commits the typed text.
+  await batchTagInput.press('ArrowDown')
   await batchTagInput.press('Enter')
   await expect(page.getByRole('button', { name: '移除 1girl' })).toBeVisible()
   await page.getByRole('textbox', { name: '替换为' }).fill('dog')
@@ -472,6 +477,8 @@ test('filtered batch sends the filter scope payload (runs on desktop and mobile)
   const includeInput = page.getByRole('combobox', { name: '包含标签' })
   await includeInput.fill('1g')
   await expect(page.getByRole('option', { name: /1girl/ })).toBeVisible()
+  // Pick the suggestion explicitly: plain Enter now commits the typed text.
+  await includeInput.press('ArrowDown')
   await includeInput.press('Enter')
   await expect(page.getByRole('button', { name: '移除筛选 1girl' })).toBeVisible()
   await expect.poll(() => recorded.imageQueries.at(-1)).toContain('include_tags=1girl')
@@ -484,6 +491,8 @@ test('filtered batch sends the filter scope payload (runs on desktop and mobile)
   const batchTagInput = page.getByRole('combobox', { name: '批量标签' })
   await batchTagInput.fill('1g')
   await expect(page.getByRole('option', { name: /1girl/ })).toBeVisible()
+  // Pick the suggestion explicitly: plain Enter now commits the typed text.
+  await batchTagInput.press('ArrowDown')
   await batchTagInput.press('Enter')
   await expect(page.getByRole('button', { name: '移除 1girl' })).toBeVisible()
 

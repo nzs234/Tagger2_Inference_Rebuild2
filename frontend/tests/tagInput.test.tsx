@@ -97,16 +97,53 @@ describe('TagInput', () => {
     expect(screen.getByRole('combobox')).toHaveAttribute('aria-expanded', 'false')
   })
 
-  it('commits the active suggestion with Alt/Option+Enter', async () => {
+  it('commits the highlighted suggestion with Alt/Option+Enter after ArrowDown', async () => {
     render(<TagInput profile="e621" label="添加标签" onAdd={onAdd} />)
     typeText('haku')
     act(() => { pending[0]!.resolve({ profile: 'e621', items: dbEntries.haku }) })
     await act(async () => {})
-    const active = screen.getByRole('option', { name: /hakurei_reimu/ })
-    expect(active).toHaveAttribute('aria-selected', 'true')
+
+    // The suggestion is visible but not pre-selected; the arrow key picks it.
+    const option = screen.getByRole('option', { name: /hakurei_reimu/ })
+    expect(option).toHaveAttribute('aria-selected', 'false')
+    fireEvent.keyDown(screen.getByRole('combobox'), { key: 'ArrowDown' })
+    expect(option).toHaveAttribute('aria-selected', 'true')
 
     fireEvent.keyDown(screen.getByRole('combobox'), { key: 'Enter', altKey: true })
     expect(onAdd).toHaveBeenCalledWith('hakurei_reimu', 'character')
+  })
+
+  it('commits the typed text on Enter even while suggestions are open', async () => {
+    // 'haku' is a real dataset tag: the open dropdown for hakurei_reimu must
+    // not hijack the Enter into the suggestion (the P2 regression).
+    render(<TagInput profile="e621" label="添加标签" onAdd={onAdd} />)
+    typeText('haku')
+    act(() => { pending[0]!.resolve({ profile: 'e621', items: dbEntries.haku }) })
+    await act(async () => {})
+    expect(screen.getByRole('option', { name: /hakurei_reimu/ })).toBeInTheDocument()
+
+    const input = screen.getByRole('combobox')
+    expect(input).not.toHaveAttribute('aria-activedescendant')
+    fireEvent.keyDown(input, { key: 'Enter' })
+    expect(onAdd).toHaveBeenCalledOnce()
+    expect(onAdd).toHaveBeenCalledWith('haku', undefined)
+  })
+
+  it('resets the highlight when a newer lookup lands, so Enter commits the edited text', async () => {
+    render(<TagInput profile="e621" label="添加标签" onAdd={onAdd} />)
+    typeText('haku')
+    act(() => { pending[0]!.resolve({ profile: 'e621', items: dbEntries.haku }) })
+    await act(async () => {})
+    fireEvent.keyDown(screen.getByRole('combobox'), { key: 'ArrowDown' })
+    expect(screen.getByRole('option', { name: /hakurei_reimu/ })).toHaveAttribute('aria-selected', 'true')
+
+    // Editing the text supersedes the pick: the fresh lookup clears the
+    // highlight, so Enter commits what is typed now, not the old suggestion.
+    typeText('totally_new_tag')
+    act(() => { pending[1]!.resolve({ profile: 'e621', items: [] }) })
+    await act(async () => {})
+    fireEvent.keyDown(screen.getByRole('combobox'), { key: 'Enter' })
+    expect(onAdd).toHaveBeenCalledWith('totally_new_tag', undefined)
   })
 
   it('commits the raw text with Alt/Option+Enter when no suggestion matches', () => {
@@ -117,6 +154,12 @@ describe('TagInput', () => {
 
     fireEvent.keyDown(screen.getByRole('combobox'), { key: 'Enter', altKey: true })
     expect(onAdd).toHaveBeenCalledWith('totally_new_tag', undefined)
+  })
+
+  it('ignores Enter on an empty input', () => {
+    render(<TagInput profile="e621" label="添加标签" onAdd={onAdd} />)
+    fireEvent.keyDown(screen.getByRole('combobox'), { key: 'Enter' })
+    expect(onAdd).not.toHaveBeenCalled()
   })
 
   it('wires stable combobox ids and a visible active state', async () => {
@@ -134,17 +177,23 @@ describe('TagInput', () => {
 
     const options = within(list).getAllByRole('option')
     expect(options).toHaveLength(2)
-    // The active option carries both the aria state and the visual class.
+    // Nothing is highlighted until the user starts arrowing: Enter must keep
+    // committing typed text while the dropdown is merely open.
+    expect(options[0]!).toHaveAttribute('aria-selected', 'false')
+    expect(options[0]!).not.toHaveClass('tm-suggest-active')
+    expect(input).not.toHaveAttribute('aria-activedescendant')
+
+    // Arrow-down starts the selection at the first suggestion (id + class).
+    fireEvent.keyDown(input, { key: 'ArrowDown' })
     expect(options[0]!).toHaveAttribute('aria-selected', 'true')
     expect(options[0]!.className).toContain('tm-suggest-active')
     expect(options[1]!).toHaveAttribute('aria-selected', 'false')
-    expect(options[1]!.className).not.toContain('tm-suggest-active')
     expect(input.getAttribute('aria-activedescendant')).toBe(options[0]!.id)
 
-    // Arrow-down moves the active descendant (id + class together).
+    // A second ArrowDown moves the active descendant along.
     fireEvent.keyDown(input, { key: 'ArrowDown' })
+    expect(options[0]!).not.toHaveClass('tm-suggest-active')
+    expect(options[1]!).toHaveClass('tm-suggest-active')
     expect(input.getAttribute('aria-activedescendant')).toBe(options[1]!.id)
-    expect(options[0]!.className).not.toContain('tm-suggest-active')
-    expect(options[1]!.className).toContain('tm-suggest-active')
   })
 })

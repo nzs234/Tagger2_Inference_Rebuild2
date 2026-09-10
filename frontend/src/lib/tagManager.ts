@@ -16,6 +16,9 @@ export interface TagManagerSession {
   status: TagManagerSessionStatus
   error?: string | null
   image_count: number
+  /** Files the scanner has already visited while status is indexing; the
+   * backend reports it progressively and older responses omit the field. */
+  scanned_count?: number
   /** Undo journal flags: buttons key off them instead of probing with 409s. */
   can_undo?: boolean
   can_redo?: boolean
@@ -29,6 +32,12 @@ export interface TagManagerCreateRequest {
   profile: TagManagerProfile
   recursive: boolean
   name?: string
+}
+
+/** Payload of the idempotent scan-cancel endpoint; `false` means no scan was
+ * in flight. The outcome itself is observed by polling the session. */
+export interface TagManagerCancelScanResult {
+  cancelled: boolean
 }
 
 /** Sidecar flavours the backend recognises. `none` means no sidecar yet. */
@@ -305,6 +314,11 @@ export const tagManagerApi = {
   deleteDataset: (sessionId: string) => request<void>(datasetPath(sessionId), { method: 'DELETE' }),
   refreshDataset: (sessionId: string) =>
     request<TagManagerSession>(`${datasetPath(sessionId)}/refresh`, { method: 'POST', body: '{}' }),
+  /** Abort an in-progress index scan; the scan stops at the next image
+   * boundary and the session settles back to `ready` (observed by polling).
+   * Unknown sessions answer 404, handled by the caller's fail mapping. */
+  cancelScan: (sessionId: string) =>
+    request<TagManagerCancelScanResult>(`${datasetPath(sessionId)}/cancel`, { method: 'POST', body: '{}' }),
 
   images: (sessionId: string, params: TagManagerImageQuery = {}) =>
     request<TagManagerImagePage>(`${datasetPath(sessionId)}/images?${imageFilterQuery(params).toString()}`),

@@ -18,6 +18,7 @@ import asyncio
 import functools
 import logging
 import os
+import posixpath
 import threading
 import uuid
 from collections.abc import Callable, Iterator, Mapping
@@ -122,13 +123,30 @@ def resolve_dataset_dir(allowlist: PathAllowlist, root_id: str, relative_path: s
     return resolved
 
 
+def _session_relative(session: Mapping[str, Any], relative: str) -> str:
+    """Join the session's dataset prefix onto a dataset-relative path.
+
+    Image rows and journalled sidecar paths are stored relative to the
+    session's dataset directory, while the allowlist resolves against the
+    registered root.  A session opened at root + ``sub`` must therefore
+    resolve ``img.jpg`` as ``sub/img.jpg``.  The join happens on the read
+    side so existing database rows and undo-journal entries (all stored
+    prefix-less) stay valid without a data migration.
+    """
+
+    prefix = str(session.get("relative_path") or "").strip().replace("\\", "/").strip("/")
+    if not prefix or prefix == ".":
+        return relative
+    return posixpath.join(prefix, relative)
+
+
 def resolve_image(
     allowlist: PathAllowlist, session: Mapping[str, Any], image: Mapping[str, Any]
 ) -> Path:
     try:
         return allowlist.resolve(
             str(session["root_id"]),
-            str(image["relative_path"]),
+            _session_relative(session, str(image["relative_path"])),
             must_exist=True,
             expect="file",
         )
@@ -151,10 +169,13 @@ def resolve_sidecar(
     # ``for_write`` defaults to True because every historical caller was a
     # write; the batch preview resolves the same path to read it and passes
     # False so a read-only dataset root can still be previewed.
+    # ``sidecar_path`` is relative to the session's dataset directory (the
+    # same shape the undo journal stores), so the session prefix is applied
+    # exactly like ``resolve_image`` does.
     try:
         return allowlist.resolve(
             str(session["root_id"]),
-            sidecar_path,
+            _session_relative(session, sidecar_path),
             must_exist=False,
             for_write=for_write,
             expect="file",
@@ -253,11 +274,15 @@ class SessionIndexer:
         allowlist: PathAllowlist,
         tag_database: TagDatabaseClient | None,
         locks: SessionLocks,
+        scheduler: IndexScheduler | None = None,
     ) -> None:
         self.store = store
         self.allowlist = allowlist
         self.tag_database = tag_database
         self._locks = locks
+        # The scheduler registers one cancel event per scheduled scan; without
+        # it (direct construction in tests) scans simply run to completion.
+        self._scheduler = scheduler
 
     def create_session(self, request: CreateDatasetRequest) -> dict[str, Any]:
         dataset_dir = resolve_dataset_dir(self.allowlist, request.root_id, request.relative_path)
@@ -298,6 +323,21 @@ class SessionIndexer:
                     status_code=404,
                 )
 
+    def cancel_scan(self, session_id: str) -> bool:
+        """Signal a running (or queued) index scan for this session to stop.
+
+        Returns whether a scan slot was found.  Cancelling is a normal user
+        action, not an error: the scan stops at the next image boundary,
+        keeps the rows it already indexed and ends in status ``ready``.  With
+        no scan in flight the call is a harmless no-op (``False``).
+        """
+
+        # Unknown sessions must surface as 404, not as a silent success.
+        require_session(self.store, session_id)
+        if self._scheduler is None:
+            return False
+        return self._scheduler.cancel(session_id)
+
     def index_session(self, session_id: str) -> None:
         """Scan the dataset directory and rebuild the index (blocking)."""
 
@@ -321,18 +361,35 @@ class SessionIndexer:
             # Observable transition before scanning: clients polling after a
             # refresh see the session leave 'ready' while the rescan runs
             # (create_session already stored 'indexing'; rewriting is harmless).
-            self.store.update_session(session_id, status="indexing")
-            self._index_session_locked(session)
+            # The progress counter restarts at zero with every scan.
+            self.store.update_session(session_id, status="indexing", scanned_count=0)
+            # Registered synchronously by the scheduler when the scan was
+            # queued; a scan that started outside the scheduler runs to
+            # completion (cancel_event is None).
+            cancel_event = (
+                self._scheduler.cancel_event(session_id)
+                if self._scheduler is not None
+                else None
+            )
+            self._index_session_locked(session, cancel_event=cancel_event)
         except TagManagerError as exc:
             logger.warning("tag manager index failed for %s: %s", session_id, exc)
-            self.store.update_session(session_id, status="error", error=exc.code)
+            self.store.update_session(
+                session_id, status="error", error=exc.code, scanned_count=0
+            )
         except Exception:  # noqa: BLE001 - scan must never crash the app
             logger.exception("tag manager index crashed for %s", session_id)
-            self.store.update_session(session_id, status="error", error="index_failed")
+            self.store.update_session(
+                session_id, status="error", error="index_failed", scanned_count=0
+            )
         finally:
             lock.release()
 
-    def _index_session_locked(self, session: Mapping[str, Any]) -> None:
+    def _index_session_locked(
+        self,
+        session: Mapping[str, Any],
+        cancel_event: threading.Event | None = None,
+    ) -> None:
         session_id = str(session["id"])
         dataset_dir = resolve_dataset_dir(
             self.allowlist, str(session["root_id"]), str(session["relative_path"])
@@ -348,7 +405,16 @@ class SessionIndexer:
 
         keep_paths: set[str] = set()
         pending: list[dict[str, Any]] = []
+        processed = 0
+        cancelled = False
         for image_path in _iter_images(dataset_dir, recursive):
+            # Cancel is cooperative: the scan stops at the next image
+            # boundary, keeps every row it already indexed and skips the
+            # pruning pass that only a complete scan may run.
+            if cancel_event is not None and cancel_event.is_set():
+                cancelled = True
+                break
+            processed += 1
             relative = image_path.relative_to(dataset_dir).as_posix()
             keep_paths.add(relative)
             prior = baseline.get(relative)
@@ -360,11 +426,32 @@ class SessionIndexer:
             if len(pending) >= SCAN_CHUNK:
                 self._flush_rows(session_id, pending)
                 pending = []
+            # Progress is written at chunk boundaries (every processed image,
+            # unchanged ones included) so a long scan is observable from the
+            # session row without paying a database write per file.
+            if processed % SCAN_CHUNK == 0:
+                self.store.update_session(session_id, scanned_count=processed)
         if pending:
             self._flush_rows(session_id, pending)
+        if cancelled:
+            # A cancelled scan is not an error and must not prune: rows for
+            # files the interrupted pass never reached stay in the index and
+            # the next complete rescan reconciles them.
+            self.store.update_session(
+                session_id,
+                status="ready",
+                error=None,
+                image_count=len(keep_paths),
+                scanned_count=0,
+            )
+            return
         self.store.prune_images_missing(session_id, keep_paths)
         self.store.update_session(
-            session_id, status="ready", error=None, image_count=len(keep_paths)
+            session_id,
+            status="ready",
+            error=None,
+            image_count=len(keep_paths),
+            scanned_count=0,
         )
 
     def _flush_rows(self, session_id: str, rows: list[dict[str, Any]]) -> int:
@@ -380,10 +467,16 @@ class IndexScheduler:
     ``index_session``'s own error handling still get logged.  These are the
     asyncio wrappers returned by run_in_executor; cancelling one also cancels
     the underlying executor future.
+
+    Each scheduled scan also owns a ``threading.Event`` registered here at
+    schedule time (synchronously with the future): a running scan observes it
+    on its worker thread and stops at the next image boundary, which is the
+    only safe way to stop a scan that is already past the queue.
     """
 
     def __init__(self) -> None:
         self._futures: dict[str, asyncio.Future[None]] = {}
+        self._cancel_events: dict[str, threading.Event] = {}
         self._guard = threading.Lock()
 
     @property
@@ -392,15 +485,55 @@ class IndexScheduler:
 
         return self._futures
 
+    def cancel_event(self, session_id: str) -> threading.Event | None:
+        """The cancel event of the session's scheduled scan, if any."""
+
+        with self._guard:
+            return self._cancel_events.get(session_id)
+
+    def cancel(self, session_id: str) -> bool:
+        """Signal the session's running (or queued) scan to stop.
+
+        Returns whether a scan slot was found; with no scan scheduled this is
+        an idempotent no-op.  The event is only set here — observing it and
+        settling the session row is the scan's own job on its worker thread.
+        """
+
+        with self._guard:
+            event = self._cancel_events.get(session_id)
+        if event is None:
+            return False
+        event.set()
+        return True
+
+    def _release_event(self, session_id: str, event: threading.Event) -> None:
+        # Identity guard: a newer scan for the same session may already own
+        # the slot, and only the scan that registered it may release it.
+        with self._guard:
+            if self._cancel_events.get(session_id) is event:
+                self._cancel_events.pop(session_id, None)
+
     def schedule(self, session_id: str, run: Callable[[str], None]) -> None:
         """Run one blocking scan on a worker thread (non-blocking caller)."""
 
+        event = threading.Event()
+        with self._guard:
+            self._cancel_events[session_id] = event
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
-            run(session_id)
+            # No running loop: the historical synchronous path runs the scan
+            # inline and releases its own event slot when it returns.
+            try:
+                run(session_id)
+            finally:
+                self._release_event(session_id, event)
             return
-        future = loop.run_in_executor(None, run, session_id)
+        try:
+            future = loop.run_in_executor(None, run, session_id)
+        except BaseException:
+            self._release_event(session_id, event)
+            raise
         with self._guard:
             self._futures[session_id] = future
         future.add_done_callback(functools.partial(self.finish, session_id))
@@ -411,11 +544,13 @@ class IndexScheduler:
         Safe to call from any thread: delete_session runs on a worker thread
         once the API offloads it, and ``asyncio.Future.cancel`` is not
         thread-safe, so the cancel is marshalled onto the loop that owns the
-        future.
+        future.  The cancel event is dropped together with the future: a scan
+        discarded while queued can never observe it.
         """
 
         with self._guard:
             future = self._futures.pop(session_id, None)
+            self._cancel_events.pop(session_id, None)
         if future is None:
             return
         try:
@@ -442,9 +577,10 @@ class IndexScheduler:
 
         with self._guard:
             # A newer scan may already be registered for this session; only
-            # the future that owns the slot removes it.
+            # the future that owns the slot removes it (and its event).
             if self._futures.get(session_id) is future:
                 self._futures.pop(session_id, None)
+                self._cancel_events.pop(session_id, None)
         if future.cancelled():
             return
         exc = future.exception()

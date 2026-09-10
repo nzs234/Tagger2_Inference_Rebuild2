@@ -141,6 +141,17 @@ def create_tag_manager_router(service: TagManagerService) -> APIRouter:
         except TagManagerError as exc:
             raise _error(exc) from exc
 
+    @router.post("/datasets/{session_id}/cancel")
+    async def cancel_dataset_scan(session_id: str):
+        # Cooperative scan cancel: only sets a threading.Event, so the worker
+        # offload below is cheap.  Idempotent by design — with no scan in
+        # flight it answers 200 {"cancelled": false} rather than an error, so
+        # a stale retry can never turn into a user-visible failure.
+        try:
+            return await asyncio.to_thread(service.cancel_scan, session_id)
+        except TagManagerError as exc:
+            raise _error(exc) from exc
+
     @router.get("/datasets/{session_id}/images")
     async def list_images(
         session_id: str,

@@ -53,6 +53,7 @@ export function TagManager() {
     selectSession,
     createMutation,
     refreshMutation,
+    cancelScanMutation,
     deleteMutation,
     batchMutation,
     undoMutation,
@@ -131,6 +132,15 @@ export function TagManager() {
   // Editing writes sidecars in place, so only writable roots can host a dataset.
   const writableRoots = (roots.data?.items ?? []).filter((root) => root.writable)
 
+  // Grid placeholder while the scan runs: the backend reports how many files
+  // the scanner has already visited; older responses omit scanned_count and
+  // fall back to the plain copy.
+  const indexingText = session?.status === 'indexing'
+    ? session.scanned_count != null
+      ? `正在索引图片（已扫描 ${session.scanned_count} 张）…`
+      : '正在索引图片，请稍候…'
+    : undefined
+
   // Filter/sort changes reset the page and cancel a pending cross-page
   // navigation: the pending target belongs to the page being left.
   const setFilter = (next: ImageFilterState) => {
@@ -198,6 +208,7 @@ export function TagManager() {
       deleting={deleteMutation.isPending}
       undoPending={undoMutation.isPending}
       redoPending={redoMutation.isPending}
+      cancelling={cancelScanMutation.isPending}
       actionsDisabled={actionsDisabled}
       canUndo={Boolean(session?.can_undo)}
       canRedo={Boolean(session?.can_redo)}
@@ -216,6 +227,7 @@ export function TagManager() {
         createMutation.mutate(body)
       })}
       onRefresh={() => session && refreshMutation.mutate(session.id)}
+      onCancelScan={() => session && cancelScanMutation.mutate(session.id)}
       onDelete={() => confirmLeaveIfDirty(() => {
         closeEditor()
         setConfirmDelete(true)
@@ -257,7 +269,7 @@ export function TagManager() {
             empty={imagesError
               ? <EmptyState icon={<Images size={22} />} title="图片列表加载失败" detail="请重试，或检查当前会话。" action={<Button variant="secondary" onClick={retryImages}>重试</Button>} />
               : session && !sessionReady
-                ? <div className="tm-grid-loading"><LoaderCircle className="spin" size={18} aria-hidden="true" /><span>{session.status === 'indexing' ? '正在索引图片，请稍候…' : session.error || '会话不可用'}</span></div>
+                ? <div className="tm-grid-loading"><LoaderCircle className="spin" size={18} aria-hidden="true" /><span>{indexingText ?? (session.error ?? '会话不可用')}</span></div>
                 : <EmptyState icon={<Images size={22} />} title="没有匹配的图片" detail="调整筛选条件，或先创建并打开一个会话。" />}
           />
           <div className="tm-pagination">
@@ -272,6 +284,12 @@ export function TagManager() {
         {/* Always mounted once the session is ready: the whole point of the
             filter scope is running a batch without selecting anything first. */}
         {sessionReady && activeId && <BatchBar
+          // Remount per session: op/tags/replacement/scope are working state
+          // for the active dataset and must never leak into the next one (a
+          // staged replace firing against a different dataset is exactly the
+          // accident this reset prevents).  Pending preview/confirm dialogs
+          // reset along with the form, which is the desired behaviour.
+          key={activeId}
           sessionId={activeId}
           profile={session?.profile ?? 'e621'}
           filter={filter}

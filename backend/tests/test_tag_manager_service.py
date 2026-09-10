@@ -1325,6 +1325,300 @@ def test_incremental_rescan_picks_up_added_and_removed_images(workspace):
         for item in service.list_images(session_id)["items"]
     }
     assert added_tags["added.png"] == {"fresh"}
+
+
+# -- subdirectory sessions (relative_path prefix on read-side resolution) ------
+
+
+@pytest.fixture()
+def subdir_workspace(tmp_path: Path):
+    """A session opened at root + ``sub``: the registered root is tmp_path and
+    the dataset lives in tmp_path/sub, so every image-level path resolution
+    has to join the session's relative_path prefix (the GUI-found 403 bug)."""
+
+    dataset = tmp_path / "sub"
+    dataset.mkdir()
+    _make_image(dataset, "a.png")
+    (dataset / "a.txt").write_text("solo, wolf\n", encoding="utf-8")
+    _make_image(dataset, "b.png")
+    (dataset / "b.json").write_text(json.dumps(STANDARD_JSON), encoding="utf-8")
+    _make_image(dataset, "c.png")
+
+    allowlist = PathAllowlist()
+    allowlist.register(tmp_path, root_id="test-root", kind="input", writable=True)
+    store = TagManagerStore(":memory:")
+    service = TagManagerService(
+        store=store,
+        allowlist=allowlist,
+        thumbnails=FakeThumbnails(),
+        tag_database=FakeTagDatabase(),
+    )
+    session = service.create_session(
+        CreateDatasetRequest(root_id="test-root", relative_path="sub", profile="e621")
+    )
+    service.index_session(str(session["id"]))
+    session = service.get_session(str(session["id"]))
+    return service, store, session, dataset, tmp_path
+
+
+def test_subdir_session_full_chain_does_not_403(subdir_workspace):
+    """Detail/thumbnail/save/batch/undo all resolve inside the session's
+    subdirectory; before the read-side prefix fix these raised
+    path_not_allowed (403) for any session with a relative_path."""
+
+    service, _store, session, dataset, root = subdir_workspace
+    session_id = str(session["id"])
+    assert session["status"] == "ready"
+    assert session["image_count"] == 3
+
+    items = service.list_images(session_id)["items"]
+    assert {item["file_name"] for item in items} == {"a.png", "b.png", "c.png"}
+    # Index rows stay dataset-relative: the prefix is joined at resolve time.
+    assert all("/" not in item["relative_path"] for item in items)
+
+    a = next(item for item in items if item["file_name"] == "a.png")
+    detail = service.get_image(session_id, int(a["id"]))
+    assert detail["content"]["kind"] == "tag_txt"
+    assert detail["sidecar_mtime"] is not None
+
+    thumbnail = service.thumbnail(session_id, int(a["id"]), size=64)
+    assert str(thumbnail).endswith(".thumb.jpg")
+
+    result = service.save_image(
+        session_id,
+        int(a["id"]),
+        ImageEditRequest(content=TagTxtContent(tags=["solo", "wolf", "rex"])),
+    )
+    assert result["sidecar_kind"] == "tag_txt"
+    assert (dataset / "a.txt").read_text(encoding="utf-8") == "solo, wolf, rex\n"
+    # New sidecars land inside the dataset directory, never at the root.
+    assert not (root / "a.txt").exists()
+
+    batch = service.batch_operation(
+        session_id,
+        BatchOperationRequest(op="add", tags=["night"], image_ids=None,
+                              filter=ImageFilter(sidecar="present")),
+    )
+    assert batch["affected"] == 2
+    undone = service.undo(session_id)
+    assert undone["reverted"] == 2
+    assert "night" not in (dataset / "a.txt").read_text(encoding="utf-8")
+
+
+def test_api_subdir_session_serves_images_without_403(subdir_workspace):
+    """The API surface stays green for a subdirectory session."""
+
+    service, _store, session, _dataset, _root = subdir_workspace
+    app = FastAPI()
+    app.include_router(create_tag_manager_router(service))
+    client = TestClient(app)
+    sid = str(session["id"])
+
+    images = client.get(f"/api/v1/tag-manager/datasets/{sid}/images")
+    assert images.status_code == 200
+    a = next(item for item in images.json()["items"] if item["file_name"] == "a.png")
+
+    detail = client.get(f"/api/v1/tag-manager/datasets/{sid}/images/{a['id']}")
+    assert detail.status_code == 200
+    assert detail.json()["content"]["kind"] == "tag_txt"
+
+    saved = client.patch(
+        f"/api/v1/tag-manager/datasets/{sid}/images/{a['id']}",
+        json={"content": {"kind": "tag_txt", "tags": ["solo"]}},
+    )
+    assert saved.status_code == 200
+    assert saved.json()["sidecar_kind"] == "tag_txt"
+
+
+# -- scan progress (scanned_count) ---------------------------------------------
+
+
+def test_scan_progress_advances_and_resets(tmp_path, monkeypatch):
+    """The session row reports scanned_count while the scan runs and resets it
+    when the scan settles; image_count keeps its dataset-size meaning."""
+
+    dataset = tmp_path / "dataset"
+    dataset.mkdir()
+    for index in range(5):
+        _make_image(dataset, f"img_{index}.png")
+        (dataset / f"img_{index}.txt").write_text(f"tag{index}\n", encoding="utf-8")
+    allowlist = PathAllowlist()
+    allowlist.register(tmp_path, root_id="test-root", kind="input", writable=True)
+    store = TagManagerStore(":memory:")
+    service = TagManagerService(
+        store=store,
+        allowlist=allowlist,
+        thumbnails=FakeThumbnails(),
+        tag_database=FakeTagDatabase(),
+    )
+    session = service.create_session(
+        CreateDatasetRequest(root_id="test-root", relative_path="", profile="e621")
+    )
+    sid = str(session["id"])
+    assert service.get_session(sid)["scanned_count"] == 0
+
+    monkeypatch.setattr(indexing, "SCAN_CHUNK", 2)
+    progress: list[int] = []
+    original_update = store.update_session
+
+    def spy_update(session_id, **kwargs):
+        # Only the intermediate progress writes are interesting; the settle
+        # write carries scanned_count=0.
+        if kwargs.get("scanned_count"):
+            progress.append(int(kwargs["scanned_count"]))
+        return original_update(session_id, **kwargs)
+
+    monkeypatch.setattr(store, "update_session", spy_update)
+
+    service.index_session(sid)
+
+    assert progress == [2, 4], "progress must advance in SCAN_CHUNK steps"
+    assert all(0 < value < 5 for value in progress)
+    final = service.get_session(sid)
+    assert final["status"] == "ready"
+    assert final["scanned_count"] == 0
+    assert final["image_count"] == 5
+
+
+# -- scan cancel ----------------------------------------------------------------
+
+
+def test_cancel_scan_keeps_partial_index_and_returns_to_ready(tmp_path, monkeypatch):
+    """Cancelling a scan is a normal outcome: the scan stops at the next image
+    boundary, keeps the rows it indexed (no prune) and settles in ``ready``;
+    a later complete rescan reconciles the index."""
+
+    dataset = tmp_path / "dataset"
+    dataset.mkdir()
+    for index in range(6):
+        _make_image(dataset, f"img_{index}.png")
+        (dataset / f"img_{index}.txt").write_text(f"tag{index}\n", encoding="utf-8")
+    allowlist = PathAllowlist()
+    allowlist.register(tmp_path, root_id="test-root", kind="input", writable=True)
+    service = TagManagerService(
+        store=TagManagerStore(":memory:"),
+        allowlist=allowlist,
+        thumbnails=FakeThumbnails(),
+        tag_database=FakeTagDatabase(),
+    )
+    session = service.create_session(
+        CreateDatasetRequest(root_id="test-root", relative_path="", profile="e621")
+    )
+    sid = str(session["id"])
+    service.index_session(sid)
+    assert service.get_session(sid)["image_count"] == 6
+
+    # Delete one image: only a *complete* scan may prune its row.  Touch every
+    # remaining sidecar too, so the rescan actually re-parses them (a fully
+    # incremental pass would skip all rows and never reach the flush gate).
+    (dataset / "img_5.png").unlink()
+    (dataset / "img_5.txt").unlink()
+    for index in range(5):
+        (dataset / f"img_{index}.txt").write_text(f"tag{index} v2\n", encoding="utf-8")
+
+    monkeypatch.setattr(indexing, "SCAN_CHUNK", 1)
+    indexer = service._indexer
+    original_flush = indexer._flush_rows
+    scan_started = threading.Event()
+    gate = threading.Event()
+
+    def blocking_flush(flush_session_id, rows):
+        original_flush(flush_session_id, rows)
+        scan_started.set()
+        assert gate.wait(timeout=5.0), "test gate never released"
+
+    monkeypatch.setattr(indexer, "_flush_rows", blocking_flush)
+
+    worker = threading.Thread(target=service.schedule_index, args=(sid,), daemon=True)
+    worker.start()
+    assert scan_started.wait(timeout=5.0), "scan never reached the first flush"
+
+    cancelled = service.cancel_scan(sid)
+    assert cancelled["cancelled"] is True
+    gate.set()
+    worker.join(timeout=10.0)
+    assert not worker.is_alive(), "cancelled scan never returned"
+
+    settled = service.get_session(sid)
+    assert settled["status"] == "ready"
+    assert settled["error"] is None
+    assert settled["image_count"] == 1  # the one chunk flushed before cancel
+    assert settled["scanned_count"] == 0
+
+    # Nothing was pruned: even the row of the deleted image survives a
+    # cancelled pass, so a partial scan can never shrink the index.
+    names = {item["file_name"] for item in service.list_images(sid)["items"]}
+    assert names == {f"img_{index}.png" for index in range(6)}
+
+    # The session stays usable: the next complete rescan prunes the deleted
+    # image and reports the true dataset size again.
+    monkeypatch.setattr(indexer, "_flush_rows", original_flush)
+    monkeypatch.setattr(indexing, "SCAN_CHUNK", 500)
+    service.index_session(sid)
+    settled = service.get_session(sid)
+    assert settled["status"] == "ready"
+    assert settled["image_count"] == 5
+    names = {item["file_name"] for item in service.list_images(sid)["items"]}
+    assert names == {f"img_{index}.png" for index in range(5)}
+
+
+def test_cancel_scan_is_idempotent_without_a_running_scan(workspace):
+    """With no scan in flight the cancel is a harmless no-op; unknown
+    sessions still surface as 404."""
+
+    service, _store, session, _dataset = workspace
+    session_id = str(session["id"])
+
+    assert service.cancel_scan(session_id) == {"cancelled": False}
+
+    with pytest.raises(TagManagerError) as excinfo:
+        service.cancel_scan("no-such-session")
+    assert excinfo.value.status_code == 404
+
+
+def test_api_cancel_route_is_idempotent_and_reports_404(workspace):
+    """The cancel endpoint answers 200 {"cancelled": false} without a scan and
+    404 for a missing session."""
+
+    service, _store, session, _dataset = workspace
+    app = FastAPI()
+    app.include_router(create_tag_manager_router(service))
+    client = TestClient(app)
+    session_id = str(session["id"])
+
+    response = client.post(f"/api/v1/tag-manager/datasets/{session_id}/cancel")
+    assert response.status_code == 200
+    assert response.json()["cancelled"] is False
+
+    missing = client.post("/api/v1/tag-manager/datasets/nope/cancel")
+    assert missing.status_code == 404
+    assert missing.json()["detail"]["code"] == "dataset_not_found"
+
+
+def test_scheduler_registers_and_releases_cancel_events(workspace):
+    """Each scheduled scan owns a cancel event for exactly its lifetime."""
+
+    service, _store, session, _dataset = workspace
+    session_id = str(session["id"])
+
+    async def drive():
+        lock = service._session_lock(session_id)
+        # Hold the session lock so the scheduled scan cannot complete while
+        # the registration assertion runs.
+        with lock:
+            service.schedule_index(session_id)
+            assert service._scheduler.cancel_event(session_id) is not None
+        deadline = time.monotonic() + 10.0
+        while service._scheduler.cancel_event(session_id) is not None:
+            if time.monotonic() > deadline:
+                raise AssertionError("cancel event was never released")
+            await asyncio.sleep(0.01)
+        assert session_id not in service._index_futures
+
+    asyncio.run(drive())
+    assert service.get_session(session_id)["status"] == "ready"
+
+
 # -- 1.10.5 review regressions: lock-window races, mtime guards, limits -------
 
 

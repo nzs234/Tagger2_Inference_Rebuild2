@@ -102,6 +102,7 @@ class TagManagerService:
             allowlist=allowlist,
             tag_database=tag_database,
             locks=self._locks,
+            scheduler=self._scheduler,
         )
         self._editor = SessionEditor(
             store=store,
@@ -175,6 +176,19 @@ class TagManagerService:
         """Scan the dataset directory and rebuild the index (blocking)."""
 
         self._indexer.index_session(session_id)
+
+    def cancel_scan(self, session_id: str) -> dict[str, Any]:
+        """Signal a running (or queued) index scan to stop; idempotent.
+
+        Returns ``{"cancelled": bool}``: ``False`` means no scan was in
+        flight (or the session row is gone, which raises 404 instead).
+        Cancelling is a normal user action — the scan keeps its partial index
+        and settles in status ``ready``; clients observe the outcome by
+        polling the session.
+        """
+
+        cancelled = self._indexer.cancel_scan(session_id)
+        return {"cancelled": cancelled}
 
     def _index_session_locked(self, session: Mapping[str, Any]) -> None:
         self._indexer._index_session_locked(session)
