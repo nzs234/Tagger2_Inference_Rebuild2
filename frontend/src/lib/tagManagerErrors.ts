@@ -31,3 +31,16 @@ export function describeTagManagerError(error: unknown, fallback: string): strin
   if (error instanceof ApiError) return KNOWN_CODES[error.code] ?? error.message
   return fallback
 }
+
+/**
+ * Codes that describe an expected, non-destructive state rather than a real
+ * failure: pressing undo/redo when the history is empty is a no-op the user
+ * caused, so it renders as a warning instead of the danger tone.
+ */
+const WARNING_CODES: ReadonlySet<string> = new Set(['undo_empty', 'redo_empty'])
+
+/** Notice tone for a Tag Manager failure; warning for benign empty-history codes. */
+export function tagManagerErrorTone(error: unknown): 'warning' | 'danger' {
+  if (error instanceof ApiError && WARNING_CODES.has(error.code)) return 'warning'
+  return 'danger'
+}

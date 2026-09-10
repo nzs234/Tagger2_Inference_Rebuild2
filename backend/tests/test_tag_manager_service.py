@@ -30,6 +30,7 @@ from tagger2.tag_manager.contracts import (
 from tagger2.tag_manager.service import TagManagerError, TagManagerService
 from tagger2.tag_manager.sidecar_io import render_tags_json
 from tagger2.tag_manager.storage import TagManagerStore
+from tagger2.tag_text import canonical_tag_key
 
 
 class FakeTagDatabase:
@@ -44,7 +45,9 @@ class FakeTagDatabase:
         return None
 
     def lookup(self, profile: str, tag: str, *, resolve_alias: bool = True):
-        category = self.categories.get(tag.casefold())
+        # The real database keys on canonical_tag_key (lowercase underscore),
+        # so a space-styled query must resolve the underscore-styled entry.
+        category = self.categories.get(canonical_tag_key(tag))
         if category is None:
             return None
         return {"name": tag, "category": category, "post_count": 10, "alias_of": None}
@@ -1872,3 +1875,666 @@ def test_delete_session_from_worker_thread_cancels_queued_scan(workspace):
         await asyncio.gather(*occupied)
 
     asyncio.run(drive())
+
+
+# -- wave 1a regression coverage ----------------------------------------------
+
+
+def test_redo_replays_multiple_undos_in_original_order(workspace):
+    """Two edits on one image, undone twice, must redo oldest-undone first so
+    the final state matches the last edit (not the first).
+
+    The retired behaviour picked the largest undone id (the newest undo), so
+    the second redo replayed the wrong step and the history desynced.
+    """
+
+    service, _store, session, dataset = workspace
+    session_id = str(session["id"])
+    a_id = _image_ids_by_name(service, session_id)["a.png"]
+
+    detail = service.get_image(session_id, a_id)
+    service.save_image(session_id, a_id, ImageEditRequest(
+        content=TagTxtContent(tags=["solo", "wolf", "first"]),
+        expected_sidecar_mtime=detail["sidecar_mtime"],
+    ))
+    detail = service.get_image(session_id, a_id)
+    service.save_image(session_id, a_id, ImageEditRequest(
+        content=TagTxtContent(tags=["solo", "wolf", "second"]),
+        expected_sidecar_mtime=detail["sidecar_mtime"],
+    ))
+
+    service.undo(session_id)
+    service.undo(session_id)
+    assert (dataset / "a.txt").read_text(encoding="utf-8") == "solo, wolf\n"
+
+    service.redo(session_id)
+    assert (dataset / "a.txt").read_text(encoding="utf-8") == "solo, wolf, first\n"
+    service.redo(session_id)
+    assert (dataset / "a.txt").read_text(encoding="utf-8") == "solo, wolf, second\n"
+
+    with pytest.raises(TagManagerError) as excinfo:
+        service.redo(session_id)
+    assert excinfo.value.code == "redo_empty"
+
+
+def test_redo_interleaved_images_follows_undo_chain(workspace):
+    """Interleaved edits across two images undo/redo in strict LIFO order."""
+
+    service, _store, session, dataset = workspace
+    session_id = str(session["id"])
+    ids = _image_ids_by_name(service, session_id)
+    a_id, c_id = ids["a.png"], ids["c.png"]
+
+    service.batch_operation(
+        session_id, BatchOperationRequest(op="add", tags=["night"], image_ids=[a_id])
+    )
+    service.save_image(session_id, c_id, ImageEditRequest(content=TagTxtContent(tags=["c1"])))
+    service.batch_operation(
+        session_id, BatchOperationRequest(op="add", tags=["day"], image_ids=[a_id])
+    )
+
+    assert "day" in (dataset / "a.txt").read_text(encoding="utf-8")
+    assert (dataset / "c.txt").read_text(encoding="utf-8") == "c1\n"
+
+    service.undo(session_id)  # drop day
+    assert "day" not in (dataset / "a.txt").read_text(encoding="utf-8")
+    service.undo(session_id)  # drop c1 -> c becomes none
+    assert not (dataset / "c.txt").exists()
+    service.undo(session_id)  # drop night
+    assert (dataset / "a.txt").read_text(encoding="utf-8") == "solo, wolf\n"
+
+    service.redo(session_id)  # night back
+    assert "night" in (dataset / "a.txt").read_text(encoding="utf-8")
+    service.redo(session_id)  # c1 back
+    assert (dataset / "c.txt").read_text(encoding="utf-8") == "c1\n"
+    service.redo(session_id)  # day back
+    assert "day" in (dataset / "a.txt").read_text(encoding="utf-8")
+
+
+def test_undo_creating_edit_clears_stale_sidecar_path(workspace):
+    """Undo of a from-nothing save clears the recorded path; a later save of a
+    different format lands in the matching extension, not the stale one."""
+
+    service, _store, session, dataset = workspace
+    session_id = str(session["id"])
+    c_id = _image_ids_by_name(service, session_id)["c.png"]
+
+    service.save_image(session_id, c_id, ImageEditRequest(content=TagTxtContent(tags=["fresh"])))
+    assert (dataset / "c.txt").is_file()
+    assert service.get_image(session_id, c_id)["sidecar_kind"] == "tag_txt"
+
+    service.undo(session_id)
+    assert not (dataset / "c.txt").exists()
+    assert service.get_image(session_id, c_id)["sidecar_kind"] == "none"
+
+    # Now create a tags_json sidecar: without the fix this reused "c.txt" and
+    # wrote JSON bytes into the TXT extension.
+    service.save_image(
+        session_id, c_id,
+        ImageEditRequest(
+            content=TagsJsonContent(tags=[TagEdit(text="solo"), TagEdit(text="wolf")])
+        ),
+    )
+    assert (dataset / "c.json").is_file()
+    assert not (dataset / "c.txt").exists()
+    document = json.loads((dataset / "c.json").read_text(encoding="utf-8"))
+    assert [entry["text"] for entry in document["tags"]] == ["solo", "wolf"]
+    detail = service.get_image(session_id, c_id)
+    assert detail["content"]["kind"] == "tags_json"
+    assert {tag["tag"] for tag in detail["tags"]} == {"solo", "wolf"}
+
+
+def test_batch_parses_string_standard_json_fields(workspace):
+    """A nine-field list slot holding a comma string must be parsed, not
+    exploded into single characters."""
+
+    service, _store, session, dataset = workspace
+    session_id = str(session["id"])
+    (dataset / "b.json").write_text(
+        json.dumps({**STANDARD_JSON, "tags": "solo, wolf", "appearance": "blue eyes"}),
+        encoding="utf-8",
+    )
+    service.index_session(session_id)
+    b_id = _image_ids_by_name(service, session_id)["b.png"]
+
+    result = service.batch_operation(
+        session_id,
+        BatchOperationRequest(op="add", tags=["night"], image_ids=[b_id]),
+    )
+    assert result["affected"] == 1
+    document = json.loads((dataset / "b.json").read_text(encoding="utf-8"))
+    assert isinstance(document["tags"], list)
+    assert document["tags"] == ["solo", "wolf", "night"]
+    assert document["appearance"] == ["blue eyes", "night"]
+
+
+def test_batch_canonical_remove_matches_space_spelling(workspace):
+    """Removing `long_hair` hits a sidecar spelling `long hair`."""
+
+    service, _store, session, dataset = workspace
+    session_id = str(session["id"])
+    _make_image(dataset, "s.png")
+    (dataset / "s.txt").write_text("long hair, solo\n", encoding="utf-8")
+    service.index_session(session_id)
+    s_id = _image_ids_by_name(service, session_id)["s.png"]
+
+    result = service.batch_operation(
+        session_id, BatchOperationRequest(op="remove", tags=["long_hair"], image_ids=[s_id])
+    )
+    assert result["affected"] == 1
+    assert (dataset / "s.txt").read_text(encoding="utf-8") == "solo\n"
+
+
+def test_batch_canonical_add_does_not_duplicate_semantically(workspace):
+    """Adding `long_hair` next to an existing `long hair` is a no-op."""
+
+    service, _store, session, dataset = workspace
+    session_id = str(session["id"])
+    _make_image(dataset, "s.png")
+    (dataset / "s.txt").write_text("long hair, solo\n", encoding="utf-8")
+    service.index_session(session_id)
+    s_id = _image_ids_by_name(service, session_id)["s.png"]
+
+    result = service.batch_operation(
+        session_id, BatchOperationRequest(op="add", tags=["long_hair"], image_ids=[s_id])
+    )
+    assert result["affected"] == 0
+    assert result["no_change"] == 1
+    assert (dataset / "s.txt").read_text(encoding="utf-8") == "long hair, solo\n"
+
+
+def test_save_uses_canonical_key_for_enrichment(workspace):
+    """The fake tag database now keys canonically; a different-case save still
+    enriches the category (guards against a casefold-only fake masking bugs)."""
+
+    service, _store, session, _dataset = workspace
+    session_id = str(session["id"])
+    a_id = _image_ids_by_name(service, session_id)["a.png"]
+
+    service.save_image(
+        session_id, a_id,
+        ImageEditRequest(content=TagTxtContent(tags=["solo", "WOLF"])),
+    )
+    detail = service.get_image(session_id, a_id)
+    categories = {tag["tag"]: tag["category"] for tag in detail["tags"]}
+    assert categories["WOLF"] == "general"
+
+
+def test_save_over_1mib_returns_413_and_writes_nothing(workspace):
+    """An oversized render is refused before the write: no file change, no
+    journal entry."""
+
+    service, store, session, dataset = workspace
+    session_id = str(session["id"])
+    c_id = _image_ids_by_name(service, session_id)["c.png"]
+    before = (dataset / "a.txt").read_text(encoding="utf-8")
+
+    huge = "x" * 512
+    with pytest.raises(TagManagerError) as excinfo:
+        service.save_image(
+            session_id, c_id,
+            ImageEditRequest(
+                content=TagsJsonContent(tags=[TagEdit(text=huge) for _ in range(2048)])
+            ),
+        )
+    assert excinfo.value.code == "sidecar_too_large"
+    assert excinfo.value.status_code == 413
+    assert not (dataset / "c.txt").exists()
+    assert store.journal_entries(session_id) == []
+    assert (dataset / "a.txt").read_text(encoding="utf-8") == before
+
+
+def test_batch_over_1mib_returns_413_and_writes_nothing(workspace):
+    """A regex replace that grows the document past 1 MiB is refused before the
+    write: the file is byte-identical and nothing is journalled."""
+
+    service, store, session, dataset = workspace
+    session_id = str(session["id"])
+
+    def long_tag(i: int) -> str:
+        head = f"tag{i:05d}"
+        return head + "x" * (256 - len(head))
+
+    document = {
+        **STANDARD_JSON,
+        "tags": [long_tag(i) for i in range(2048)],
+        "appearance": [long_tag(10_000 + i) for i in range(512)],
+        "environment": [long_tag(20_000 + i) for i in range(512)],
+    }
+    (dataset / "c.png").touch()
+    (dataset / "c.json").write_text(json.dumps(document), encoding="utf-8")
+    service.index_session(session_id)
+    c_id = _image_ids_by_name(service, session_id)["c.png"]
+    before = (dataset / "c.json").read_text(encoding="utf-8")
+
+    with pytest.raises(TagManagerError) as excinfo:
+        service.batch_operation(
+            session_id,
+            # Doubling every "x" overwrites the tag budget: the render crosses
+            # 1 MiB even though the on-disk input is under it.
+            BatchOperationRequest(
+                op="replace", tags=["x"], replacement="xy", use_regex=True, image_ids=[c_id]
+            ),
+        )
+    assert excinfo.value.code == "sidecar_too_large"
+    assert excinfo.value.status_code == 413
+    assert (dataset / "c.json").read_text(encoding="utf-8") == before
+    assert store.journal_entries(session_id) == []
+
+
+def test_oversized_journal_text_is_rejected_before_replay():
+    """Phase-1 validation refuses an oversized journalled text, so a replay of
+    such an entry can never touch a file."""
+
+    from tagger2.tag_manager.editing import SessionEditor
+
+    huge = "x" * (1024 * 1024 + 1)  # comfortably over the 1 MiB budget
+    with pytest.raises(TagManagerError) as excinfo:
+        SessionEditor._assert_journal_text_valid(huge, "standard_json", "a.json")
+    assert excinfo.value.code == "sidecar_too_large"
+    assert excinfo.value.status_code == 413
+
+
+def test_batch_counts_read_only_and_no_change(workspace):
+    """Mixed batch reports affected / skipped_read_only / no_change separately."""
+
+    service, store, session, dataset = workspace
+    session_id = str(session["id"])
+    _make_image(dataset, "raw.png")
+    (dataset / "raw.json").write_text(
+        json.dumps({
+            "artist": [], "character": [], "contributor": [], "copyright": [],
+            "general": ["solo"], "invalid": [], "lore": [], "meta": [], "species": [],
+        }),
+        encoding="utf-8",
+    )
+    service.index_session(session_id)
+    ids = _image_ids_by_name(service, session_id)
+
+    # raw.png is read-only; a.png already has wolf (no change); c.png changes.
+    result = service.batch_operation(
+        session_id,
+        BatchOperationRequest(
+            op="add", tags=["wolf"], image_ids=[ids["a.png"], ids["raw.png"], ids["c.png"]]
+        ),
+    )
+    assert result["affected"] == 1
+    assert result["skipped_read_only"] == 1
+    assert result["no_change"] == 1
+    assert store.journal_entries(session_id)[0]["spec"]["count"] == 1
+
+    # A batch with only read-only/no-op targets still reports the tallies.
+    result = service.batch_operation(
+        session_id,
+        BatchOperationRequest(op="add", tags=["wolf"], image_ids=[ids["a.png"], ids["raw.png"]]),
+    )
+    assert result["affected"] == 0
+    assert result["journal_id"] is None
+    assert result["skipped_read_only"] == 1
+    assert result["no_change"] == 1
+
+
+def test_session_detail_reports_can_undo_can_redo(workspace):
+    service, _store, session, _dataset = workspace
+    session_id = str(session["id"])
+    a_id = _image_ids_by_name(service, session_id)["a.png"]
+
+    assert service.get_session(session_id)["can_undo"] is False
+    assert service.get_session(session_id)["can_redo"] is False
+
+    service.save_image(session_id, a_id, ImageEditRequest(content=TagTxtContent(tags=["solo"])))
+    assert service.get_session(session_id)["can_undo"] is True
+    assert service.get_session(session_id)["can_redo"] is False
+
+    service.undo(session_id)
+    assert service.get_session(session_id)["can_undo"] is False
+    assert service.get_session(session_id)["can_redo"] is True
+
+    service.redo(session_id)
+    assert service.get_session(session_id)["can_undo"] is True
+    assert service.get_session(session_id)["can_redo"] is False
+
+
+def test_api_batch_exposes_skip_counts(workspace):
+    """The batch route surfaces affected / skipped_read_only / no_change."""
+
+    service, _store, session, dataset = workspace
+    session_id = str(session["id"])
+    app = FastAPI()
+    app.include_router(create_tag_manager_router(service))
+    client = TestClient(app)
+
+    _make_image(dataset, "raw.png")
+    (dataset / "raw.json").write_text(
+        json.dumps({
+            "artist": [], "character": [], "contributor": [], "copyright": [],
+            "general": ["solo"], "invalid": [], "lore": [], "meta": [], "species": [],
+        }),
+        encoding="utf-8",
+    )
+    service.index_session(session_id)
+    ids = _image_ids_by_name(service, session_id)
+
+    response = client.post(
+        f"/api/v1/tag-manager/datasets/{session_id}/batch",
+        json={
+            "op": "add", "tags": ["wolf"],
+            "image_ids": [ids["a.png"], ids["raw.png"], ids["c.png"]],
+        },
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["affected"] == 1
+    assert body["skipped_read_only"] == 1
+    assert body["no_change"] == 1
+
+
+def test_api_accepts_ascending_sort_values(workspace):
+    """The listing route accepts the new ascending sort values and orders."""
+
+    service, _store, session, _dataset = workspace
+    session_id = str(session["id"])
+    app = FastAPI()
+    app.include_router(create_tag_manager_router(service))
+    client = TestClient(app)
+
+    base = f"/api/v1/tag-manager/datasets/{session_id}/images"
+    desc = client.get(base, params={"sort": "mtime"})
+    asc = client.get(base, params={"sort": "mtime_asc"})
+    assert desc.status_code == 200 and asc.status_code == 200
+    assert [item["file_name"] for item in asc.json()["items"]] == [
+        item["file_name"] for item in reversed(desc.json()["items"])
+    ]
+    by_tags = client.get(base, params={"sort": "tag_count_asc"})
+    assert by_tags.status_code == 200
+    counts = [item["tag_count"] for item in by_tags.json()["items"]]
+    assert counts == sorted(counts)
+
+
+def test_api_session_detail_exposes_can_undo_redo(workspace):
+    service, _store, session, _dataset = workspace
+    session_id = str(session["id"])
+    app = FastAPI()
+    app.include_router(create_tag_manager_router(service))
+    client = TestClient(app)
+    a_id = _image_ids_by_name(service, session_id)["a.png"]
+
+    before = client.get(f"/api/v1/tag-manager/datasets/{session_id}").json()
+    assert before["can_undo"] is False and before["can_redo"] is False
+
+    client.patch(
+        f"/api/v1/tag-manager/datasets/{session_id}/images/{a_id}",
+        json={"content": {"kind": "tag_txt", "tags": ["solo"]}},
+    )
+    after = client.get(f"/api/v1/tag-manager/datasets/{session_id}").json()
+    assert after["can_undo"] is True and after["can_redo"] is False
+
+
+# -- wave 2a: batch preview ----------------------------------------------------
+
+
+RAW_E621_JSON = {
+    "artist": [], "character": [], "contributor": [], "copyright": [],
+    "general": ["solo"], "invalid": [], "lore": [], "meta": [], "species": [],
+}
+
+
+def test_preview_batch_writes_nothing(workspace):
+    """A preview leaves every sidecar byte- and mtime-identical, appends no
+    journal entry and keeps the redo stack."""
+
+    service, store, session, dataset = workspace
+    session_id = str(session["id"])
+    ids = _image_ids_by_name(service, session_id)
+
+    # Seed a redo stack: a batch, then undo, leaves an undone entry that a
+    # preview must never discard.
+    service.batch_operation(
+        session_id,
+        BatchOperationRequest(op="add", tags=["night"], image_ids=[ids["a.png"]]),
+    )
+    service.undo(session_id)
+    assert store.latest_journal_entry(session_id, undone=True) is not None
+    journal_before = len(store.journal_entries(session_id))
+
+    before = {
+        "a.txt": (dataset / "a.txt").read_bytes(),
+        "b.json": (dataset / "b.json").read_bytes(),
+    }
+    mtimes = {name: os.stat(dataset / name).st_mtime_ns for name in before}
+
+    result = service.preview_batch(
+        session_id,
+        BatchOperationRequest(
+            op="add", tags=["fresh"],
+            image_ids=[ids["a.png"], ids["b.png"], ids["c.png"]],
+        ),
+    )
+
+    assert result["affected"] == 3
+    assert result["will_create"] == 1
+    for name, content in before.items():
+        assert (dataset / name).read_bytes() == content
+        assert os.stat(dataset / name).st_mtime_ns == mtimes[name]
+    assert not (dataset / "c.txt").exists()
+    assert not (dataset / "c.json").exists()
+    assert len(store.journal_entries(session_id)) == journal_before
+    assert store.latest_journal_entry(session_id, undone=True) is not None
+
+
+def test_preview_batch_counts_mixed_targets(workspace):
+    """affected / no_change / skipped_read_only / will_create are tallied for
+    targets that would write, are a no-op, are read-only and do not exist."""
+
+    service, store, session, dataset = workspace
+    session_id = str(session["id"])
+    _make_image(dataset, "raw.png")
+    (dataset / "raw.json").write_text(json.dumps(RAW_E621_JSON), encoding="utf-8")
+    service.index_session(session_id)
+    ids = _image_ids_by_name(service, session_id)
+
+    # a.png already has wolf (no change); raw.png is read-only; c.png has no
+    # sidecar and would be created as tag_txt.
+    result = service.preview_batch(
+        session_id,
+        BatchOperationRequest(
+            op="add", tags=["wolf"],
+            image_ids=[ids["a.png"], ids["raw.png"], ids["c.png"]],
+        ),
+    )
+    assert result["targets"] == 3
+    assert result["affected"] == 1
+    assert result["no_change"] == 1
+    assert result["skipped_read_only"] == 1
+    assert result["will_create"] == 1
+    assert result["formats"] == {
+        "tag_txt": 1, "tags_json": 0, "standard_json": 0, "none": 0,
+    }
+    assert store.journal_entries(session_id) == []
+
+
+def test_preview_batch_samples_are_ordered_and_formatted(workspace):
+    """Samples follow target order and carry the real before/after tag lists
+    for both tag_txt and tags_json targets."""
+
+    service, _store, session, dataset = workspace
+    session_id = str(session["id"])
+    d_id = _add_tags_json_sidecar(service, session, dataset)
+    ids = _image_ids_by_name(service, session_id)
+
+    result = service.preview_batch(
+        session_id,
+        BatchOperationRequest(
+            op="add", tags=["night"], image_ids=[ids["a.png"], d_id]
+        ),
+    )
+    assert result["affected"] == 2
+    assert [sample["file_name"] for sample in result["samples"]] == ["a.png", "d.png"]
+    first, second = result["samples"]
+    assert first["kind"] == "tag_txt"
+    assert first["before_tags"] == ["solo", "wolf"]
+    assert first["after_tags"] == ["solo", "wolf", "night"]
+    assert second["kind"] == "tags_json"
+    assert second["before_tags"] == ["solo"]
+    assert second["after_tags"] == ["solo", "night"]
+
+
+def test_preview_batch_samples_capped_at_five(workspace):
+    """Only the first five changed targets appear, in target order."""
+
+    service, _store, session, dataset = workspace
+    session_id = str(session["id"])
+    for index in range(6):
+        _make_image(dataset, f"p{index}.png")
+        (dataset / f"p{index}.txt").write_text("solo\n", encoding="utf-8")
+    service.index_session(session_id)
+    ids = [int(item["id"]) for item in service.list_images(session_id)["items"]]
+
+    result = service.preview_batch(
+        session_id, BatchOperationRequest(op="add", tags=["night"], image_ids=ids)
+    )
+    assert result["affected"] == 9  # a, b, c, p0..p5
+    assert [sample["file_name"] for sample in result["samples"]] == [
+        "a.png", "b.png", "c.png", "p0.png", "p1.png",
+    ]
+
+
+def test_preview_batch_scope_matches_batch_semantics(workspace):
+    """Filter-scoped and id-scoped previews resolve the same targets the real
+    batch would and predict the same tallies."""
+
+    service, _store, session, _dataset = workspace
+    session_id = str(session["id"])
+    ids = _image_ids_by_name(service, session_id)
+
+    filtered = BatchOperationRequest(
+        op="add", tags=["night"], filter=ImageFilter(sidecar="present")
+    )
+    preview = service.preview_batch(session_id, filtered)
+    assert preview["targets"] == 2
+    assert preview["affected"] == 2
+
+    batch = service.batch_operation(
+        session_id,
+        BatchOperationRequest(op="add", tags=["night"], filter=ImageFilter(sidecar="present")),
+    )
+    assert batch["affected"] == preview["affected"]
+    assert batch["no_change"] == preview["no_change"]
+    assert batch["skipped_read_only"] == preview["skipped_read_only"]
+
+    selected = BatchOperationRequest(op="add", tags=["day"], image_ids=[ids["a.png"]])
+    preview_selected = service.preview_batch(session_id, selected)
+    assert preview_selected["targets"] == 1
+    batch_selected = service.batch_operation(
+        session_id,
+        BatchOperationRequest(op="add", tags=["day"], image_ids=[ids["a.png"]]),
+    )
+    assert batch_selected["affected"] == preview_selected["affected"] == 1
+
+
+def test_preview_batch_allows_read_only_root(tmp_path: Path):
+    """Previewing never writes, so a read-only dataset root is acceptable."""
+
+    dataset = tmp_path / "dataset"
+    dataset.mkdir()
+    _make_image(dataset, "a.png")
+    (dataset / "a.txt").write_text("solo\n", encoding="utf-8")
+    allowlist = PathAllowlist()
+    allowlist.register(dataset, root_id="preview-ro-root", kind="input", writable=False)
+    service = TagManagerService(
+        store=TagManagerStore(":memory:"),
+        allowlist=allowlist,
+        thumbnails=FakeThumbnails(),
+        tag_database=FakeTagDatabase(),
+    )
+    session = service.create_session(
+        CreateDatasetRequest(root_id="preview-ro-root", relative_path="", profile="e621")
+    )
+    service.index_session(str(session["id"]))
+    a_id = _image_ids_by_name(service, str(session["id"]))["a.png"]
+
+    result = service.preview_batch(
+        str(session["id"]),
+        BatchOperationRequest(op="add", tags=["night"], image_ids=[a_id]),
+    )
+    assert result["affected"] == 1
+    assert (dataset / "a.txt").read_text(encoding="utf-8") == "solo\n"
+
+
+def test_preview_batch_rejects_above_max_for_both_target_shapes(workspace):
+    """The 2000-image cap applies to previews with a 413 before any work."""
+
+    service, store, session, _dataset = workspace
+    session_id = str(session["id"])
+    store.upsert_images(
+        session_id,
+        [
+            {
+                "relative_path": f"bulk/img_{i}.png",
+                "file_name": f"img_{i}.png",
+                "image_format": "png",
+                "sidecar_kind": "none",
+                "sidecar_path": None,
+                "mtime": 100.0 + i,
+                "sidecar_mtime": None,
+                "width": 8,
+                "height": 8,
+                "tag_count": 0,
+            }
+            for i in range(MAX_BATCH_IMAGES + 50)
+        ],
+    )
+
+    with pytest.raises(TagManagerError) as excinfo:
+        service.preview_batch(
+            session_id,
+            BatchOperationRequest(op="add", tags=["fresh"], filter=ImageFilter(sidecar="any")),
+        )
+    assert excinfo.value.code == "batch_too_large"
+    assert excinfo.value.status_code == 413
+
+    ids = [int(item["id"]) for item in store.list_images(session_id, limit=MAX_BATCH_IMAGES + 50)[0]]
+    with pytest.raises(TagManagerError) as excinfo:
+        service.preview_batch(
+            session_id, BatchOperationRequest(op="add", tags=["fresh"], image_ids=ids)
+        )
+    assert excinfo.value.code == "batch_too_large"
+    assert store.journal_entries(session_id) == []
+
+
+def test_api_batch_preview_contract(workspace):
+    """The preview route answers with the BatchPreviewResponse shape and writes
+    nothing; a malformed body keeps the standard 422 envelope."""
+
+    service, store, session, dataset = workspace
+    session_id = str(session["id"])
+    app = FastAPI()
+    app.include_router(create_tag_manager_router(service))
+    client = TestClient(app)
+    ids = _image_ids_by_name(service, session_id)
+
+    response = client.post(
+        f"/api/v1/tag-manager/datasets/{session_id}/batch/preview",
+        json={"op": "add", "tags": ["night"], "image_ids": [ids["a.png"]]},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["targets"] == 1
+    assert body["affected"] == 1
+    assert body["no_change"] == 0
+    assert body["skipped_read_only"] == 0
+    assert body["will_create"] == 0
+    assert body["formats"] == {
+        "tag_txt": 1, "tags_json": 0, "standard_json": 0, "none": 0,
+    }
+    assert body["samples"][0]["file_name"] == "a.png"
+    assert body["samples"][0]["after_tags"] == ["solo", "wolf", "night"]
+    assert (dataset / "a.txt").read_text(encoding="utf-8") == "solo, wolf\n"
+    assert store.journal_entries(session_id) == []
+
+    bad = client.post(
+        f"/api/v1/tag-manager/datasets/{session_id}/batch/preview",
+        json={"op": "add", "tags": ["night"], "image_ids": []},
+    )
+    assert bad.status_code == 422
+

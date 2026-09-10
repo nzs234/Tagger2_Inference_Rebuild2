@@ -133,7 +133,7 @@ function applyWriteStyle(
  * are lost mid-review. A `syncToken` bump forces the draft back to the
  * server content (explicit reload after a conflict).
  */
-export function EditorDrawer({ detail, profile, saving, conflict, hasPrev, hasNext, onClose, onNavigate, onSave, onReload, syncToken, saveRevision, saveErrorToken }: {
+export function EditorDrawer({ detail, profile, saving, conflict, hasPrev, hasNext, onClose, onNavigate, onSave, onReload, syncToken, saveRevision, saveErrorToken, registerLeaveGuard }: {
   detail: TagManagerImageDetail
   profile: TagManagerProfile
   saving: boolean
@@ -147,12 +147,14 @@ export function EditorDrawer({ detail, profile, saving, conflict, hasPrev, hasNe
   syncToken?: string | number
   saveRevision?: number
   saveErrorToken?: number
+  /** Publishes the draft guard to the editor hook; see `confirmLeaveIfDirty`. */
+  registerLeaveGuard: (guard: ((action: () => void) => void) | null) => void
 }) {
   const [draft, setDraft] = useState<TagManagerImageContent>(() => detail.content)
   // Clean baseline for the dirty guard; it is updated only after the parent
   // reports a successful save or an explicit reload.
   const [baseline, setBaseline] = useState<TagManagerImageContent>(() => detail.content)
-  const [pendingNav, setPendingNav] = useState<'close' | 'prev' | 'next' | null>(null)
+  const [pendingConfirm, setPendingConfirm] = useState<{ kind: 'discard' | 'saving'; label: string; action: () => void } | null>(null)
   const [copyState, setCopyState] = useState<'idle' | 'copied' | 'failed'>('idle')
   const copyTimer = useRef<number | null>(null)
   const pendingBaseline = useRef<TagManagerImageContent | null>(null)
@@ -193,13 +195,34 @@ export function EditorDrawer({ detail, profile, saving, conflict, hasPrev, hasNe
   }, [saveErrorToken])
 
   const editable = draft.kind === 'tag_txt' || draft.kind === 'tags_json' || draft.kind === 'standard_json'
-  const requestNav = (target: 'close' | 'prev' | 'next') => {
-    if (dirty && editable && !saving) {
-      setPendingNav(target)
+  const navLabels: Record<'close' | 'prev' | 'next', string> = {
+    close: '关闭编辑器',
+    prev: '上一张',
+    next: '下一张',
+  }
+  /**
+   * Single gate for every way out of the drawer (close, prev/next, session
+   * switch).  An in-flight save takes precedence: even a clean draft must not
+   * unmount the drawer while the mutation is pending, or the conflict-recovery
+   * UI would disappear with the save still unresolved.  Otherwise a dirty
+   * editable draft confirms before it is discarded.
+   */
+  const guard = (action: () => void, label: string) => {
+    if (saving) {
+      setPendingConfirm({ kind: 'saving', label, action })
       return
     }
-    if (target === 'close') onClose()
-    else onNavigate(target === 'next' ? 1 : -1)
+    if (dirty && editable) {
+      setPendingConfirm({ kind: 'discard', label, action })
+      return
+    }
+    action()
+  }
+  const requestNav = (target: 'close' | 'prev' | 'next') => {
+    guard(() => {
+      if (target === 'close') onClose()
+      else onNavigate(target === 'next' ? 1 : -1)
+    }, navLabels[target])
   }
   const save = (action?: 'close' | 'next' | 'prev') => {
     if (!editable || saving) return
@@ -207,17 +230,32 @@ export function EditorDrawer({ detail, profile, saving, conflict, hasPrev, hasNe
     pendingBaseline.current = draft
     onSave(payload, action)
   }
-  const discardAndNav = () => {
-    const target = pendingNav
-    setPendingNav(null)
-    if (target === 'close') onClose()
-    else if (target) onNavigate(target === 'next' ? 1 : -1)
+  const confirmPending = () => {
+    const action = pendingConfirm?.action
+    setPendingConfirm(null)
+    action?.()
   }
-  const navLabels: Record<'close' | 'prev' | 'next', string> = {
-    close: '关闭编辑器',
-    prev: '上一张',
-    next: '下一张',
-  }
+  // Publish the guard while mounted so the page's session-switch entry points
+  // (`confirmLeaveIfDirty`) can ask before the active session changes.  The
+  // latest saving/dirty/editable values are read from a ref so the registered
+  // callback is never stale without re-registering on every keystroke.
+  const guardState = useRef({ saving, dirty, editable })
+  guardState.current = { saving, dirty, editable }
+  useEffect(() => {
+    registerLeaveGuard((action) => {
+      const state = guardState.current
+      if (state.saving) {
+        setPendingConfirm({ kind: 'saving', label: '切换会话', action })
+        return
+      }
+      if (state.dirty && state.editable) {
+        setPendingConfirm({ kind: 'discard', label: '切换会话', action })
+        return
+      }
+      action()
+    })
+    return () => registerLeaveGuard(null)
+  }, [registerLeaveGuard])
   /** Conflict recovery escape hatch: copy the unsaved draft out before the
    * reload discards it.  jsdom (and hardened browsers) may not expose the
    * clipboard, so failures degrade to a brief 复制失败 feedback. */
@@ -271,7 +309,7 @@ export function EditorDrawer({ detail, profile, saving, conflict, hasPrev, hasNe
         <div className="tm-drawer-footer-actions">
           <Button variant="quiet" disabled={!hasPrev || saving} onClick={() => requestNav('prev')}>上一张</Button>
           <Button variant="quiet" disabled={!hasNext || saving} onClick={() => requestNav('next')}>下一张</Button>
-          <Button variant="secondary" onClick={() => requestNav('close')}>关闭</Button>
+          <Button variant="secondary" disabled={saving} onClick={() => requestNav('close')}>关闭</Button>
           {hasPrev && <Button
             icon={saving ? <LoaderCircle className="spin" size={15} /> : undefined}
             disabled={readOnly || !editable || saving}
@@ -290,12 +328,19 @@ export function EditorDrawer({ detail, profile, saving, conflict, hasPrev, hasNe
         </div>
       </footer>
     </div>
-    {pendingNav != null && <ConfirmDialog
-      title={dirty ? `有未保存的更改，仍要${navLabels[pendingNav]}？` : navLabels[pendingNav]}
-      detail={<span>当前草稿尚未保存，{pendingNav === 'close' ? '关闭编辑器' : '切换图片'}会丢弃这些更改。</span>}
+    {pendingConfirm?.kind === 'saving' && <ConfirmDialog
+      title="保存仍在进行中，确定要关闭吗？"
+      detail={<span>关闭会中断当前保存的反馈；若保存失败，冲突处理入口也会随之消失。</span>}
+      confirmLabel="仍然关闭"
+      onConfirm={confirmPending}
+      onClose={() => setPendingConfirm(null)}
+    />}
+    {pendingConfirm?.kind === 'discard' && <ConfirmDialog
+      title={`有未保存的更改，仍要${pendingConfirm.label}？`}
+      detail={<span>当前图片有未保存的更改，{pendingConfirm.label}将丢弃这些更改。</span>}
       confirmLabel="丢弃更改"
-      onConfirm={discardAndNav}
-      onClose={() => setPendingNav(null)}
+      onConfirm={confirmPending}
+      onClose={() => setPendingConfirm(null)}
     />}
   </DialogLayer>
 }

@@ -171,9 +171,13 @@ export function FilterBar({ filter, sort, profile, disabled, onChange, onSortCha
     </Field>
     <Field label="排序">
       <select value={sort} aria-label="排序" disabled={disabled} onChange={(event) => onSortChange(event.target.value as TagManagerSort)}>
-        <option value="name">文件名</option>
-        <option value="mtime">修改时间</option>
-        <option value="tags">标签数</option>
+        {/* `mtime`/`tags` keep their legacy descending values; the `_asc`
+            variants were added alongside them (see docs/tag_manager.md). */}
+        <option value="name">名称</option>
+        <option value="mtime">修改时间（新→旧）</option>
+        <option value="mtime_asc">修改时间（旧→新）</option>
+        <option value="tags">标签数（多→少）</option>
+        <option value="tag_count_asc">标签数（少→多）</option>
       </select>
     </Field>
   </div>

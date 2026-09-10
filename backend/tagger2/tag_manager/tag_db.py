@@ -21,6 +21,7 @@ import os
 import threading
 from typing import Any, TypedDict
 
+from ..tag_text import canonical_tag_key
 from ..workflow.resources import CLASSIFY_RESOURCE_CATEGORY, WorkflowResourceCatalog
 
 # e621 alias chains are flattened to their final target exactly like
@@ -145,17 +146,20 @@ class TagDatabase:
     def lookup(
         self, profile: str, tag: str, *, resolve_alias: bool = True
     ) -> TagInfo | None:
-        """Case-insensitively look up one tag.
+        """Look up one tag after canonicalizing the query.
 
-        When ``tag`` names a known alias antecedent and ``resolve_alias`` is
-        true, the canonical tag is returned with ``alias_of`` set to the
-        antecedent. An unloaded profile is loaded first; unknown tags return
-        None. Raises :class:`TagDatabaseError` when no snapshot is available.
+        The query is folded through :func:`canonical_tag_key` (lowercase
+        underscore), so ``Long Hair`` and ``long_hair`` both reach the stored
+        canonical entry.  When ``tag`` names a known alias antecedent and
+        ``resolve_alias`` is true, the canonical tag is returned with
+        ``alias_of`` set to the antecedent. An unloaded profile is loaded
+        first; unknown tags return None. Raises :class:`TagDatabaseError` when
+        no snapshot is available.
         """
 
         self.ensure_loaded(profile)
         index = _CACHE[self._cache_key(profile)]
-        key = tag.casefold()
+        key = canonical_tag_key(tag)
         if resolve_alias:
             alias = index.aliases.get(key)
             if alias is not None:
@@ -180,7 +184,7 @@ class TagDatabase:
         if not text or limit <= 0:
             return []
         index = _CACHE[self._cache_key(profile)]
-        prefix = text.casefold()
+        prefix = canonical_tag_key(text)
         names = index.sorted_names
         start = bisect.bisect_left(names, prefix)
         matches: list[TagInfo] = []
@@ -197,15 +201,15 @@ class TagDatabase:
     ) -> list[TagInfo]:
         """Resolve the tag through aliases, returning implied or implying tags.
 
-        Resolves ``tag`` through aliases (casefold), returning the :class:`TagInfo`
-        for each mapped key (skipping keys not present in canonical tags;
-        sorted by post_count desc, then name). ``reverse=True`` answers
-        which tags imply this one. Unknown tags return an empty list.
+        Resolves ``tag`` through aliases (canonical key), returning the
+        :class:`TagInfo` for each mapped key (skipping keys not present in
+        canonical tags; sorted by post_count desc, then name). ``reverse=True``
+        answers which tags imply this one. Unknown tags return an empty list.
         """
 
         self.ensure_loaded(profile)
         index = _CACHE[self._cache_key(profile)]
-        key = tag.casefold()
+        key = canonical_tag_key(tag)
         alias = index.aliases.get(key)
         canonical_key = alias[1] if alias is not None else key
 
@@ -311,7 +315,9 @@ def _build_index(resource_id: str, document: dict[str, Any]) -> _ProfileIndex:
         category = row.get("category")
         # The snapshot builder already validated categories against the
         # profile's declared table, so unknown strings are kept as-is.
-        tags[name.casefold()] = {
+        # Keys are the shared canonical form (lowercase underscore) so a query
+        # typed with spaces resolves the same way as the stored spelling.
+        tags[canonical_tag_key(name)] = {
             "name": name,
             "category": category if isinstance(category, str) else "",
             "post_count": post_count,
@@ -326,7 +332,13 @@ def _build_index(resource_id: str, document: dict[str, Any]) -> _ProfileIndex:
         consequent = row.get("consequent_name")
         if not isinstance(antecedent, str) or not isinstance(consequent, str):
             continue
-        raw_aliases[antecedent.casefold()] = (antecedent, consequent.casefold())
+        antecedent_key = canonical_tag_key(antecedent)
+        consequent_key = canonical_tag_key(consequent)
+        # An alias whose two sides differ only by style is a no-op under the
+        # canonical key; recording it would look like a one-step cycle.
+        if antecedent_key == consequent_key:
+            continue
+        raw_aliases[antecedent_key] = (antecedent, consequent_key)
 
     aliases: dict[str, tuple[str, str]] = {}
     for antecedent_key, (display, first_target) in raw_aliases.items():
@@ -362,8 +374,8 @@ def _build_index(resource_id: str, document: dict[str, Any]) -> _ProfileIndex:
         consequent = row.get("consequent_name")
         if not isinstance(antecedent, str) or not isinstance(consequent, str):
             continue
-        ant_key = antecedent.casefold()
-        con_key = consequent.casefold()
+        ant_key = canonical_tag_key(antecedent)
+        con_key = canonical_tag_key(consequent)
         ant_canonical = _resolve_canonical(ant_key)
         con_canonical = _resolve_canonical(con_key)
         if ant_canonical == con_canonical:

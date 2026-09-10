@@ -2,9 +2,13 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { TagManager } from '../src/pages/TagManager'
-import type { TagManagerImageDetail, TagManagerImageSummary, TagManagerSession } from '../src/lib/tagManager'
+import type { BatchPreviewResponse, TagManagerImageDetail, TagManagerImageSummary, TagManagerSession } from '../src/lib/tagManager'
 
-const session: TagManagerSession = {
+/** Session detail carries journal-availability flags the shared type does not
+ * expose yet (added alongside this wave of UI changes). */
+type SessionFixture = TagManagerSession & { can_undo?: boolean; can_redo?: boolean }
+
+const session: SessionFixture = {
   id: 'ds-1',
   name: 'cats',
   root_id: 'in',
@@ -16,6 +20,10 @@ const session: TagManagerSession = {
   image_count: 3,
   created_at: '2026-09-01T00:00:00Z',
   updated_at: '2026-09-01T00:00:00Z',
+  // Both journal directions start available so the session-bar buttons are
+  // clickable; individual tests flip them off to exercise the disabled logic.
+  can_undo: true,
+  can_redo: true,
 }
 
 function summary(id: number, fileName: string, sidecarKind: TagManagerImageSummary['sidecar_kind'], tagCount: number): TagManagerImageSummary {
@@ -46,8 +54,22 @@ const detail: TagManagerImageDetail = {
   sidecar_mtime: 1_725_148_800,
 }
 
+/** Default preview: two targets change, one stays put; the confirm button is
+ * enabled so the legacy batch tests keep exercising the real write path. */
+const defaultPreview: BatchPreviewResponse = {
+  targets: 3,
+  affected: 2,
+  no_change: 1,
+  skipped_read_only: 0,
+  will_create: 0,
+  formats: { tag_txt: 2, tags_json: 0, standard_json: 0, none: 0 },
+  samples: [
+    { image_id: 1, file_name: 'a.png', kind: 'tag_txt', before_tags: ['solo', 'long_hair'], after_tags: ['long_hair', '1girl'] },
+  ],
+}
+
 interface HarnessState {
-  sessions: TagManagerSession[]
+  sessions: SessionFixture[]
   createBodies: Array<Record<string, unknown>>
   patchBodies: Array<Record<string, unknown>>
   batchBodies: Array<Record<string, unknown>>
@@ -71,6 +93,13 @@ interface HarnessState {
   thumbnailCalls: number[]
   /** When set, the next undo request fails with this error envelope. */
   undoError: { code: string; message: string } | null
+  /** Extra counters merged into the batch response (affected defaults to 2). */
+  batchCounters: { skipped_read_only?: number; no_change?: number }
+  /** Preview response served by POST .../batch/preview (a change is reported by
+   * default so the confirm button stays enabled). */
+  previewResult: BatchPreviewResponse
+  /** When set, the undo response carries this many reverted images. */
+  undoReverted: number | null
   /** When set, the images endpoint slices by offset: page one = `first`,
    * page two = `second`; `total` drives the page count (PAGE_SIZE is 60). */
   pagedPages: { first: TagManagerImageSummary[]; second: TagManagerImageSummary[]; total: number } | null
@@ -147,14 +176,19 @@ function setupFetch(state: HarnessState) {
       return json({ items: state.sessions })
     }
     if (/\/tag-manager\/datasets\/ds-1\/refresh$/.test(path)) return json({ ...session, status: 'indexing' }, 202)
+    if (/\/tag-manager\/datasets\/ds-1\/batch\/preview$/.test(path)) {
+      return json(state.previewResult)
+    }
     if (/\/tag-manager\/datasets\/ds-1\/batch$/.test(path)) {
       state.batchBodies.push(JSON.parse(init?.body as string) as Record<string, unknown>)
-      return json({ affected: 2, journal_id: 'j-batch' })
+      return json({ affected: 2, journal_id: 'j-batch', ...state.batchCounters })
     }
     if (/\/tag-manager\/datasets\/ds-1\/undo$/.test(path)) {
       if (state.undoError) return json(state.undoError, 409)
       state.undoCalls += 1
-      return json({ journal_id: 'j-undo' })
+      return json(state.undoReverted != null
+        ? { journal_id: 'j-undo', reverted: state.undoReverted }
+        : { journal_id: 'j-undo' })
     }
     if (/\/tag-manager\/datasets\/ds-1\/redo$/.test(path)) {
       state.redoCalls += 1
@@ -237,6 +271,9 @@ describe('TagManager page', () => {
       sidecarMtime: 1_725_148_800,
       thumbnailCalls: [],
       undoError: null,
+      batchCounters: {},
+      previewResult: { ...defaultPreview, formats: { ...defaultPreview.formats }, samples: defaultPreview.samples.map((sample) => ({ ...sample })) },
+      undoReverted: null,
       pagedPages: null,
     }
   })
@@ -349,9 +386,9 @@ describe('TagManager page', () => {
     fireEvent.click(screen.getByLabelText('使用正则表达式'))
 
     fireEvent.click(screen.getByRole('button', { name: '执行' }))
-    const confirmation = screen.getByRole('alertdialog', { name: '对 2 张图片执行「替换」？' })
-    expect(confirmation.textContent).toContain('选中的 2 张图片')
-    fireEvent.click(screen.getByRole('button', { name: '确认执行' }))
+    const previewDialog = await screen.findByRole('alertdialog', { name: '批量操作预览' })
+    expect(previewDialog.textContent).toContain('选中的 2 张图片')
+    fireEvent.click(within(previewDialog).getByRole('button', { name: '确认执行' }))
 
     await waitFor(() => expect(state.batchBodies).toHaveLength(1))
     expect(state.batchBodies[0]).toEqual({
@@ -549,9 +586,9 @@ describe('TagManager page', () => {
     await screen.findByRole('option', { name: /1girl/ })
     fireEvent.keyDown(tagInput, { key: 'Enter' })
     fireEvent.click(screen.getByRole('button', { name: '执行' }))
-    const confirmation = screen.getByRole('alertdialog', { name: '对 3 张图片执行「添加」？' })
-    expect(confirmation.textContent).toContain('当前过滤结果的全部 3 张图片')
-    fireEvent.click(screen.getByRole('button', { name: '确认执行' }))
+    const previewDialog = await screen.findByRole('alertdialog', { name: '批量操作预览' })
+    expect(previewDialog.textContent).toContain('当前过滤结果的全部 3 张图片')
+    fireEvent.click(within(previewDialog).getByRole('button', { name: '确认执行' }))
     await waitFor(() => expect(state.batchBodies).toHaveLength(1))
     expect(state.batchBodies[0]).toEqual({
       op: 'add',
@@ -895,7 +932,7 @@ describe('TagManager page', () => {
     await screen.findByRole('option', { name: /1girl/ })
     fireEvent.keyDown(tagInput, { key: 'Enter' })
     fireEvent.click(screen.getByRole('button', { name: '执行' }))
-    fireEvent.click(screen.getByRole('button', { name: '确认执行' }))
+    fireEvent.click(await screen.findByRole('button', { name: '确认执行' }))
 
     await waitFor(() => expect(state.batchBodies).toHaveLength(1))
     await waitFor(() => expect(screen.getByText('选中图片（0）')).toBeInTheDocument())
@@ -1113,5 +1150,163 @@ describe('TagManager page', () => {
       expected_sidecar_mtime: 1_725_148_805,
     })
     expect(within(dialog).queryByText(/有未保存更改/)).not.toBeInTheDocument()
+  })
+
+  it('confirms before a session switch discards a dirty draft', async () => {
+    state.sessions = [session, { ...session, id: 'ds-2', name: 'dogs', relative_path: 'dogs' }]
+    setupFetch(state)
+    renderPage()
+    await screen.findByAltText('a.png')
+
+    fireEvent.dblClick(screen.getByTitle('a.png'))
+    await screen.findByRole('dialog', { name: 'a.png' })
+    fireEvent.click(screen.getByRole('button', { name: '移除 solo' }))
+    const sessionSelect = screen.getByRole('combobox', { name: '现有会话' })
+
+    // Switching sessions with a dirty draft asks first.
+    fireEvent.change(sessionSelect, { target: { value: 'ds-2' } })
+    const confirm = await screen.findByRole('alertdialog')
+    expect(confirm.textContent).toContain('切换会话')
+    expect(confirm.textContent).toContain('未保存')
+
+    // Cancelling keeps both the current session and the whole draft.
+    fireEvent.click(within(confirm).getByRole('button', { name: '取消' }))
+    expect(sessionSelect).toHaveValue('ds-1')
+    expect(screen.getByRole('dialog', { name: 'a.png' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '移除 long_hair' })).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: '移除 solo' })).not.toBeInTheDocument()
+
+    // Confirming discards the draft, closes the editor and performs the switch.
+    fireEvent.change(sessionSelect, { target: { value: 'ds-2' } })
+    fireEvent.click(within(await screen.findByRole('alertdialog')).getByRole('button', { name: '丢弃更改' }))
+    await waitFor(() => expect(sessionSelect).toHaveValue('ds-2'))
+    expect(screen.queryByRole('dialog', { name: 'a.png' })).not.toBeInTheDocument()
+    expect(state.patchBodies).toHaveLength(0)
+  })
+
+  it('blocks closing the editor while a save is in flight', async () => {
+    setupFetch(state)
+    renderPage()
+    await screen.findByAltText('a.png')
+
+    fireEvent.dblClick(screen.getByTitle('a.png'))
+    const dialog = await screen.findByRole('dialog', { name: 'a.png' })
+    fireEvent.click(screen.getByRole('button', { name: '移除 solo' }))
+    const gate = deferred()
+    state.patchGate = gate
+    fireEvent.click(within(dialog).getByRole('button', { name: '保存' }))
+    await waitFor(() => expect(state.patchBodies).toHaveLength(1))
+
+    // The footer close button is disabled outright while saving.
+    const footer = dialog.querySelector('.tm-drawer-footer') as HTMLElement
+    expect(within(footer).getByRole('button', { name: '关闭' })).toBeDisabled()
+
+    // The header close button (and Escape) routes through the guard, which
+    // confirms because the drawer must not unmount mid-save.
+    const header = dialog.querySelector('.drawer-header') as HTMLElement
+    fireEvent.click(within(header).getByRole('button', { name: '关闭' }))
+    const confirm = await screen.findByRole('alertdialog')
+    expect(confirm.textContent).toContain('保存仍在进行中')
+    fireEvent.click(within(confirm).getByRole('button', { name: '取消' }))
+    expect(screen.getByRole('dialog', { name: 'a.png' })).toBeInTheDocument()
+
+    fireEvent.keyDown(document, { key: 'Escape' })
+    expect((await screen.findByRole('alertdialog')).textContent).toContain('保存仍在进行中')
+    fireEvent.click(within(screen.getByRole('alertdialog')).getByRole('button', { name: '取消' }))
+
+    gate.release()
+    await waitFor(() => expect(within(dialog).getByRole('button', { name: '保存' })).toBeEnabled())
+    expect(screen.getByRole('dialog', { name: 'a.png' })).toBeInTheDocument()
+  })
+
+  it('lets Escape close only the tag dropdown, not the editor', async () => {
+    setupFetch(state)
+    renderPage()
+    await screen.findByAltText('a.png')
+
+    fireEvent.dblClick(screen.getByTitle('a.png'))
+    await screen.findByRole('dialog', { name: 'a.png' })
+    const addInput = screen.getByRole('combobox', { name: '添加标签' })
+    fireEvent.change(addInput, { target: { value: 'haku' } })
+    await screen.findByRole('option', { name: /hakurei_reimu/ })
+
+    fireEvent.keyDown(addInput, { key: 'Escape' })
+    expect(screen.queryByRole('option', { name: /hakurei_reimu/ })).not.toBeInTheDocument()
+    expect(screen.getByRole('dialog', { name: 'a.png' })).toBeInTheDocument()
+  })
+
+  it('drops the whole selection through the explicit 清除选择 button', async () => {
+    setupFetch(state)
+    renderPage()
+    await screen.findByAltText('a.png')
+
+    // Nothing selected: the button is present but inert.
+    expect(screen.getByRole('button', { name: '清除选择' })).toBeDisabled()
+
+    fireEvent.click(screen.getByRole('checkbox', { name: '选择 a.png' }))
+    fireEvent.click(screen.getByRole('checkbox', { name: '选择 b.png' }))
+    expect(screen.getByText('选中图片（2）')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '清除选择' })).toBeEnabled()
+
+    fireEvent.click(screen.getByRole('button', { name: '清除选择' }))
+    expect(screen.getByText('选中图片（0）')).toBeInTheDocument()
+    expect(screen.getByRole('checkbox', { name: '选择 a.png' })).not.toBeChecked()
+    expect(screen.getByRole('checkbox', { name: '选择 b.png' })).not.toBeChecked()
+    expect(screen.getByRole('button', { name: '清除选择' })).toBeDisabled()
+  })
+
+  it('keeps the selection when the filter changes (clear button is the only reset)', async () => {
+    setupFetch(state)
+    renderPage()
+    await screen.findByAltText('a.png')
+
+    fireEvent.click(screen.getByRole('checkbox', { name: '选择 a.png' }))
+    expect(screen.getByText('选中图片（1）')).toBeInTheDocument()
+
+    // A filter change refetches the page but must not silently drop selected
+    // ids from outside the new result set.
+    const includeInput = screen.getByLabelText('包含标签')
+    fireEvent.change(includeInput, { target: { value: 'long' } })
+    const suggestion = await screen.findByRole('option', { name: /long_hair/ })
+    fireEvent.mouseDown(within(suggestion).getByRole('button'))
+    await waitFor(() => expect(state.imageQueries.at(-1)).toContain('include_tags=long_hair'))
+    expect(screen.getByText('选中图片（1）')).toBeInTheDocument()
+  })
+
+  it('disables undo and redo when the session detail reports no journal entries', async () => {
+    state.sessions = [{ ...session, can_undo: false, can_redo: false }]
+    setupFetch(state)
+    renderPage()
+    await screen.findByAltText('a.png')
+
+    expect(screen.getByRole('button', { name: '撤销' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: '重做' })).toBeDisabled()
+  })
+
+  it('reports batch skip counters in the success notice, omitting zero parts', async () => {
+    state.batchCounters = { skipped_read_only: 3, no_change: 0 }
+    setupFetch(state)
+    renderPage()
+    await screen.findByAltText('a.png')
+
+    const tagInput = screen.getByRole('combobox', { name: '批量标签' })
+    fireEvent.change(tagInput, { target: { value: '1g' } })
+    await screen.findByRole('option', { name: /1girl/ })
+    fireEvent.keyDown(tagInput, { key: 'Enter' })
+    fireEvent.click(screen.getByRole('button', { name: '执行' }))
+    fireEvent.click(await screen.findByRole('button', { name: '确认执行' }))
+
+    // no_change is 0 and gets dropped; the read-only skips stay.
+    expect(await screen.findByText('已修改 2 张，跳过 3 张（只读）')).toBeInTheDocument()
+  })
+
+  it('shows the reverted image count in the undo notice', async () => {
+    state.undoReverted = 4
+    setupFetch(state)
+    renderPage()
+    await screen.findByAltText('a.png')
+
+    fireEvent.click(screen.getByRole('button', { name: '撤销' }))
+    expect(await screen.findByText('已撤销上一步（恢复 4 张图片）')).toBeInTheDocument()
   })
 })

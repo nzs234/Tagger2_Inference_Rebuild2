@@ -184,6 +184,18 @@ function setupFetch(state: HarnessState) {
     }
     if (path === '/api/v1/tag-manager/datasets') return json({ items: [session] })
     if (/\/tag-manager\/datasets\/ds-1$/.test(path)) return json(session)
+    if (/\/tag-manager\/datasets\/ds-1\/batch\/preview$/.test(path)) {
+      // A batch of one target changes, so the preview confirm stays enabled.
+      return json({
+        targets: 1,
+        affected: 1,
+        no_change: 0,
+        skipped_read_only: 0,
+        will_create: 0,
+        formats: { tag_txt: 1, tags_json: 0, standard_json: 0, none: 0 },
+        samples: [{ image_id: 1, file_name: 'a.png', kind: 'tag_txt', before_tags: [], after_tags: ['long hair'] }],
+      })
+    }
     if (/\/tag-manager\/datasets\/ds-1\/batch$/.test(path)) {
       state.batchBodies.push(JSON.parse(init?.body as string) as Record<string, unknown>)
       return json({ affected: 1, journal_id: 'j-batch' })
@@ -408,7 +420,8 @@ describe('TagManager separator style', () => {
     fireEvent.keyDown(tagInput, { key: 'Enter' })
 
     fireEvent.click(screen.getByRole('button', { name: '执行' }))
-    fireEvent.click(screen.getByRole('button', { name: '确认执行' }))
+    const preview = await screen.findByRole('alertdialog', { name: '批量操作预览' })
+    fireEvent.click(within(preview).getByRole('button', { name: '确认执行' }))
 
     await waitFor(() => expect(state.batchBodies).toHaveLength(1))
     expect(state.batchBodies[0]).toEqual({

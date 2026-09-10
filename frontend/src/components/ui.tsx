@@ -431,6 +431,9 @@ export function DialogLayer({ children, onClose, className = 'drawer-backdrop', 
     }, 0)
 
     const onKeyDown = (event: KeyboardEvent) => {
+      // A nested control that already consumed Escape (e.g. the tag
+      // autocomplete closing its dropdown) must not also close the dialog.
+      if (event.defaultPrevented) return
       const backdrop = backdropRef.current
       const dialog = backdrop?.querySelector<HTMLElement>(dialogRoleSelector)
       if (!dialog) return

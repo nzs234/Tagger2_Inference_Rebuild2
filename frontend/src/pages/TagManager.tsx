@@ -1,5 +1,5 @@
 import { useQuery } from '@tanstack/react-query'
-import { ChartColumn, Images, ListChecks, LoaderCircle, Tags, X } from 'lucide-react'
+import { ChartColumn, Images, ListChecks, LoaderCircle, Tags, X, XCircle } from 'lucide-react'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { BatchBar } from '../components/tagManager/BatchBar'
 import { EditorDrawer } from '../components/tagManager/EditorDrawer'
@@ -15,7 +15,7 @@ import { useTagManagerImages } from '../components/tagManager/useTagManagerImage
 import { useTagManagerSessions } from '../components/tagManager/useTagManagerSessions'
 import { Button, ConfirmDialog, DialogLayer, EmptyState, Notice, Panel } from '../components/ui'
 import { api } from '../lib/api'
-import { describeTagManagerError } from '../lib/tagManagerErrors'
+import { describeTagManagerError, tagManagerErrorTone } from '../lib/tagManagerErrors'
 import {
   tagManagerApi,
   type ImageFilterState,
@@ -37,7 +37,9 @@ export function TagManager() {
   // copy; see lib/tagManagerErrors.ts.
   const { notices, push: pushNotice, dismiss: dismissNotice } = useNoticeQueue()
   const fail = useCallback((error: unknown, fallback: string) => {
-    pushNotice('danger', describeTagManagerError(error, fallback))
+    // Empty-history undo/redo is a benign no-op, so it renders as a warning
+    // instead of the danger tone used for real failures.
+    pushNotice(tagManagerErrorTone(error), describeTagManagerError(error, fallback))
   }, [pushNotice])
 
   // Session layer.  The cleanup callbacks only run on mutation success — long
@@ -99,6 +101,8 @@ export function TagManager() {
     openImage,
     closeEditor,
     cancelPendingNavigate,
+    confirmLeaveIfDirty,
+    registerLeaveGuard,
     navigate,
     save,
     reload,
@@ -107,7 +111,11 @@ export function TagManager() {
   // Any change of the active session — manual switch, create, the automatic
   // fallback after a deletion or a stale restored id — starts a new working
   // context.  Grid selection, the editor and the page are session-scoped
-  // state and must never leak into the next session.
+  // state and must never leak into the next session.  The user-facing switches
+  // (select/create/delete) run through `confirmLeaveIfDirty`, which owns the
+  // discard/saving confirmation and closes the editor before the switch, so
+  // this effect is a no-op for them.  It stays as the safety net for a session
+  // change we did not originate (e.g. a stale persisted id falling back).
   const lastActiveIdRef = useRef(activeId)
   useEffect(() => {
     if (lastActiveIdRef.current === activeId) return
@@ -167,6 +175,9 @@ export function TagManager() {
         <span><strong>{session?.image_count ?? total}</strong> 图片</span>
         <span className="heading-divider" />
         <span><strong>{selectedIds.size}</strong> 已选</span>
+        {/* Selection persists across pages and filter changes by design, so an
+            explicit clear action is the only way to drop it deliberately. */}
+        <Button size="sm" variant="quiet" icon={<XCircle size={13} />} disabled={selectedIds.size === 0} onClick={clear}>清除选择</Button>
       </div>
     </div>
 
@@ -188,15 +199,27 @@ export function TagManager() {
       undoPending={undoMutation.isPending}
       redoPending={redoMutation.isPending}
       actionsDisabled={actionsDisabled}
+      canUndo={Boolean(session?.can_undo)}
+      canRedo={Boolean(session?.can_redo)}
       onSelect={(id) => {
-        selectSession(id)
-        clear()
-        setPage(0)
-        closeEditor()
+        // Switching sessions discards the current draft; the editor confirms
+        // first when it is dirty or a save is in flight.
+        confirmLeaveIfDirty(() => {
+          selectSession(id)
+          clear()
+          setPage(0)
+          closeEditor()
+        })
       }}
-      onCreate={(body) => createMutation.mutate(body)}
+      onCreate={(body) => confirmLeaveIfDirty(() => {
+        closeEditor()
+        createMutation.mutate(body)
+      })}
       onRefresh={() => session && refreshMutation.mutate(session.id)}
-      onDelete={() => setConfirmDelete(true)}
+      onDelete={() => confirmLeaveIfDirty(() => {
+        closeEditor()
+        setConfirmDelete(true)
+      })}
       onUndo={() => session && undoMutation.mutate(session.id)}
       onRedo={() => session && redoMutation.mutate(session.id)}
     />
@@ -227,6 +250,8 @@ export function TagManager() {
             loadThumbnail={loadThumbnail}
             selectedIds={selectedIds}
             editingId={editingId}
+            // Different result set (session/page/filter/sort) starts at the top.
+            resetKey={`${activeId}:${page}:${JSON.stringify(filter)}:${sort}`}
             onToggleSelect={toggleSelect}
             onOpen={(image) => openImage(image.id)}
             empty={imagesError
@@ -246,13 +271,15 @@ export function TagManager() {
       <div className="tm-side">
         {/* Always mounted once the session is ready: the whole point of the
             filter scope is running a batch without selecting anything first. */}
-        {sessionReady && <BatchBar
+        {sessionReady && activeId && <BatchBar
+          sessionId={activeId}
           profile={session?.profile ?? 'e621'}
           filter={filter}
           selectedIds={selectedIdList}
           filteredTotal={total}
           submitting={batchMutation.isPending}
           disabled={!sessionReady}
+          notify={pushNotice}
           onSubmit={(body) => batchMutation.mutate(body)}
         />}
         <Panel
@@ -296,6 +323,7 @@ export function TagManager() {
           syncToken={syncToken}
           saveRevision={saveRevision}
           saveErrorToken={saveErrorToken}
+          registerLeaveGuard={registerLeaveGuard}
         />
       : <DialogLayer onClose={closeEditor}>
           <div className="tm-drawer drawer" role="dialog" aria-modal="true" aria-label={detailError ? '图片内容加载失败' : '正在加载图片'}>

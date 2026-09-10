@@ -16,6 +16,9 @@ export interface TagManagerSession {
   status: TagManagerSessionStatus
   error?: string | null
   image_count: number
+  /** Undo journal flags: buttons key off them instead of probing with 409s. */
+  can_undo?: boolean
+  can_redo?: boolean
   created_at: string
   updated_at: string
 }
@@ -55,7 +58,7 @@ export interface TagManagerImagePage {
   total: number
 }
 
-export type TagManagerSort = 'name' | 'mtime' | 'tags'
+export type TagManagerSort = 'name' | 'mtime' | 'mtime_asc' | 'tags' | 'tag_count_asc'
 export type TagManagerIncludeMode = 'all' | 'any'
 export type TagManagerKindFilter = 'any' | TagManagerSidecarKind
 export type TagManagerSidecarFilter = 'any' | 'present' | 'missing'
@@ -169,6 +172,36 @@ export interface TagManagerBatchResult {
   affected: number
   /** A no-op batch does not produce a journal entry, so the id may be absent or null. */
   journal_id?: number | null
+  /** Read-only targets (raw e621) the batch skipped instead of editing. */
+  skipped_read_only?: number
+  /** Targets the operation left unchanged (already absent/present tags). */
+  no_change?: number
+}
+
+/**
+ * Read-only preview of a batch operation: the same tallies the real batch
+ * would report, plus a per-format breakdown and up to five before/after
+ * samples.  Nothing is written, journalled or indexed.
+ */
+export interface BatchPreviewResponse {
+  targets: number
+  affected: number
+  no_change: number
+  skipped_read_only: number
+  /** Targets whose sidecar does not exist yet and would be created. */
+  will_create: number
+  /**
+   * Effective target format tally. A target with no sidecar falls back to
+   * `tag_txt`, so its fresh sidecar counts there and `none` stays 0.
+   */
+  formats: { tag_txt: number; tags_json: number; standard_json: number; none: number }
+  samples: Array<{
+    image_id: number
+    file_name: string
+    kind: 'tag_txt' | 'tags_json' | 'standard_json'
+    before_tags: string[]
+    after_tags: string[]
+  }>
 }
 
 export interface TagManagerJournalResult {
@@ -297,6 +330,8 @@ export const tagManagerApi = {
 
   batch: (sessionId: string, body: TagManagerBatchRequest) =>
     request<TagManagerBatchResult>(`${datasetPath(sessionId)}/batch`, { method: 'POST', body: JSON.stringify(body) }),
+  batchPreview: (sessionId: string, body: TagManagerBatchRequest) =>
+    request<BatchPreviewResponse>(`${datasetPath(sessionId)}/batch/preview`, { method: 'POST', body: JSON.stringify(body) }),
   undo: (sessionId: string) =>
     request<TagManagerJournalResult>(`${datasetPath(sessionId)}/undo`, { method: 'POST', body: '{}' }),
   redo: (sessionId: string) =>

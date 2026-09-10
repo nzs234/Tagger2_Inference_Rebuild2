@@ -145,13 +145,18 @@ def resolve_sidecar(
     session: Mapping[str, Any],
     image: Mapping[str, Any],
     sidecar_path: str,
+    *,
+    for_write: bool = True,
 ) -> Path:
+    # ``for_write`` defaults to True because every historical caller was a
+    # write; the batch preview resolves the same path to read it and passes
+    # False so a read-only dataset root can still be previewed.
     try:
         return allowlist.resolve(
             str(session["root_id"]),
             sidecar_path,
             must_exist=False,
-            for_write=True,
+            for_write=for_write,
             expect="file",
         )
     except PathNotAllowedError as exc:
@@ -270,7 +275,13 @@ class SessionIndexer:
         )
 
     def get_session(self, session_id: str) -> dict[str, Any]:
-        return require_session(self.store, session_id)
+        session = require_session(self.store, session_id)
+        # Surface the undo/redo availability on the detail response so the
+        # toolbar can render enabled/disabled buttons without polling the
+        # journal; the flags flip with every edit/undo/redo.
+        session["can_undo"] = self.store.has_journal_entry(session_id, undone=False)
+        session["can_redo"] = self.store.has_journal_entry(session_id, undone=True)
+        return session
 
     def list_sessions(self) -> list[dict[str, Any]]:
         return self.store.list_sessions()

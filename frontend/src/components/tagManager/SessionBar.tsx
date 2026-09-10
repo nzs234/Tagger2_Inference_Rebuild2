@@ -20,7 +20,7 @@ function SessionStatusBadge({ session }: { session: TagManagerSession }) {
   </span>
 }
 
-export function SessionBar({ sessions, activeSession, writableRoots, active, creating, refreshing, deleting, undoPending, redoPending, actionsDisabled, onSelect, onCreate, onRefresh, onDelete, onUndo, onRedo }: {
+export function SessionBar({ sessions, activeSession, writableRoots, active, creating, refreshing, deleting, undoPending, redoPending, actionsDisabled, canUndo, canRedo, onSelect, onCreate, onRefresh, onDelete, onUndo, onRedo }: {
   sessions: TagManagerSession[]
   activeSession?: TagManagerSession
   writableRoots: RootInfo[]
@@ -32,6 +32,10 @@ export function SessionBar({ sessions, activeSession, writableRoots, active, cre
   redoPending: boolean
   /** True while the session is missing or still indexing. */
   actionsDisabled: boolean
+  /** Session detail's can_undo: false when the journal has no undoable entry. */
+  canUndo: boolean
+  /** Session detail's can_redo: false when nothing has been undone yet. */
+  canRedo: boolean
   onSelect: (id: string) => void
   onCreate: (body: TagManagerCreateRequest) => void
   onRefresh: () => void
@@ -50,8 +54,8 @@ export function SessionBar({ sessions, activeSession, writableRoots, active, cre
     eyebrow="SESSION"
     actions={<div className="tm-session-actions">
       <Button size="sm" variant="secondary" icon={refreshing ? <LoaderCircle className="spin" size={14} /> : <RefreshCw size={14} />} disabled={actionsDisabled || refreshing} onClick={onRefresh}>刷新</Button>
-      <Button size="sm" variant="secondary" icon={<Undo2 size={14} />} disabled={actionsDisabled || undoPending} onClick={onUndo}>撤销</Button>
-      <Button size="sm" variant="secondary" icon={<Redo2 size={14} />} disabled={actionsDisabled || redoPending} onClick={onRedo}>重做</Button>
+      <Button size="sm" variant="secondary" icon={<Undo2 size={14} />} disabled={actionsDisabled || undoPending || !canUndo} onClick={onUndo}>撤销</Button>
+      <Button size="sm" variant="secondary" icon={<Redo2 size={14} />} disabled={actionsDisabled || redoPending || !canRedo} onClick={onRedo}>重做</Button>
       <Button size="sm" variant="danger" icon={<Trash2 size={14} />} disabled={!activeSession || deleting} onClick={onDelete}>删除会话</Button>
     </div>}
   >

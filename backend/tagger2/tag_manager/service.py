@@ -291,6 +291,11 @@ class TagManagerService:
     def batch_operation(self, session_id: str, request: BatchOperationRequest) -> dict[str, Any]:
         return self._editor.batch_operation(session_id, request)
 
+    def preview_batch(self, session_id: str, request: BatchOperationRequest) -> dict[str, Any]:
+        """Describe a batch operation's effect without writing anything."""
+
+        return self._editor.preview_batch(session_id, request)
+
     def _append_batch_journal(
         self,
         session_id: str,
@@ -312,8 +317,21 @@ class TagManagerService:
         image: Mapping[str, Any],
         request: BatchOperationRequest,
         categories: CategoryResolver,
-    ) -> dict[str, Any] | None:
+    ) -> Any:
         return self._editor._apply_batch_to_image(session, image, request, categories)
+
+    def _compute_batch_change(
+        self,
+        session: Mapping[str, Any],
+        image: Mapping[str, Any],
+        request: BatchOperationRequest,
+        categories: CategoryResolver,
+        *,
+        for_write: bool = True,
+    ) -> Any:
+        return self._editor._compute_batch_change(
+            session, image, request, categories, for_write=for_write
+        )
 
     # -- undo / redo -------------------------------------------------------
 

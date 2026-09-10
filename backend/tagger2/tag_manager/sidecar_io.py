@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any, Literal, Mapping, Sequence
 
 from ..nine_field_schema import NINE_FIELDS
+from ..tag_text import canonical_tag_key
 from ..workflow.raw_e621 import RawE621JsonError, parse_raw_e621_annotation
 
 SidecarKind = Literal[
@@ -79,7 +80,12 @@ def _decode(raw: bytes) -> str:
 
 
 def _parse_tag_list(text: str) -> tuple[str, ...]:
-    """Split comma-separated tags; dedup casefolded, keep first occurrence."""
+    """Split comma-separated tags; dedup on the canonical key, keep first spelling.
+
+    The canonical key folds case *and* the underscore/space style, so a TXT
+    carrying both ``long hair`` and ``long_hair`` collapses to the first
+    occurrence instead of indexing as two tags.
+    """
 
     tags: list[str] = []
     seen: set[str] = set()
@@ -87,7 +93,7 @@ def _parse_tag_list(text: str) -> tuple[str, ...]:
         tag = part.strip()
         if not tag:
             continue
-        key = tag.casefold()
+        key = canonical_tag_key(tag)
         if key not in seen:
             seen.add(key)
             tags.append(tag)
@@ -104,7 +110,7 @@ def _coerce_string_list(value: Any) -> tuple[str, ...]:
             tag = str(item).strip()
             if not tag:
                 continue
-            key = tag.casefold()
+            key = canonical_tag_key(tag)
             if key not in seen:
                 seen.add(key)
                 tags.append(tag)
@@ -241,7 +247,11 @@ def render_standard_json(document: Mapping[str, Any]) -> str:
 
 
 def dedup_tags(tags: list[str]) -> list[str]:
-    """Casefold-dedup while preserving order and original spelling."""
+    """Canonical-dedup while preserving order and original spelling.
+
+    The key folds case and underscore/space style, so ``long hair`` and
+    ``long_hair`` merge onto the first spelling written.
+    """
 
     result: list[str] = []
     seen: set[str] = set()
@@ -249,7 +259,7 @@ def dedup_tags(tags: list[str]) -> list[str]:
         cleaned = tag.strip()
         if not cleaned:
             continue
-        key = cleaned.casefold()
+        key = canonical_tag_key(cleaned)
         if key not in seen:
             seen.add(key)
             result.append(cleaned)
@@ -262,6 +272,7 @@ __all__ = [
     "SidecarContent",
     "SidecarError",
     "SidecarKind",
+    "_parse_tag_list",
     "dedup_tags",
     "load_sidecar",
     "render_standard_json",

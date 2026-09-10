@@ -108,8 +108,13 @@ export function TagInput({ profile, label, placeholder, disabled, onAdd }: {
           event.preventDefault()
           const selected = open && activeIndex >= 0 ? suggestions[activeIndex] : undefined
           commit(selected ? selected.name : text, selected?.category)
-        } else if (event.key === 'Escape') {
+        } else if (event.key === 'Escape' && open) {
+          // Escape closes only the suggestion dropdown.  Without swallowing the
+          // event it bubbles to the drawer's DialogLayer and closes the whole
+          // editor; stopPropagation also keeps that from depending solely on
+          // the layer's defaultPrevented check.
           event.preventDefault()
+          event.stopPropagation()
           setOpen(false)
           setActiveIndex(-1)
         }

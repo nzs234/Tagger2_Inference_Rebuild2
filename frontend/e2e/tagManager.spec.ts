@@ -26,6 +26,10 @@ const session: TagManagerSession = {
   status: 'ready',
   error: null,
   image_count: 3,
+  // Journal-availability flags gate the toolbar buttons; keep both directions
+  // live so the main chain can exercise undo.
+  can_undo: true,
+  can_redo: true,
   created_at: '2026-09-01T00:00:00Z',
   updated_at: '2026-09-01T00:00:00Z',
 }
@@ -88,6 +92,8 @@ interface RecordedApi {
   /** `query` parameter of every tag-db autocomplete lookup. */
   tagDbQueries: string[]
   batchBodies: Array<Record<string, unknown>>
+  /** Payloads of every POST .../batch/preview request. */
+  previewBodies: Array<Record<string, unknown>>
   patchBodies: Array<Record<string, unknown>>
   undoCalls: number
   redoCalls: number
@@ -99,6 +105,7 @@ async function mockTagManagerApi(page: Page): Promise<RecordedApi> {
     imageQueries: [],
     tagDbQueries: [],
     batchBodies: [],
+    previewBodies: [],
     patchBodies: [],
     undoCalls: 0,
     redoCalls: 0,
@@ -133,7 +140,20 @@ async function mockTagManagerApi(page: Page): Promise<RecordedApi> {
       return json({ profile: 'e621', items: tagDbEntries.filter((entry) => entry.name.includes(query)) })
     }
 
-    // Session-scoped tag-manager endpoints.
+    // Session-scoped tag-manager endpoints. Preview is matched before batch so
+    // the two POST routes never collide.
+    if (/\/tag-manager\/datasets\/ds-1\/batch\/preview$/.test(pathname) && method === 'POST') {
+      recorded.previewBodies.push(request.postDataJSON() as Record<string, unknown>)
+      return json({
+        targets: 3,
+        affected: 2,
+        no_change: 1,
+        skipped_read_only: 0,
+        will_create: 1,
+        formats: { tag_txt: 2, tags_json: 1, standard_json: 0, none: 0 },
+        samples: [{ image_id: 2, file_name: 'b.png', kind: 'tag_txt', before_tags: ['solo'], after_tags: ['solo', 'long_hair'] }],
+      })
+    }
     if (/\/tag-manager\/datasets\/ds-1\/batch$/.test(pathname) && method === 'POST') {
       recorded.batchBodies.push(request.postDataJSON() as Record<string, unknown>)
       return json({ affected: 2, journal_id: 7 })
@@ -261,10 +281,14 @@ test('main chain: filter, select, batch replace, edit, save-and-next, undo', asy
   await page.getByRole('checkbox', { name: '使用正则表达式' }).check({ force: true })
 
   await page.getByRole('button', { name: '执行', exact: true }).click()
-  const confirm = page.getByRole('alertdialog', { name: '对 2 张图片执行「替换」？' })
-  await expect(confirm).toBeVisible()
-  await expect(confirm).toContainText('选中的 2 张图片')
-  await confirm.getByRole('button', { name: '确认执行' }).click()
+  const preview = page.getByRole('alertdialog', { name: '批量操作预览' })
+  await expect(preview).toBeVisible()
+  await expect(preview).toContainText('选中的 2 张图片')
+  await expect(preview).toContainText('将修改 2 张')
+  await expect(preview).toContainText('其中 1 张没有 sidecar')
+  // The real write must not fire before the confirmation.
+  expect(recorded.batchBodies).toHaveLength(0)
+  await preview.getByRole('button', { name: '确认执行' }).click()
 
   await expect.poll(() => recorded.batchBodies).toHaveLength(1)
   expect(recorded.batchBodies[0]).toEqual({
@@ -274,7 +298,9 @@ test('main chain: filter, select, batch replace, edit, save-and-next, undo', asy
     use_regex: true,
     image_ids: [1, 2],
   })
-  await expect(page.getByText('批量操作完成，影响 2 张图片')).toBeVisible()
+  // Preview described exactly the request that was executed.
+  expect(recorded.previewBodies[0]).toEqual(recorded.batchBodies[0])
+  await expect(page.getByText('已修改 2 张', { exact: true })).toBeVisible()
 
   // The confirm dialog closes itself on confirmation (progress shows on the
   // 执行 button and in the notice queue), so no stale scope count lingers.
@@ -462,10 +488,10 @@ test('filtered batch sends the filter scope payload (runs on desktop and mobile)
   await expect(page.getByRole('button', { name: '移除 1girl' })).toBeVisible()
 
   await page.getByRole('button', { name: '执行', exact: true }).click()
-  const confirm = page.getByRole('alertdialog', { name: '对 3 张图片执行「添加」？' })
-  await expect(confirm).toBeVisible()
-  await expect(confirm).toContainText('当前过滤结果的全部 3 张图片')
-  await confirm.getByRole('button', { name: '确认执行' }).click()
+  const preview = page.getByRole('alertdialog', { name: '批量操作预览' })
+  await expect(preview).toBeVisible()
+  await expect(preview).toContainText('当前过滤结果的全部 3 张图片')
+  await preview.getByRole('button', { name: '确认执行' }).click()
 
   await expect.poll(() => recorded.batchBodies).toHaveLength(1)
   expect(recorded.batchBodies[0]).toEqual({
@@ -481,5 +507,7 @@ test('filtered batch sends the filter scope payload (runs on desktop and mobile)
     },
   })
   expect(recorded.batchBodies[0].image_ids).toBeUndefined()
-  await expect(page.getByText('批量操作完成，影响 2 张图片')).toBeVisible()
+  // The preview request carried the identical filtered-scope payload.
+  expect(recorded.previewBodies[0]).toEqual(recorded.batchBodies[0])
+  await expect(page.getByText('已修改 2 张', { exact: true })).toBeVisible()
 })

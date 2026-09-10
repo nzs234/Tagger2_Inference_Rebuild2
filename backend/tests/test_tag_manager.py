@@ -180,6 +180,24 @@ def test_invalid_sidecars_fail_closed(tmp_path: Path) -> None:
     assert dedup_tags(["Solo", "solo", "SOLO", "wolf"]) == ["Solo", "wolf"]
 
 
+def test_dedup_tags_merges_space_and_underscore_spellings() -> None:
+    """The dedup key is canonical_tag_key, so the styles merge onto the first
+    spelling written (a behaviour change from casefold-only dedup)."""
+
+    assert dedup_tags(["long hair", "long_hair", "LONG_HAIR"]) == ["long hair"]
+    assert dedup_tags(["long_hair", "long hair"]) == ["long_hair"]
+
+
+def test_load_tag_txt_merges_space_and_underscore_spellings(tmp_path: Path) -> None:
+    txt = tmp_path / "a.txt"
+    txt.write_text("long hair, long_hair, solo\n", encoding="utf-8")
+
+    content = load_sidecar(txt, None)
+
+    assert content.kind == "tag_txt"
+    assert content.tags == ("long hair", "solo")
+
+
 def _session_entry(session_id: str = "sess-1") -> dict:
     return {
         "id": session_id,

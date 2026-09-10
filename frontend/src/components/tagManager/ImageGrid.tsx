@@ -96,10 +96,16 @@ export interface GridNavHelpers {
  * cards.  Grid is the right primitive here because cells legitimately contain
  * interactive widgets (checkbox, edit button) — a listbox would forbid that.
  */
-export function VirtualGrid({ count, empty, ariaLabel, renderItem }: {
+export function VirtualGrid({ count, empty, ariaLabel, resetKey, renderItem }: {
   count: number
   empty?: ReactNode
   ariaLabel?: string
+  /** Changing this value scrolls the viewport back to the first row.  The
+   * grid keeps its scroll position while the same key is rendered (e.g. a
+   * selection-only re-render), but a different result set — new session,
+   * page, filter or sort — starts at the top instead of inheriting the old
+   * offset. */
+  resetKey?: string
   renderItem: (index: number, helpers: GridNavHelpers) => ReactNode
 }) {
   const containerRef = useRef<HTMLDivElement>(null)
@@ -108,6 +114,15 @@ export function VirtualGrid({ count, empty, ariaLabel, renderItem }: {
   // Keyboard focus deferred to the effect below when the target row is
   // currently windowed out of the DOM.
   const pendingFocus = useRef<number | null>(null)
+  // Reset on a result-set change: the internal scrollTop drives the windowed
+  // rows, so the DOM node and the state must move together.  The state resets
+  // even when the empty branch hides the container, so a later non-empty
+  // render starts at the top too.
+  useEffect(() => {
+    const container = containerRef.current
+    if (container) container.scrollTop = 0
+    setScrollTop(0)
+  }, [resetKey])
   const columns = size.width > 0 ? Math.max(2, Math.floor((size.width + GRID_GAP) / (CARD_MIN_WIDTH + GRID_GAP))) : 6
   const rowCount = Math.ceil(count / columns)
   const rowStride = CARD_HEIGHT + GRID_GAP
@@ -222,12 +237,14 @@ function CardTags({ tags }: { tags: TagManagerImageSummary['tags'] }) {
  * editor, and the card body is the roving-tabindex keyboard hub — arrows move
  * focus between cards, Space toggles selection, Enter opens the editor.
  */
-export function ImageGrid({ images, loadThumbnail, selectedIds, editingId, empty, onToggleSelect, onOpen }: {
+export function ImageGrid({ images, loadThumbnail, selectedIds, editingId, empty, resetKey, onToggleSelect, onOpen }: {
   images: TagManagerImageSummary[]
   loadThumbnail: (imageId: number) => Promise<Blob>
   selectedIds: ReadonlySet<number>
   editingId?: number
   empty?: ReactNode
+  /** Identity of the rendered result set; a change scrolls the grid to the top. */
+  resetKey?: string
   onToggleSelect: (image: TagManagerImageSummary, index: number, modifiers: { shift: boolean; ctrl: boolean }) => void
   onOpen: (image: TagManagerImageSummary) => void
 }) {
@@ -239,6 +256,7 @@ export function ImageGrid({ images, loadThumbnail, selectedIds, editingId, empty
     count={images.length}
     empty={empty}
     ariaLabel="图片网格"
+    resetKey={resetKey}
     renderItem={(index, { columns, focusItem }) => {
       const image = images[index]
       if (!image) return null

@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { ApiError } from '../../lib/api'
 import {
   tagManagerApi,
@@ -47,6 +47,22 @@ export function useTagEditor({ activeId, images, imagesReady, page, totalPages, 
   // arrive.  The stamp keeps a placeholder window (previous session/page still
   // mirrored) from resolving the target against the wrong image list.
   const pendingNavigate = useRef<{ end: 'first' | 'last'; sessionId: string; page: number } | null>(null)
+  // The open drawer owns the draft, so only it knows whether a session switch
+  // would discard unsaved work.  It publishes an imperative guard here; the
+  // page's session-switch entry points run their switch through
+  // `confirmLeaveIfDirty` so a dirty draft (or an in-flight save) is confirmed
+  // before the active session changes under the editor.
+  const leaveGuard = useRef<((action: () => void) => void) | null>(null)
+  const registerLeaveGuard = useCallback((guard: ((action: () => void) => void) | null) => {
+    leaveGuard.current = guard
+  }, [])
+  /** Run `action`, first asking the open editor to confirm when it has a dirty
+   * draft or a save in flight.  With no editor open the action runs at once. */
+  const confirmLeaveIfDirty = useCallback((action: () => void) => {
+    const guard = leaveGuard.current
+    if (guard) guard(action)
+    else action()
+  }, [])
 
   // Position of the editing image on the current page; -1 when not open.
   const editingIndex = editingId == null ? -1 : images.findIndex((image) => image.id === editingId)
@@ -120,6 +136,10 @@ export function useTagEditor({ activeId, images, imagesReady, page, totalPages, 
       void queryClient.invalidateQueries({ queryKey: ['tag-manager', 'image', sessionId, result.image_id] })
       void queryClient.invalidateQueries({ queryKey: ['tag-manager', 'images', sessionId] })
       void queryClient.invalidateQueries({ queryKey: ['tag-manager', 'stats', sessionId] })
+      // A save appends a journal entry, so the session detail's can_undo flag
+      // must refetch; otherwise the 撤销 button would stay disabled until an
+      // unrelated refetch happens.
+      void queryClient.invalidateQueries({ queryKey: ['tag-manager', 'dataset', sessionId] })
       if (nextAction === 'close') {
         closeEditor()
       } else if (nextAction) {
@@ -203,6 +223,8 @@ export function useTagEditor({ activeId, images, imagesReady, page, totalPages, 
     openImage,
     closeEditor,
     cancelPendingNavigate,
+    confirmLeaveIfDirty,
+    registerLeaveGuard,
     navigate,
     save,
     reload,

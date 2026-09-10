@@ -32,6 +32,11 @@ export const useTagManagerView = create<TagManagerViewState>()(
     }),
     {
       name: 'tagger2-tm-view',
+      // Persisted `sort` needs no migration when the option list grows: the
+      // original values name/mtime/tags all remain valid TagManagerSort
+      // members, and the added mtime_asc/tag_count_asc simply appear as new
+      // choices. An unknown value from a future build would fall through the
+      // select's value lookup but still be sent to the backend as-is.
       partialize: (state) => ({
         filter: state.filter,
         sort: state.sort,

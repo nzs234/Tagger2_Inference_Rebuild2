@@ -1,9 +1,23 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useCallback, useEffect, useMemo, useRef } from 'react'
-import type { TagManagerBatchRequest, TagManagerSession } from '../../lib/tagManager'
+import type { TagManagerBatchRequest, TagManagerBatchResult, TagManagerSession } from '../../lib/tagManager'
 import { tagManagerApi } from '../../lib/tagManager'
 import { useTagManagerView } from '../../store/tagManagerView'
 import type { NoticeTone } from './useNoticeQueue'
+
+/**
+ * Success copy for a finished batch.  Zero counters are omitted so the common
+ * all-written case stays short; read-only skips and no-change targets are
+ * only mentioned when the backend actually reported them.
+ */
+export function formatBatchResultNotice(result: TagManagerBatchResult): string {
+  const parts = [`已修改 ${result.affected} 张`]
+  const skipped = result.skipped_read_only ?? 0
+  const noChange = result.no_change ?? 0
+  if (skipped > 0) parts.push(`跳过 ${skipped} 张（只读）`)
+  if (noChange > 0) parts.push(`${noChange} 张无变化`)
+  return parts.join('，')
+}
 
 /** Page-injected callbacks so this hook stays free of notice/editor state. */
 export interface UseTagManagerSessionsOptions {
@@ -86,12 +100,15 @@ export function useTagManagerSessions({ notify, fail, onSessionRemoved, onSessio
 
   /** Invalidate the session-scoped queries after a write.
    * Batch/undo/redo touch an unbounded set of images, so every detail under
-   * the session is dropped; roots and the dataset list keep their cache. */
+   * the session is dropped; roots and the dataset list keep their cache.  The
+   * session detail is included too: its can_undo/can_redo flags flip with every
+   * journal write and the toolbar renders directly from them. */
   const invalidateSessionData = () => {
     const sessionId = activeId as string
     void queryClient.invalidateQueries({ queryKey: ['tag-manager', 'images', sessionId] })
     void queryClient.invalidateQueries({ queryKey: ['tag-manager', 'image', sessionId] })
     void queryClient.invalidateQueries({ queryKey: ['tag-manager', 'stats', sessionId] })
+    void queryClient.invalidateQueries({ queryKey: ['tag-manager', 'dataset', sessionId] })
   }
 
   const createMutation = useMutation({
@@ -127,16 +144,19 @@ export function useTagManagerSessions({ notify, fail, onSessionRemoved, onSessio
     mutationFn: (body: TagManagerBatchRequest) => tagManagerApi.batch(activeId as string, body),
     onSuccess: (result) => {
       onSessionDataChanged()
-      notify('success', `批量操作完成，影响 ${result.affected} 张图片`)
+      notify('success', formatBatchResultNotice(result))
       invalidateSessionData()
     },
     onError: (error) => fail(error, '批量操作失败'),
   })
   const undoMutation = useMutation({
     mutationFn: (id: string) => tagManagerApi.undo(id),
-    onSuccess: () => {
+    onSuccess: (result) => {
       onSessionDataChanged()
-      notify('success', '已撤销上一次操作')
+      // `reverted` is the number of journal entries/change rows rolled back;
+      // older backends may omit it, so the count is only shown when present.
+      const reverted = typeof result.reverted === 'number' ? result.reverted : undefined
+      notify('success', reverted != null ? `已撤销上一步（恢复 ${reverted} 张图片）` : '已撤销上一次操作')
       invalidateSessionData()
     },
     onError: (error) => fail(error, '撤销失败'),

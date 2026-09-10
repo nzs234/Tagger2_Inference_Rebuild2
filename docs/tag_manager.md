@@ -6,9 +6,11 @@
 
 - **数据集会话**：选择一个已注册的根目录（root）+ 相对路径打开一个数据集目录，后台扫描图片与标注文件并建立索引。支持递归扫描、增量刷新（图片与 sidecar 的 mtime 都未变化的文件跳过重新解析）、多会话并行。刷新与写操作并发时会话忙时返回 409 `session_busy`（可重试），不会静默跳过扫描。
 - **网格浏览**：虚拟化缩略图网格，按文件名 / 修改时间 / 标签数排序；按标签组合（包含 all/any、排除）、标注格式、有无 sidecar 过滤。**单击卡片切换选择**（shift/ctrl 范围选择、复选框可用），**双击或卡片角落的「编辑」按钮打开编辑器**；支持键盘操作：方向键移动焦点、空格选择、回车打开。选择锚点使用稳定图片 id，翻页/重排/改筛选后 shift 范围选择不会圈选错位。筛选条件以可删除的标签 chips 呈现（输入框带标签库自动补全），筛选/排序/页码/会话选择在刷新后保留。
+- **排序方向**：`sort` 取值 `name` / `mtime` / `mtime_asc` / `tags` / `tag_count_asc`。`mtime` 与 `tags` 保持既有的**降序**语义（兼容老客户端），`mtime_asc`、`tag_count_asc` 为升序；同名/同值的项以图片 id 升序稳定收尾。
 - **逐图编辑**：双击图片（或点编辑按钮）进入编辑面板，按格式提供编辑界面（见下），保存时带乐观并发校验（mtime 不一致返回 409，可复制草稿或重新加载）。编辑器在保存后保持打开（不重置滚动与焦点），支持「保存并下一张 / 保存并上一张」连续修图并在页边界自动翻页；关闭或切换时有未保存草稿会先确认；无 sidecar 的图片可直接在编辑器内选择格式新建。
-- **批量操作**：多选图片或按当前过滤器圈定范围，执行 添加 / 删除 / 替换（支持正则）标签。批量面板在会话就绪后常驻显示；未勾选任何图片时操作范围自动指向当前过滤结果，超过单批 2000 张上限会在执行前拦截提示。
-- **撤销 / 重做**：每个会话保留最近 20 步操作日志，可逐步撤销与重做。撤销后再次编辑或执行批量会清空重做栈（新历史分支后旧的重做条目已不可重放）。
+- **批量操作**：多选图片或按当前过滤器圈定范围，执行 添加 / 删除 / 替换（支持正则）标签。批量面板在会话就绪后常驻显示；未勾选任何图片时操作范围自动指向当前过滤结果，超过单批 2000 张上限会在执行前拦截提示。点击「执行」先走**只读预览**（汇总、格式分布、前后标签抽样，见「操作反馈与预览」），确认后才写入。响应带 `affected`（实际写入张数）、`skipped_read_only`（raw e621 只读跳过）、`no_change`（操作对该图无变化）三个计数。
+- **撤销 / 重做**：每个会话保留最近 20 步操作日志，可逐步撤销与重做。**撤销按日志从新到旧回退，重做按从旧到新（最早被撤销的条目先重放）**，多步撤销后重做恢复的顺序与撤销严格互逆。撤销后再次编辑或执行批量会清空重做栈（新历史分支后旧的重做条目已不可重放）。会话详情接口额外返回 `can_undo` / `can_redo`。
+- **标签比较归一**：非正则的批量比较、去重与标签库查询都按键 `canonical_tag_key`（小写 + 下划线）归一，因此 `long hair` 与 `long_hair` 视为同一标签：删除/替换用任一拼写都能命中；去重保留文件中**首次出现的拼写**（同文件两种拼写合并为一条，属预期行为变更）。正则模式仍按原文匹配（模式不是标签名）。
 - **标签统计**：数据集内标签频次排行（带分类，空格/下划线拼写合并计数），点击行加入包含过滤，行内「排除」按钮加入排除过滤。
 - **标签库自动补全**：基于 workflow 模块的 classify-snapshot 资源（官方 DB 导出），返回名称、分类、post_count 与别名指向。
 - **中英双语显示**：所有标签（网格卡片、编辑面板、自动补全、统计榜）都可同时显示英文原名与中文译名，词库随仓库离线提供，可一键关闭。
@@ -62,6 +64,17 @@ runtime\python.exe scripts\build_tag_translations.py --sources amenorira   :: �
 
 翻译结果立即在界面上生效，并**保存到本地用户词库** `data/tag_manager/translations/{profile}-zh.csv`：加载时合并进离线词库（用户条目优先），重启后依然可用，完全离线时也能命中，重建发行词库不会覆盖该文件。词库中已有的标签不会发起模型调用；模型返回的英文回显、超长结果会被丢弃。没有任何可用在线模型时返回 409 `tag_translate_unavailable`，模型调用失败返回 502 `tag_translate_failed`（可重试）。
 
+## 操作反馈与预览
+
+批量操作采用「先预览、后写入」的两步流程，其余用户可见反馈如下：
+
+- **批量预览对话框**：点击「执行」后先调用 `POST /datasets/{id}/batch/preview`（只读，零写入），弹出预览对话框。汇总区给出「将修改 N 张 / 无变化 K 张 / 跳过 M 张（只读）/ 目标总数 T 张」；当有目标尚无 sidecar 时会额外标明「其中 N 张没有 sidecar，将以 tag_txt 格式新建」；格式分布仅列出计数大于 0 的 `tag_txt` / `tags_json` / `standard_json`；抽样区最多展示 5 个目标，逐条给出文件名、格式徽章与前后标签差异（新增标签高亮、删除标签加删除线、未变标签普通显示，标签过多时截断并提示剩余数量）。预览请求与最终写入使用**同一份表单状态构建的完全相同的请求体**，保证预览描述的就是实际执行的操作。
+- **预览失败降级**：预览接口报错时不会阻塞执行，而是回退到普通确认框并 toast 提示「预览加载失败，将直接确认执行」；用户确认后仍提交同一份请求体。
+- **无变更保护**：预览结果显示 `affected = 0`（没有会产生修改的目标）时对话框显式提示，并禁用「确认执行」。理由是空操作批量不会产生撤销日志条目，执行只会得到「已修改 0 张」的提示，提前拦截比放行更清晰。
+- **清除选择**：网格选择会跨页、跨筛选保留；页面右上角的「清除选择」按钮（无选中时禁用）是唯一主动放弃当前选择的方式。
+- **排序选项**：排序下拉列出 `name` / `mtime` / `mtime_asc` / `tags` / `tag_count_asc` 五项，语义见「功能概览 · 排序方向」。
+- **空历史撤销 / 重做**：历史为空时点击撤销或重做不再视为错误，而是以警告样式提示（区别于真正的失败红条）。
+
 ## 支持的标注格式
 
 | 格式 | 判定 | 读写 |
@@ -105,6 +118,7 @@ GET    /datasets/{id}/images           分页/过滤/排序的图片列表（含
 GET    /datasets/{id}/images/{iid}     图片详情 + 格式原生内容 + sidecar_mtime
 PATCH  /datasets/{id}/images/{iid}     保存编辑（content 按 kind 判别；expected_sidecar_mtime 乐观锁）
 POST   /datasets/{id}/batch            批量 add/remove/replace（image_ids 或 filter 二选一）
+POST   /datasets/{id}/batch/preview    批量操作只读预览（零写入：不落盘、不写日志、不刷新索引、不动重做栈）
 POST   /datasets/{id}/undo             撤销最近一步
 POST   /datasets/{id}/redo             重做
 GET    /datasets/{id}/tags/stats       标签频次统计（含 translation）
@@ -116,7 +130,7 @@ POST   /translations/translate         在线模型补译缺失标签并保存�
 POST   /nl/translate                   用在线模型翻译 NL 段落（target=zh|en）
 ```
 
-错误统一为 `{"detail": {"code", "message", "retryable"}}`（应用的错误中间件会把它平铺到响应体并附加 `request_id`）；常见错误码：`sidecar_conflict`（mtime 过期，重新加载即可）、`sidecar_kind_mismatch`（编辑负载与 sidecar 格式不符）、`sidecar_read_only`（raw e621 只读）、`batch_too_large`（单批上限 2000 张）、`session_busy`（会话级写互斥：保存/批量/撤销/扫描进行中，可重试）、`root_not_writable`（数据集根目录未开启可写）、`tag_db_unavailable`（该 profile 没有已注册的分类快照）、`nl_translate_unavailable`/`tag_translate_unavailable`（没有已启用且已配置密钥的在线模型）、`nl_translate_failed`/`tag_translate_failed`（在线模型调用失败，可重试）。
+错误统一为 `{"detail": {"code", "message", "retryable"}}`（应用的错误中间件会把它平铺到响应体并附加 `request_id`）；常见错误码：`sidecar_conflict`（mtime 过期，重新加载即可）、`sidecar_kind_mismatch`（编辑负载与 sidecar 格式不符）、`sidecar_read_only`（raw e621 只读）、`sidecar_too_large`（写入渲染超过 1 MiB，413，文件与日志均未写）、`batch_too_large`（单批上限 2000 张）、`session_busy`（会话级写互斥：保存/批量/撤销/扫描进行中，可重试）、`root_not_writable`（数据集根目录未开启可写）、`tag_db_unavailable`（该 profile 没有已注册的分类快照）、`nl_translate_unavailable`/`tag_translate_unavailable`（没有已启用且已配置密钥的在线模型）、`nl_translate_failed`/`tag_translate_failed`（在线模型调用失败，可重试）。
 
 ## 架构与数据存储
 
@@ -147,7 +161,7 @@ backend/tagger2/
 
 - 路径访问只接受 `root_id + relative_path`，经共享 `PathAllowlist` 解析，响应不返回绝对路径。
 - 所有 sidecar 写入为原子写（临时文件 + fsync + replace）。
-- sidecar 读取上限 1 MiB、缩略图解码前执行字节/像素预算校验，防解压炸弹。
+- sidecar 读取上限 1 MiB、缩略图解码前执行字节/像素预算校验，防解压炸弹。**写入侧对渲染结果执行同一 1 MiB 预算**（单图保存、批量、撤销/重做 replay 均在写前校验，超限返回 413 `sidecar_too_large` 且文件与操作日志都不落盘）；编辑器各标签字段另有单条长度上限。
 - 会话 id 与图片 id 均不可枚举或跨会话访问。
 
 ## 与 Dataset Workflow 的关系

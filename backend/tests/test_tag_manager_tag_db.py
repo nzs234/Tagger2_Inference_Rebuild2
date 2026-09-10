@@ -375,3 +375,34 @@ def test_top_tags(tmp_path: Path):
     assert top_limit[0]["name"] == "hot_dog"
     assert top_limit[1]["name"] == "horn"
 
+
+
+def test_lookup_and_autocomplete_normalize_space_style(tmp_path: Path):
+    """Queries are folded through canonical_tag_key (lowercase underscore), so
+    a space-styled query resolves an underscore-stored tag and vice versa."""
+
+    doc = _document()
+    doc["tags"].append({"name": "long_hair", "category": "general", "post_count": 300})
+    db = _memory_db(tmp_path, doc, scope="canonical")
+    db.ensure_loaded("e621", resource_id="test-snapshot-v1")
+
+    # Space spelling reaches the underscore-stored canonical entry.
+    assert db.lookup("e621", "long hair")["name"] == "long_hair"
+    assert db.lookup("e621", "long_hair")["name"] == "long_hair"
+    assert db.lookup("e621", "LONG HAIR")["name"] == "long_hair"
+
+    # Autocomplete: a space query prefixes the underscore names.
+    assert [info["name"] for info in db.autocomplete("e621", "long ")] == ["long_hair"]
+    assert [info["name"] for info in db.autocomplete("e621", "long_")] == ["long_hair"]
+
+
+def test_alias_resolution_normalizes_space_style(tmp_path: Path):
+    """An alias antecedent stored with underscores resolves a space query too."""
+
+    comp = _document()
+    db = _memory_db(tmp_path, comp, scope="alias-space")
+    db.ensure_loaded("e621", resource_id="test-snapshot-v1")
+
+    # The fixture alias antecedent is "1girl"; query with an underscore variant.
+    assert db.lookup("e621", "1girl")["name"] == "solo"
+    assert db.lookup("e621", "1_girl") is None  # only literal spaces fold

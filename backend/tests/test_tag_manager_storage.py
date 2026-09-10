@@ -139,3 +139,91 @@ def test_tag_filter_key_folds_non_ascii_like_python(tmp_path: Path) -> None:
     stats = store.tag_stats("sess-1")
     assert len(stats) == 1
     assert stats[0]["count"] == 2
+
+
+def test_next_redo_entry_returns_oldest_undone(tmp_path: Path) -> None:
+    """Redo must replay the earliest undone entry, not the newest: undo walks
+    the live stack newest-first, so redo mirrors it oldest-first."""
+
+    store = TagManagerStore(tmp_path / "tag_manager.sqlite3")
+    store.create_session(_session_entry())
+
+    first = store.append_journal("sess-1", op="edit", spec={"k": 1}, changes=[])
+    second = store.append_journal("sess-1", op="edit", spec={"k": 2}, changes=[])
+    third = store.append_journal("sess-1", op="edit", spec={"k": 3}, changes=[])
+
+    # Stack: undo third, then second.
+    store.set_journal_undone(third, True)
+    store.set_journal_undone(second, True)
+
+    assert store.latest_journal_entry("sess-1", undone=False)["id"] == first
+    assert store.next_redo_entry("sess-1")["id"] == second
+    store.set_journal_undone(second, False)
+    assert store.next_redo_entry("sess-1")["id"] == third
+    store.set_journal_undone(third, False)
+    assert store.next_redo_entry("sess-1") is None
+
+
+def test_has_journal_entry_probes_existence(tmp_path: Path) -> None:
+    store = TagManagerStore(tmp_path / "tag_manager.sqlite3")
+    store.create_session(_session_entry())
+
+    assert store.has_journal_entry("sess-1", undone=False) is False
+    assert store.has_journal_entry("sess-1", undone=True) is False
+
+    entry = store.append_journal("sess-1", op="edit", spec={}, changes=[])
+    assert store.has_journal_entry("sess-1", undone=False) is True
+    assert store.has_journal_entry("sess-1", undone=True) is False
+
+    store.set_journal_undone(entry, True)
+    assert store.has_journal_entry("sess-1", undone=False) is False
+    assert store.has_journal_entry("sess-1", undone=True) is True
+
+
+def test_set_image_tags_sidecar_path_is_optional_and_clearable(tmp_path: Path) -> None:
+    """Omitting sidecar_path keeps the recorded path; passing None clears it
+    (the undo unlink branch must not leave a stale extension behind)."""
+
+    store = TagManagerStore(tmp_path / "tag_manager.sqlite3")
+    store.create_session(_session_entry())
+    image_id = store.upsert_images("sess-1", [_scan_row("a.png", [("solo", "general")])])[0]
+    assert store.get_image("sess-1", image_id)["sidecar_path"] == "a.txt"
+
+    # Omitted: the stored path survives the tag refresh.
+    store.set_image_tags(
+        image_id, [("wolf", "general")], sidecar_kind="tag_txt", sidecar_mtime=200.0
+    )
+    assert store.get_image("sess-1", image_id)["sidecar_path"] == "a.txt"
+
+    # Explicit None: the column is cleared.
+    store.set_image_tags(
+        image_id, [], sidecar_kind="none", sidecar_mtime=None, sidecar_path=None
+    )
+    assert store.get_image("sess-1", image_id)["sidecar_path"] is None
+
+
+def test_list_images_ascending_sort_values(tmp_path: Path) -> None:
+    """The ascending variants are additive: descending values keep their order."""
+
+    store = TagManagerStore(tmp_path / "tag_manager.sqlite3")
+    store.create_session(_session_entry())
+    rows = [
+        _scan_row("a.png", [("solo", "general")]),
+        _scan_row("b.png", [("solo", "general"), ("wolf", "general"), ("rex", "character")]),
+        _scan_row("c.png", []),
+    ]
+    rows[0]["mtime"] = 1.0
+    rows[1]["mtime"] = 3.0
+    rows[2]["mtime"] = 2.0
+    rows[2]["tag_count"] = 0
+    rows[2]["sidecar_kind"] = "none"
+    rows[2]["sidecar_path"] = None
+    store.upsert_rows("sess-1", rows)
+
+    def names(sort: str) -> list[str]:
+        return [item["file_name"] for item in store.list_images("sess-1", sort=sort)[0]]
+
+    assert names("mtime") == ["b.png", "c.png", "a.png"]
+    assert names("mtime_asc") == ["a.png", "c.png", "b.png"]
+    assert names("tags") == ["b.png", "a.png", "c.png"]
+    assert names("tag_count_asc") == ["c.png", "a.png", "b.png"]

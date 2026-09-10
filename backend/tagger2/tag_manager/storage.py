@@ -25,6 +25,12 @@ SCHEMA_VERSION = 1
 # inside SQLite's variable budget regardless of the build's compile limits.
 _SQL_PARAMETER_CHUNK = 500
 
+# Sentinel for the optional ``sidecar_path`` write on :meth:`set_image_tags`.
+# ``None`` is a meaningful value (clear the column) while *not passing* the
+# argument must leave the stored path alone, so the two cases need distinct
+# markers rather than ``None`` doubling as "unset".
+_UNSET: Any = object()
+
 # SQLite side of ``canonical_tag_key``: the same lowercase underscore form
 # so a filter typed with spaces matches a sidecar written with underscores.
 # CASEFOLD is a scalar function registered on every connection (see
@@ -367,13 +373,30 @@ class TagManagerStore:
         }
 
     def set_image_tags(
-        self, image_id: int, tags: list[tuple[str, str]], *, sidecar_kind: str, sidecar_mtime: float | None
+        self,
+        image_id: int,
+        tags: list[tuple[str, str]],
+        *,
+        sidecar_kind: str,
+        sidecar_mtime: float | None,
+        sidecar_path: str | None = _UNSET,
     ) -> None:
-        """Replace the tag rows of one image and refresh its denormalized columns."""
+        """Replace the tag rows of one image and refresh its denormalized columns.
+
+        ``sidecar_path`` is optional: omitting it keeps the path recorded at
+        scan/save time, while passing an explicit ``None`` clears the column
+        (undo of a "from nothing" save must not leave the old extension behind
+        and route a later different-format save into it).
+        """
 
         with self.connection() as conn:
             _replace_image_tags(
-                conn, image_id, tags, sidecar_kind=sidecar_kind, sidecar_mtime=sidecar_mtime
+                conn,
+                image_id,
+                tags,
+                sidecar_kind=sidecar_kind,
+                sidecar_mtime=sidecar_mtime,
+                sidecar_path=sidecar_path,
             )
 
     def get_image(self, session_id: str, image_id: int) -> dict[str, Any] | None:
@@ -460,10 +483,15 @@ class TagManagerStore:
         elif sidecar == "missing":
             clauses.append("d.sidecar_kind = 'none'")
 
+        # ``mtime``/``tags`` keep their long-standing descending semantics; the
+        # ascending variants are separate values so adding them cannot reorder
+        # an existing client's grid.
         order = {
             "name": "d.file_name COLLATE NOCASE ASC, d.id ASC",
             "mtime": "d.mtime DESC, d.id ASC",
+            "mtime_asc": "d.mtime ASC, d.id ASC",
             "tags": "d.tag_count DESC, d.file_name COLLATE NOCASE ASC, d.id ASC",
+            "tag_count_asc": "d.tag_count ASC, d.file_name COLLATE NOCASE ASC, d.id ASC",
         }.get(sort, "d.file_name COLLATE NOCASE ASC, d.id ASC")
 
         where = " AND ".join(clauses)
@@ -567,6 +595,33 @@ class TagManagerStore:
             ).fetchone()
         return _journal_dict(row) if row is not None else None
 
+    def next_redo_entry(self, session_id: str) -> dict[str, Any] | None:
+        """Return the oldest still-undone entry: the next redo step.
+
+        Undo walks the live history newest-first (``undone=0 ORDER BY id DESC``),
+        so its mirror image is the *earliest* undone entry (``ORDER BY id ASC``):
+        replaying the largest undone id first would apply the newest undone
+        edit before the one that preceded it.
+        """
+
+        with self.connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM undo_journal WHERE session_id = ? AND undone = 1"
+                " ORDER BY id ASC LIMIT 1",
+                (session_id,),
+            ).fetchone()
+        return _journal_dict(row) if row is not None else None
+
+    def has_journal_entry(self, session_id: str, *, undone: bool) -> bool:
+        """Existence probe backing the session's ``can_undo``/``can_redo`` flags."""
+
+        with self.connection() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM undo_journal WHERE session_id = ? AND undone = ? LIMIT 1",
+                (session_id, 1 if undone else 0),
+            ).fetchone()
+        return row is not None
+
     def set_journal_undone(self, entry_id: int, undone: bool) -> None:
         with self.connection() as conn:
             conn.execute(
@@ -651,6 +706,7 @@ def _replace_image_tags(
     *,
     sidecar_kind: str,
     sidecar_mtime: float | None,
+    sidecar_path: str | None = _UNSET,
 ) -> None:
     conn.execute("DELETE FROM dataset_image_tags WHERE image_id = ?", (image_id,))
     for position, (tag, category) in enumerate(tags):
@@ -659,14 +715,28 @@ def _replace_image_tags(
             " VALUES (?, ?, ?, ?)",
             (image_id, tag, category, position),
         )
-    conn.execute(
-        "UPDATE dataset_images"
-        " SET tag_count = (SELECT COUNT(*) FROM dataset_image_tags WHERE image_id = ?),"
-        "     sidecar_kind = ?,"
-        "     sidecar_mtime = ?"
-        " WHERE id = ?",
-        (image_id, sidecar_kind, sidecar_mtime, image_id),
-    )
+    # ``sidecar_path`` is only rewritten when a caller passes it explicitly;
+    # the default keeps whatever the scan/save recorded.  Passing ``None``
+    # clears the column (the unlink branch of undo/redo).
+    if sidecar_path is _UNSET:
+        conn.execute(
+            "UPDATE dataset_images"
+            " SET tag_count = (SELECT COUNT(*) FROM dataset_image_tags WHERE image_id = ?),"
+            "     sidecar_kind = ?,"
+            "     sidecar_mtime = ?"
+            " WHERE id = ?",
+            (image_id, sidecar_kind, sidecar_mtime, image_id),
+        )
+    else:
+        conn.execute(
+            "UPDATE dataset_images"
+            " SET tag_count = (SELECT COUNT(*) FROM dataset_image_tags WHERE image_id = ?),"
+            "     sidecar_kind = ?,"
+            "     sidecar_mtime = ?,"
+            "     sidecar_path = ?"
+            " WHERE id = ?",
+            (image_id, sidecar_kind, sidecar_mtime, sidecar_path, image_id),
+        )
 
 
 def _session_dict(row: sqlite3.Row) -> dict[str, Any]:

@@ -123,4 +123,31 @@ describe('DialogLayer', () => {
     fireEvent.mouseDown(backdrop as HTMLElement)
     expect(screen.getByRole('alertdialog', { name: '删除资源？' })).toBeInTheDocument()
   })
+
+  it('ignores Escape a nested control already consumed', async () => {
+    function Harness() {
+      const [open, setOpen] = useState(false)
+      return (
+        <div className="app-shell">
+          <button type="button" onClick={() => setOpen(true)}>打开编辑器</button>
+          {open && (
+            <DialogLayer onClose={() => setOpen(false)}>
+              <section role="dialog" aria-label="配置编辑器">
+                <input
+                  aria-label="吞掉 Esc"
+                  onKeyDown={(event) => { if (event.key === 'Escape') event.preventDefault() }}
+                />
+              </section>
+            </DialogLayer>
+          )}
+        </div>
+      )
+    }
+    render(<Harness />)
+    fireEvent.click(screen.getByRole('button', { name: '打开编辑器' }))
+    await screen.findByRole('dialog', { name: '配置编辑器' })
+
+    fireEvent.keyDown(screen.getByLabelText('吞掉 Esc'), { key: 'Escape' })
+    expect(screen.getByRole('dialog', { name: '配置编辑器' })).toBeInTheDocument()
+  })
 })

@@ -194,6 +194,38 @@ def test_batch_tag_per_item_limit():
     assert ok.tags == ["a" * BATCH_TAG_MAX_LENGTH]
 
 
+def test_editor_tag_fields_share_the_per_tag_cap():
+    """Editor save payloads reuse the batch per-tag cap (TagTxtContent entries
+    and every NineFieldEdit list element)."""
+
+    from tagger2.tag_manager.contracts import (
+        EDITOR_TAG_MAX_LENGTH,
+        ImageEditRequest,
+        NineFieldEdit,
+        StandardJsonContent,
+        TagTxtContent,
+    )
+
+    assert EDITOR_TAG_MAX_LENGTH == BATCH_TAG_MAX_LENGTH
+    over = "a" * (EDITOR_TAG_MAX_LENGTH + 1)
+
+    with pytest.raises(ValidationError):
+        TagTxtContent(tags=[over])
+    with pytest.raises(ValidationError):
+        NineFieldEdit(tags=[over])
+    with pytest.raises(ValidationError):
+        NineFieldEdit(appearance=[over])
+    with pytest.raises(ValidationError):
+        NineFieldEdit(environment=[over])
+    with pytest.raises(ValidationError):
+        NineFieldEdit(quality=[over])
+    with pytest.raises(ValidationError):
+        ImageEditRequest(content=StandardJsonContent(fields=NineFieldEdit(tags=[over])))
+
+    ok = TagTxtContent(tags=["a" * EDITOR_TAG_MAX_LENGTH])
+    assert ok.tags == ["a" * EDITOR_TAG_MAX_LENGTH]
+
+
 def test_oversized_filter_tag_returns_422(client):
     http, session_id = client
     response = http.get(

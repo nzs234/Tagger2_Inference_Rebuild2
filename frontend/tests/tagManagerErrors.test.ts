@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { ApiError } from '../src/lib/api'
-import { describeTagManagerError } from '../src/lib/tagManagerErrors'
+import { describeTagManagerError, tagManagerErrorTone } from '../src/lib/tagManagerErrors'
 
 /** Every code documented in docs/tag_manager.md (错误码 section). */
 const DOCUMENTED_CODES = [
@@ -50,5 +50,24 @@ describe('describeTagManagerError', () => {
     expect(describeTagManagerError(new Error('boom'), '操作失败')).toBe('操作失败')
     expect(describeTagManagerError(undefined, '操作失败')).toBe('操作失败')
     expect(describeTagManagerError('raw string', '操作失败')).toBe('操作失败')
+  })
+})
+
+describe('tagManagerErrorTone', () => {
+  // Empty-history undo/redo is an expected no-op, so it must not render with
+  // the destructive danger tone used for real failures.
+  it('demotes undo_empty/redo_empty to the warning tone', () => {
+    expect(tagManagerErrorTone(new ApiError('nothing to undo', 409, 'undo_empty'))).toBe('warning')
+    expect(tagManagerErrorTone(new ApiError('nothing to redo', 409, 'redo_empty'))).toBe('warning')
+  })
+
+  it('keeps other ApiError codes on the danger tone', () => {
+    expect(tagManagerErrorTone(new ApiError('busy', 409, 'session_busy'))).toBe('danger')
+    expect(tagManagerErrorTone(new ApiError('unknown', 500, 'mystery'))).toBe('danger')
+  })
+
+  it('treats non-ApiError values as danger', () => {
+    expect(tagManagerErrorTone(new Error('boom'))).toBe('danger')
+    expect(tagManagerErrorTone(undefined)).toBe('danger')
   })
 })

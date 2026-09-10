@@ -11,6 +11,8 @@ from pydantic import ValidationError
 
 from .contracts import (
     BatchOperationRequest,
+    BatchOperationResponse,
+    BatchPreviewResponse,
     CreateDatasetRequest,
     ImageEditRequest,
     ImageFilter,
@@ -144,7 +146,7 @@ def create_tag_manager_router(service: TagManagerService) -> APIRouter:
         session_id: str,
         offset: int = Query(default=0, ge=0),
         limit: int = Query(default=200, ge=1, le=1000),
-        sort: str = Query(default="name", pattern="^(name|mtime|tags)$"),
+        sort: str = Query(default="name", pattern="^(name|mtime|mtime_asc|tags|tag_count_asc)$"),
         include_tags: list[str] | None = Query(default=None),
         exclude_tags: list[str] | None = Query(default=None),
         include_mode: str = Query(default="all", pattern="^(all|any)$"),
@@ -207,10 +209,19 @@ def create_tag_manager_router(service: TagManagerService) -> APIRouter:
         except TagManagerError as exc:
             raise _error(exc) from exc
 
-    @router.post("/datasets/{session_id}/batch")
+    @router.post("/datasets/{session_id}/batch", response_model=BatchOperationResponse)
     async def batch_operation(session_id: str, request: BatchOperationRequest):
         try:
             return await asyncio.to_thread(service.batch_operation, session_id, request)
+        except TagManagerError as exc:
+            raise _error(exc) from exc
+
+    @router.post("/datasets/{session_id}/batch/preview", response_model=BatchPreviewResponse)
+    async def preview_batch(session_id: str, request: BatchOperationRequest):
+        # Read-only, but it resolves targets and renders candidate sidecars, so
+        # it runs off the event loop like the real batch.
+        try:
+            return await asyncio.to_thread(service.preview_batch, session_id, request)
         except TagManagerError as exc:
             raise _error(exc) from exc
 

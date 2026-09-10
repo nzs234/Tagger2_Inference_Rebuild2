@@ -31,6 +31,14 @@ FILTER_TAG_MAX_LENGTH = 100
 BATCH_TAG_MAX_LENGTH = 256
 FILTER_TAGS_TOTAL_MAX_LENGTH = 8192
 
+# Editor save payloads reuse the batch per-tag cap so a single tag can never
+# be long enough to blow the 1 MiB sidecar write budget on its own.
+EDITOR_TAG_MAX_LENGTH = BATCH_TAG_MAX_LENGTH
+
+# Sort values accepted by the image listing.  ``mtime``/``tags`` keep their
+# long-standing descending direction; the ``_asc`` variants are additive.
+TagManagerSort = Literal["name", "mtime", "mtime_asc", "tags", "tag_count_asc"]
+
 # Regex guards for ``use_regex`` batch operations.  Python's ``re`` has no
 # match timeout, so the defence is upfront rejection: patterns are length
 # capped, must compile, and obviously catastrophic shapes (a quantified group
@@ -233,18 +241,22 @@ def _validate_extra_values(values: dict[str, Any], *, where: str) -> None:
 
 
 class NineFieldEdit(BaseModel):
-    """Nine-field standard JSON payload; field order is frozen."""
+    """Nine-field standard JSON payload; field order is frozen.
+
+    Each list entry is a tag-like string, so it reuses the shared per-tag
+    length cap; the list-level ``max_length`` still bounds the whole field.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
-    quality: list[str] = Field(default_factory=list, max_length=8)
+    quality: list[Annotated[str, Field(max_length=EDITOR_TAG_MAX_LENGTH)]] = Field(default_factory=list, max_length=8)
     count: Literal["", "solo", "duo", "trio", "group"] = ""
     character: str = Field(default="", max_length=2048)
     series: str = Field(default="", max_length=2048)
     artist: str = Field(default="", max_length=2048)
-    appearance: list[str] = Field(default_factory=list, max_length=512)
-    tags: list[str] = Field(default_factory=list, max_length=2048)
-    environment: list[str] = Field(default_factory=list, max_length=512)
+    appearance: list[Annotated[str, Field(max_length=EDITOR_TAG_MAX_LENGTH)]] = Field(default_factory=list, max_length=512)
+    tags: list[Annotated[str, Field(max_length=EDITOR_TAG_MAX_LENGTH)]] = Field(default_factory=list, max_length=2048)
+    environment: list[Annotated[str, Field(max_length=EDITOR_TAG_MAX_LENGTH)]] = Field(default_factory=list, max_length=512)
     nl: str = Field(default="", max_length=16_384)
 
 
@@ -254,7 +266,7 @@ class TagTxtContent(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     kind: Literal["tag_txt"] = "tag_txt"
-    tags: list[str] = Field(max_length=2048)
+    tags: list[Annotated[str, Field(max_length=EDITOR_TAG_MAX_LENGTH)]] = Field(max_length=2048)
 
 
 class TagsJsonContent(BaseModel):
@@ -307,6 +319,68 @@ class ImageEditRequest(BaseModel):
 
     content: SaveTagsContent
     expected_sidecar_mtime: float | None = Field(default=None, ge=0.0)
+
+
+class BatchOperationResponse(BaseModel):
+    """Result of one batch operation.
+
+    ``affected`` counts the images actually written; ``skipped_read_only``
+    counts targets skipped because their sidecar is read-only (raw e621) and
+    ``no_change`` counts targets the operation left untouched.
+    """
+
+    affected: int = 0
+    journal_id: int | None = None
+    skipped_read_only: int = 0
+    no_change: int = 0
+
+
+class BatchPreviewFormats(BaseModel):
+    """Effective target format tally of a batch preview.
+
+    Counted over the targets the batch would write, by the format it would
+    render.  A target with no sidecar falls back to ``tag_txt`` (the batch
+    behaviour), so its fresh sidecar counts there and the ``none`` bucket is
+    only present for contract symmetry.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    tag_txt: int = 0
+    tags_json: int = 0
+    standard_json: int = 0
+    none: int = 0
+
+
+class BatchPreviewSample(BaseModel):
+    """One changed target's before/after tags in a batch preview."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    image_id: int
+    file_name: str
+    kind: EditableSidecarKind
+    before_tags: list[str] = Field(default_factory=list)
+    after_tags: list[str] = Field(default_factory=list)
+
+
+class BatchPreviewResponse(BaseModel):
+    """Read-only description of what a batch operation would change.
+
+    Mirrors the batch tallies without writing anything: ``targets`` is the
+    resolved target count, ``affected``/``no_change``/``skipped_read_only`` are
+    the would-be outcomes, ``will_create`` counts targets whose sidecar does not
+    exist yet, and ``samples`` holds at most the first five changed targets in
+    target order.
+    """
+
+    targets: int = 0
+    affected: int = 0
+    no_change: int = 0
+    skipped_read_only: int = 0
+    will_create: int = 0
+    formats: BatchPreviewFormats = Field(default_factory=BatchPreviewFormats)
+    samples: list[BatchPreviewSample] = Field(default_factory=list)
 
 
 class TranslationLookupRequest(BaseModel):
@@ -364,9 +438,14 @@ class TagTranslateRequest(BaseModel):
 __all__ = [
     "BATCH_TAG_MAX_LENGTH",
     "BatchOperationRequest",
+    "BatchOperationResponse",
+    "BatchPreviewFormats",
+    "BatchPreviewResponse",
+    "BatchPreviewSample",
     "BatchTag",
     "COUNT_VALUES",
     "CreateDatasetRequest",
+    "EDITOR_TAG_MAX_LENGTH",
     "EditableSidecarKind",
     "FILTER_TAG_MAX_LENGTH",
     "FILTER_TAGS_TOTAL_MAX_LENGTH",
@@ -381,6 +460,7 @@ __all__ = [
     "StandardJsonContent",
     "TagEdit",
     "TagManagerProfile",
+    "TagManagerSort",
     "TagTranslateRequest",
     "TagTxtContent",
     "TagsJsonContent",

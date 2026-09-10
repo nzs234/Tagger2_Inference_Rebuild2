@@ -14,6 +14,7 @@ import json
 import logging
 import re
 from collections.abc import Container, Mapping
+from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Literal, cast
@@ -23,6 +24,7 @@ from ..security import (
     PathNotAllowedError,
     atomic_write_bytes,
 )
+from ..tag_text import canonical_tag_key
 from .contracts import (
     BatchOperationRequest,
     ImageEditRequest,
@@ -40,9 +42,11 @@ from .indexing import (
 )
 from .protocols import TagDatabaseClient
 from .sidecar_io import (
+    MAX_SIDECAR_BYTES,
     NINE_FIELDS,
     SidecarContent,
     SidecarError,
+    _parse_tag_list,
     dedup_tags,
     load_sidecar,
     render_standard_json,
@@ -55,6 +59,40 @@ logger = logging.getLogger("tagger2.tag_manager")
 
 MAX_BATCH_IMAGES = 2000
 JOURNAL_DEPTH = 20
+# The batch preview ships at most this many sample diffs; the counts above the
+# samples always describe the full target set, so a large batch stays cheap.
+PREVIEW_SAMPLE_LIMIT = 5
+
+# ``_apply_batch_to_image`` return sentinel for a read-only target, kept
+# distinct from ``None`` (a target the operation left unchanged) so the batch
+# response can report the two skip reasons separately.
+_SKIPPED_READ_ONLY: Any = object()
+
+
+@dataclass(frozen=True)
+class BatchChangePlan:
+    """One target's fully-computed batch change, before anything is written.
+
+    ``_compute_batch_change`` owns the read + validate + render span (including
+    the write-size guard); this plan carries everything the write phase needs so
+    the same computation can drive either the real batch or a read-only preview.
+    ``live_mtime`` is the stamp observed while reading: the write phase
+    re-verifies it immediately before writing, and the preview never does (it
+    never writes).
+    """
+
+    image_id: int
+    file_name: str
+    sidecar_rel: str
+    sidecar_path: Path
+    kind: str
+    existed: bool
+    before_text: str | None
+    after_text: str
+    before_tags: list[str]
+    after_tags: list[str]
+    before_version: dict[str, int] | None
+    live_mtime: float | None
 
 # Nine-field list fields that batch tag operations apply to.  Character,
 # series, artist, quality, count and nl are never touched by batch edits.
@@ -63,6 +101,23 @@ BATCH_TAG_FIELDS = ("tags", "appearance", "environment")
 # Nine-field entries whose values are tag-like and therefore translatable; the
 # free-form nl paragraph is translated by the online model instead.
 TRANSLATABLE_FIELDS = ("quality", "appearance", "tags", "environment")
+
+
+def _guard_write_size(text: str) -> None:
+    """Reject a sidecar or journalled text over the 1 MiB read budget.
+
+    ``sidecar_io`` only enforces the limit on read; without the write-side
+    mirror an oversized save would land a file the next load refuses to parse.
+    Checked before every write (save, batch and undo/redo replay), so a
+    rejected request leaves both the sidecar and the journal untouched.
+    """
+
+    if len(text.encode("utf-8")) > MAX_SIDECAR_BYTES:
+        raise TagManagerError(
+            "sidecar exceeds the 1 MiB limit",
+            code="sidecar_too_large",
+            status_code=413,
+        )
 
 
 @lru_cache(maxsize=256)
@@ -194,6 +249,18 @@ def _sidecar_rel_for_kind(relative_image_path: str, kind: str) -> str:
 
 def _kind_from_suffix(sidecar_path: Path) -> str:
     return "tag_txt" if sidecar_path.suffix.casefold() == ".txt" else "standard_json"
+
+
+def _sidecar_rel_matches_kind(sidecar_rel: str, kind: str) -> bool:
+    """Whether a recorded sidecar path's suffix fits the requested kind.
+
+    ``.txt`` is the tag_txt slot; anything else (``.json``) is the JSON slot.
+    A recorded path that disagrees (a stale extension after the sidecar was
+    deleted and re-created with another format) must not drive the write.
+    """
+
+    suffix = Path(sidecar_rel).suffix.casefold()
+    return suffix == ".txt" if kind == "tag_txt" else suffix != ".txt"
 
 
 def _sidecar_version(path: Path) -> dict[str, int] | None:
@@ -350,7 +417,13 @@ def _render_edit(content: Any, original: SidecarContent | None = None) -> str:
 def _apply_tag_op(
     tags: list[str], request: BatchOperationRequest
 ) -> list[str] | None:
-    """Apply one batch op to a flat tag list; None means no change."""
+    """Apply one batch op to a flat tag list; None means no change.
+
+    Non-regex comparisons key on ``canonical_tag_key`` (lowercase underscore),
+    so a sidecar spelling ``long hair`` and a request spelling ``long_hair``
+    match; dedup keeps the first spelling it sees.  Regex mode keeps matching
+    the raw text (a pattern is not a tag name).
+    """
 
     if request.op == "add":
         merged = dedup_tags([*tags, *request.tags])
@@ -363,8 +436,8 @@ def _apply_tag_op(
                 if not any(pattern.search(tag) for pattern in patterns)
             ]
         else:
-            removed = {tag.casefold() for tag in request.tags}
-            kept = [tag for tag in tags if tag.casefold() not in removed]
+            removed = {canonical_tag_key(tag) for tag in request.tags}
+            kept = [tag for tag in tags if canonical_tag_key(tag) not in removed]
         return kept if kept != tags else None
     # replace
     if request.use_regex:
@@ -374,8 +447,10 @@ def _apply_tag_op(
             pattern.sub(replacement, tag) if pattern else tag for tag in tags
         ]
     else:
-        replaced = {tag.casefold(): request.replacement or "" for tag in request.tags}
-        updated = [replaced.get(tag.casefold(), tag) for tag in tags]
+        replaced = {
+            canonical_tag_key(tag): request.replacement or "" for tag in request.tags
+        }
+        updated = [replaced.get(canonical_tag_key(tag), tag) for tag in tags]
     cleaned = [tag for tag in updated if tag.strip()]
     merged = dedup_tags(cleaned)
     return merged if merged != dedup_tags(tags) else None
@@ -386,14 +461,20 @@ def _apply_entry_op(
     request: BatchOperationRequest,
     categories: CategoryResolver,
 ) -> list[dict[str, Any]] | None:
-    """Apply one batch op to tags_json entries, preserving entry metadata."""
+    """Apply one batch op to tags_json entries, preserving entry metadata.
+
+    Non-regex keys use ``canonical_tag_key`` exactly like the flat-list path;
+    regex mode still matches the raw entry text.
+    """
 
     if request.op == "add":
-        existing = {str(entry.get("text", "")).casefold() for entry in entries}
+        existing = {
+            canonical_tag_key(str(entry.get("text", ""))) for entry in entries
+        }
         fresh = [
             {"text": tag, "category": categories.category_for(tag)}
             for tag in request.tags
-            if tag.casefold() not in existing
+            if canonical_tag_key(tag) not in existing
         ]
         return entries + fresh if fresh else None
     if request.op == "remove":
@@ -404,10 +485,10 @@ def _apply_entry_op(
                 if not any(pattern.search(str(entry.get("text", ""))) for pattern in patterns)
             ]
         else:
-            removed = {tag.casefold() for tag in request.tags}
+            removed = {canonical_tag_key(tag) for tag in request.tags}
             kept = [
                 entry for entry in entries
-                if str(entry.get("text", "")).casefold() not in removed
+                if canonical_tag_key(str(entry.get("text", ""))) not in removed
             ]
         return kept if kept != entries else None
     # replace
@@ -423,11 +504,13 @@ def _apply_entry_op(
                 entry["text"] = new_text
                 updated.append(entry)
     else:
-        replaced = {tag.casefold(): request.replacement or "" for tag in request.tags}
+        replaced = {
+            canonical_tag_key(tag): request.replacement or "" for tag in request.tags
+        }
         updated = []
         for entry in entries:
             text = str(entry.get("text", ""))
-            new_text = replaced.get(text.casefold(), text)
+            new_text = replaced.get(canonical_tag_key(text), text)
             if new_text.strip():
                 entry = dict(entry)
                 entry["text"] = new_text
@@ -435,7 +518,7 @@ def _apply_entry_op(
     merged: list[dict[str, Any]] = []
     seen: set[str] = set()
     for entry in updated:
-        key = str(entry.get("text", "")).casefold()
+        key = canonical_tag_key(str(entry.get("text", "")))
         if key in seen:
             continue
         seen.add(key)
@@ -550,8 +633,11 @@ class SessionEditor:
 
         Without this check a corrupt (typically legacy) entry would fail in
         phase 2 — after earlier changes of the same entry were already applied.
+        The size guard runs here too, so an oversized journalled text is
+        refused in phase 1 with no file written.
         """
 
+        _guard_write_size(text)
         if not text or slot_kind == "tag_txt":
             return
         try:
@@ -591,6 +677,12 @@ class SessionEditor:
         sidecar_rel = image["sidecar_path"] or _sidecar_rel_for_kind(
             str(image["relative_path"]), kind
         )
+        # A recorded path may carry a suffix from a previous format (its
+        # extension was not updated when an undo deleted the sidecar).  Reuse
+        # it only when it belongs to the requested slot, otherwise re-derive:
+        # writing tags_json bytes into "c.txt" would leave an unreadable file.
+        if not _sidecar_rel_matches_kind(str(sidecar_rel), kind):
+            sidecar_rel = _sidecar_rel_for_kind(str(image["relative_path"]), kind)
         if current_kind == "raw_e621_json" and kind != "raw_e621_json":
             raise TagManagerError(
                 "raw e621 sidecars are read-only; convert explicitly",
@@ -614,6 +706,9 @@ class SessionEditor:
         rendered = _render_edit(
             edit.content, _original_content_for_merge(before_text, kind)
         )
+        # Refuse an oversized render before the write: a file over the read
+        # budget could never be loaded again, and nothing may land on disk.
+        _guard_write_size(rendered)
         # Re-verify the optimistic-concurrency stamp immediately before the
         # write: an external writer can land a change between the validation
         # above and this write, and the write must only ever land on the
@@ -651,10 +746,22 @@ class SessionEditor:
         # the journal entry actually landed.  A failed save (sidecar conflict,
         # kind mismatch, ...) must leave the redo history untouched.
         self.store.discard_redo_stack(session_id)
-        content = load_sidecar(
-            sidecar_path.with_suffix(".txt") if kind == "tag_txt" else None,
-            sidecar_path if kind != "tag_txt" else None,
-        )
+        # The bytes are already written and journalled above; a post-write
+        # parse failure (should not happen for a render this service produced)
+        # is surfaced as a readable error that says the step is undoable
+        # rather than leaking a raw SidecarError after the redo stack dropped.
+        try:
+            content = load_sidecar(
+                sidecar_path.with_suffix(".txt") if kind == "tag_txt" else None,
+                sidecar_path if kind != "tag_txt" else None,
+            )
+        except SidecarError as exc:
+            raise TagManagerError(
+                f"sidecar was written but cannot be re-read ({exc});"
+                " 该步已记录到操作日志，可撤销恢复",
+                code="sidecar_invalid",
+                status_code=409,
+            ) from exc
         categories = CategoryResolver(self.tag_database, str(session["profile"]))
         self.store.upsert_images(
             session_id,
@@ -694,7 +801,12 @@ class SessionEditor:
             session = require_session(self.store, session_id)
             targets = self._resolve_targets(session_id, request)
             if not targets:
-                return {"affected": 0, "journal_id": None}
+                return {
+                    "affected": 0,
+                    "journal_id": None,
+                    "skipped_read_only": 0,
+                    "no_change": 0,
+                }
             if len(targets) > MAX_BATCH_IMAGES:
                 raise TagManagerError(
                     f"batch operations are capped at {MAX_BATCH_IMAGES} images",
@@ -703,10 +815,16 @@ class SessionEditor:
                 )
             categories = CategoryResolver(self.tag_database, str(session["profile"]))
             changes: list[dict[str, Any]] = []
+            skipped_read_only = 0
+            no_change = 0
             try:
                 for image in targets:
                     change = self._apply_batch_to_image(session, image, request, categories)
-                    if change is not None:
+                    if change is _SKIPPED_READ_ONLY:
+                        skipped_read_only += 1
+                    elif change is None:
+                        no_change += 1
+                    else:
                         changes.append(change)
             except Exception:
                 # Keep the images already written recoverable: journal the
@@ -719,14 +837,25 @@ class SessionEditor:
                     self.store.discard_redo_stack(session_id)
                 raise
             if not changes:
-                # Every target was a no-op: nothing branches the history, so
-                # no (empty) journal entry and the redo stack stays intact.
-                return {"affected": 0, "journal_id": None}
+                # Every target was read-only or a no-op: nothing branches the
+                # history, so no (empty) journal entry and the redo stack stays
+                # intact.  The skip tallies still describe what was skipped.
+                return {
+                    "affected": 0,
+                    "journal_id": None,
+                    "skipped_read_only": skipped_read_only,
+                    "no_change": no_change,
+                }
             entry_id = self._append_batch_journal(session_id, request, changes)
             # A new batch invalidates the undone history that can no longer be
             # replayed; drop it only after the entry actually landed.
             self.store.discard_redo_stack(session_id)
-            return {"affected": len(changes), "journal_id": entry_id}
+            return {
+                "affected": len(changes),
+                "journal_id": entry_id,
+                "skipped_read_only": skipped_read_only,
+                "no_change": no_change,
+            }
 
     def _append_batch_journal(
         self,
@@ -797,14 +926,80 @@ class SessionEditor:
         image: Mapping[str, Any],
         request: BatchOperationRequest,
         categories: CategoryResolver,
-    ) -> dict[str, Any] | None:
+    ) -> Any:
+        plan = self._compute_batch_change(session, image, request, categories)
+        if plan is _SKIPPED_READ_ONLY or plan is None:
+            return plan
+        sidecar_path = plan.sidecar_path
+        # Re-verify against the stamp observed while reading: an external
+        # writer can land a change between the indexed-stamp check and this
+        # write, and the write must only land on the bytes the batch actually
+        # parsed.  The check deliberately lives in the write phase (not in
+        # ``_compute_batch_change``), so a preview never trips it.
+        if stat_mtime(sidecar_path) != plan.live_mtime:
+            raise TagManagerError(
+                "sidecar changed while the batch was running",
+                code="sidecar_conflict",
+                status_code=409,
+                retryable=True,
+            )
+        atomic_write_bytes(sidecar_path, plan.after_text.encode("utf-8"))
+        change = {
+            "image_id": plan.image_id,
+            "sidecar": plan.sidecar_rel,
+            "existed": plan.existed,
+            "kind": plan.kind,
+            "before": plan.before_text or "",
+            "after": plan.after_text,
+            "before_version": plan.before_version,
+            "after_version": _sidecar_version(sidecar_path),
+        }
+        try:
+            refreshed = load_sidecar(
+                sidecar_path.with_suffix(".txt") if plan.kind == "tag_txt" else None,
+                sidecar_path if plan.kind != "tag_txt" else None,
+            )
+            self.store.set_image_tags(
+                plan.image_id,
+                categories.categorize(refreshed.tags),
+                sidecar_kind=plan.kind,
+                sidecar_mtime=stat_mtime(sidecar_path),
+            )
+        except Exception:  # noqa: BLE001 - the write is journalled; undo/rescan repairs the index
+            logger.warning(
+                "tag manager batch index refresh failed for %s;"
+                " the journal entry keeps the change recoverable",
+                plan.sidecar_rel,
+                exc_info=True,
+            )
+        return change
+
+    def _compute_batch_change(
+        self,
+        session: Mapping[str, Any],
+        image: Mapping[str, Any],
+        request: BatchOperationRequest,
+        categories: CategoryResolver,
+        *,
+        for_write: bool = True,
+    ) -> Any:
+        """Read, validate and render one target without touching the disk.
+
+        Returns ``_SKIPPED_READ_ONLY`` for a read-only target, ``None`` when the
+        operation leaves the sidecar unchanged, and a :class:`BatchChangePlan`
+        otherwise.  Validation failures (stale ``mtime``, a disappeared
+        sidecar, an oversized render, ...) raise exactly like the write path.
+        ``for_write=False`` (the preview) resolves the sidecar path without the
+        writable-root requirement, since nothing is written.
+        """
+
         if str(image["sidecar_kind"]) == "raw_e621_json":
-            return None  # read-only surfaces are skipped, never half-edited
+            return _SKIPPED_READ_ONLY  # read-only surfaces are skipped, never half-edited
         content, _live_mtime = load_content_and_mtime(
             paths=sidecar_paths(self.allowlist, session, image)
         )
         if content.kind == "raw_e621_json":
-            return None  # the index row is stale; never edit a read-only file
+            return _SKIPPED_READ_ONLY  # the index row is stale; never edit a read-only file
         indexed_kind = str(image["sidecar_kind"])
         if content.kind == "none" and indexed_kind != "none":
             # The indexed sidecar vanished (or blanked) after the scan.  Never
@@ -827,7 +1022,9 @@ class SessionEditor:
         else:
             effective_kind = "tag_txt"
         sidecar_rel = _sidecar_rel_for_kind(str(image["relative_path"]), effective_kind)
-        sidecar_path = resolve_sidecar(self.allowlist, session, image, sidecar_rel)
+        sidecar_path = resolve_sidecar(
+            self.allowlist, session, image, sidecar_rel, for_write=for_write
+        )
         before_text = _read_sidecar_text(sidecar_path)
         before_version = _sidecar_version(sidecar_path)
         indexed_mtime = image.get("sidecar_mtime")
@@ -840,73 +1037,137 @@ class SessionEditor:
                 retryable=True,
             )
 
+        before_tags = list(content.tags)
+        after_tags: list[str]
         if effective_kind == "tag_txt":
             new_tags = _apply_tag_op(list(content.tags), request)
             if new_tags is None:
                 return None
             after_text = render_tag_txt(new_tags)
+            after_tags = list(new_tags)
         elif effective_kind == "tags_json":
             entries = [dict(entry) for entry in content.tag_entries]
             new_entries = _apply_entry_op(entries, request, categories)
             if new_entries is None:
                 return None
             after_text = render_tags_json(new_entries, document=content.document)
+            after_tags = [str(entry["text"]) for entry in new_entries]
         else:
             document = dict(content.document or {})
             changed = False
+            # The preview diffs the nine-field ``tags`` slot; remember its new
+            # value when the op touched it so the samples show the real new
+            # tag list rather than the pre-op one.
+            new_tags_field: list[str] | None = None
             for field in BATCH_TAG_FIELDS:
-                values = list(document.get(field) or ())
-                new_values = _apply_tag_op([str(value) for value in values], request)
+                raw_values = document.get(field)
+                # A nine-field list slot can hold a plain string (legacy or
+                # hand-authored documents).  ``list("solo, wolf")`` would
+                # explode it into single characters, so parse it with the same
+                # rule the sidecar loader uses and write back the upgraded
+                # list.
+                if isinstance(raw_values, str):
+                    values = list(_parse_tag_list(raw_values))
+                elif raw_values is None:
+                    values = []
+                else:
+                    values = [str(value) for value in raw_values]
+                new_values = _apply_tag_op(values, request)
                 if new_values is not None:
                     document[field] = new_values
                     changed = True
+                    if field == "tags":
+                        new_tags_field = list(new_values)
             if not changed:
                 return None
             after_text = render_standard_json(document)
+            after_tags = new_tags_field if new_tags_field is not None else before_tags
 
         if after_text == (before_text or ""):
             return None
-        # Re-verify against the stamp observed while reading: an external
-        # writer can land a change between the indexed-stamp check above and
-        # this write, and the write must only land on the bytes the batch
-        # actually parsed.
-        if stat_mtime(sidecar_path) != live_mtime:
-            raise TagManagerError(
-                "sidecar changed while the batch was running",
-                code="sidecar_conflict",
-                status_code=409,
-                retryable=True,
-            )
-        atomic_write_bytes(sidecar_path, after_text.encode("utf-8"))
-        change = {
-            "image_id": int(image["id"]),
-            "sidecar": sidecar_rel,
-            "existed": before_text is not None,
-            "kind": effective_kind,
-            "before": before_text or "",
-            "after": after_text,
-            "before_version": before_version,
-            "after_version": _sidecar_version(sidecar_path),
-        }
-        try:
-            refreshed = load_sidecar(
-                sidecar_path.with_suffix(".txt") if effective_kind == "tag_txt" else None,
-                sidecar_path if effective_kind != "tag_txt" else None,
-            )
-            self.store.set_image_tags(
-                int(image["id"]),
-                categories.categorize(refreshed.tags),
-                sidecar_kind=effective_kind,
-                sidecar_mtime=stat_mtime(sidecar_path),
-            )
-        except Exception:  # noqa: BLE001 - the write is journalled; undo/rescan repairs the index
-            logger.warning(
-                "tag manager batch index refresh failed for %s;"
-                " the journal entry keeps the change recoverable",
-                sidecar_rel,
-                exc_info=True,
-            )
-        return change
+        # A render over the 1 MiB read budget could never be loaded again;
+        # refuse it before the write so the file stays untouched.
+        _guard_write_size(after_text)
+        return BatchChangePlan(
+            image_id=int(image["id"]),
+            file_name=str(image["file_name"]),
+            sidecar_rel=sidecar_rel,
+            sidecar_path=sidecar_path,
+            kind=effective_kind,
+            existed=before_text is not None,
+            before_text=before_text,
+            after_text=after_text,
+            before_tags=before_tags,
+            after_tags=after_tags,
+            before_version=before_version,
+            live_mtime=live_mtime,
+        )
+
+    def preview_batch(self, session_id: str, request: BatchOperationRequest) -> dict[str, Any]:
+        """Describe what :meth:`batch_operation` would change, writing nothing.
+
+        Runs under the same exclusive lock as the write so the described state
+        cannot race a concurrent edit.  No file is touched, no journal entry is
+        appended, the index is not refreshed and the redo stack is left alone;
+        the response reports the same tallies plus the effective target formats
+        and a bounded sample of before/after tag diffs.
+        """
+
+        session = require_session(self.store, session_id)
+        with self._locks.exclusive(session_id):
+            # Lock-window re-check, same as batch_operation: a concurrent
+            # delete must surface as 404 before any target is resolved.
+            session = require_session(self.store, session_id)
+            targets = self._resolve_targets(session_id, request)
+            if len(targets) > MAX_BATCH_IMAGES:
+                raise TagManagerError(
+                    f"batch operations are capped at {MAX_BATCH_IMAGES} images",
+                    code="batch_too_large",
+                    status_code=413,
+                )
+            formats = {"tag_txt": 0, "tags_json": 0, "standard_json": 0, "none": 0}
+            samples: list[dict[str, Any]] = []
+            affected = 0
+            no_change = 0
+            skipped_read_only = 0
+            will_create = 0
+            if targets:
+                categories = CategoryResolver(self.tag_database, str(session["profile"]))
+                for image in targets:
+                    plan = self._compute_batch_change(
+                        session, image, request, categories, for_write=False
+                    )
+                    if plan is _SKIPPED_READ_ONLY:
+                        skipped_read_only += 1
+                        continue
+                    if plan is None:
+                        no_change += 1
+                        continue
+                    affected += 1
+                    # ``effective_kind`` falls back to tag_txt for a target with
+                    # no sidecar, so a freshly created sidecar is counted under
+                    # tag_txt; ``will_create`` tallies those separately and the
+                    # ``none`` bucket therefore stays empty.
+                    formats[plan.kind] = formats.get(plan.kind, 0) + 1
+                    if not plan.existed:
+                        will_create += 1
+                    if len(samples) < PREVIEW_SAMPLE_LIMIT:
+                        samples.append({
+                            "image_id": plan.image_id,
+                            "file_name": plan.file_name,
+                            "kind": plan.kind,
+                            "before_tags": plan.before_tags,
+                            "after_tags": plan.after_tags,
+                        })
+            return {
+                "targets": len(targets),
+                "affected": affected,
+                "no_change": no_change,
+                "skipped_read_only": skipped_read_only,
+                "will_create": will_create,
+                "formats": formats,
+                "samples": samples,
+            }
 
     # -- undo / redo -------------------------------------------------------
 
@@ -934,7 +1195,10 @@ class SessionEditor:
         with self._locks.exclusive(session_id):
             # Lock-window re-check, same as undo.
             require_session(self.store, session_id)
-            entry = self.store.latest_journal_entry(session_id, undone=True)
+            # Undo walks the live history newest-first; redo must mirror it by
+            # replaying the *oldest* undone entry first, or a multi-step undo
+            # would redo the steps out of order.
+            entry = self.store.next_redo_entry(session_id)
             if entry is None:
                 raise TagManagerError(
                     "nothing to redo",
@@ -987,6 +1251,10 @@ class SessionEditor:
                     [],
                     sidecar_kind="none",
                     sidecar_mtime=None,
+                    # Clear the recorded path: leaving the old extension would
+                    # make a later save of another format reuse this stale
+                    # suffix and write the wrong file.
+                    sidecar_path=None,
                 )
                 continue
             atomic_write_bytes(sidecar_path, text.encode("utf-8"))
@@ -1016,6 +1284,8 @@ class SessionEditor:
 __all__ = [
     "JOURNAL_DEPTH",
     "MAX_BATCH_IMAGES",
+    "PREVIEW_SAMPLE_LIMIT",
+    "BatchChangePlan",
     "SessionEditor",
     "assert_sidecar_not_stale",
     "content_payload",
