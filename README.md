@@ -74,7 +74,7 @@ Tagger2 Inference Rebuild 将本地 Caption 模型、在线视觉模型、多供
 | 批量任务 | 扫描本机目录，创建持久化的本地、在线或混合打标任务，查看进度和历史。 |
 | 数据集工作流 | 执行 Caption、分类、标签替换、OCR、NL、人工复核、Policy、Token 检查与安全提交。 |
 | 标签管理 | 类 BooruDatasetTagManager 的数据集标签编辑：网格浏览、逐图/批量编辑、e621 与 danbooru 标签库自动补全、中英双语标签、下划线/空格切换、NL 在线翻译、撤销重做。 |
-| Tag Wiki | 本地 e621 / Danbooru 标签百科镜像：查含义、中文自然语言语义搜索（跨语言向量 + 关键词融合）、AI 问答（RAG），以及高频标签的结构化中文摘要预翻译。 |
+| Tag Wiki | 本地 e621 / Danbooru 标签百科镜像：按分类浏览高频标签、模糊搜索、查看中文摘要与关联标签。 |
 | 在线模型 | 管理 OpenAI、Gemini、Claude 和兼容 API，测试连接并发现可用模型。 |
 | 本地模型 | 下载、注册、加载和卸载模型，管理推理后端、Adapter、阈值与显存驻留。 |
 | 设置 | 管理输入/输出根目录、运行限制和非敏感运行配置。 |
@@ -308,17 +308,14 @@ Count Review 确认后只叠加人工 count，再执行 Policy；Token Review �
 
 ## Tag Wiki
 
-本地化的 e621 / Danbooru 标签百科与智能检索，解决“这个 tag 是什么意思”“我想表达某个动作用什么 tag”“这个 tag 要和什么搭配”三个问题。页面右上角可切换语料库；自 V1.10.1 起两个构建完成的 Wiki 数据库随发行包分发，解压即用。完整说明见 [docs/tag_wiki.md](docs/tag_wiki.md)。
+本地化的 e621 / Danbooru 标签百科目录，支持按分类浏览高频标签、模糊搜索、中文摘要与关联标签。页面右上角可切换语料库；构建完成的 Wiki 数据库随发行包分发，解压即用。完整说明见 [docs/tag_wiki.md](docs/tag_wiki.md)。
 
 - **本地数据**：e621 wiki 正文来自官方 `db_export` 的 `wiki_pages` 每日导出（约 17 MB），应用内一键下载入库到 `data/tag_wiki/tag_wiki.sqlite3`；Danbooru 语料自 V1.10.1 起随包提供（也可用 `scripts/fetch_danbooru_wiki.py` 经官方 API 增量抓取）。tag 类别、post_count、别名与 implications 复用分类快照资源。
-- **三种查询模式**：
-  - **查含义**：tag → 别名归一 → 中文摘要 + 英文原文 + implications 搭配提示 + 相关 tag。
-  - **语义搜索**：中文/自然语言描述 → multilingual-e5 跨语言向量检索与 FTS5 关键词检索做 RRF 融合，返回相关 tag 与 wiki 依据；画师/角色/贡献者类链接列表页与“链接汤”章节在构建时剪枝，避免污染排序。
-  - **AI 问答**：本地检索提供上下文，已配置的在线大模型生成带来源的中文回答（RAG），无可用 Provider 时给出引导。
-- **中文摘要预翻译**：为高频 tag（默认 post_count ≥ 1000，可切换模型词表/全部）批量生成结构化摘要（含义/用法/搭配/注意事项），支持在线 Provider 或本地 GPU LLM 两条路径，断点续跑。
+- **目录查询**：按官方分类与二级语义组浏览高频标签，支持名称、别名、前缀和包含匹配；打开词条可查看中文摘要、热度与关联标签。
+- **中文摘要**：维护端为高频标签生成结构化中文摘要，发行包中的目录与摘要只读。
 - **快捷入口**：标签管理器与工作台的标签药丸上有“查 Wiki”按钮，弹出抽屉直接查看该标签的中文释义与搭配。
-- **命令行运维**：`scripts/build_tag_wiki.py --build/--translate` 与 `scripts/translate_tag_wiki_local.py`（本地 LLM 翻译）支持不开浏览器完成构建、更新与翻译，全部断点续跑。
-- **离线友好**：除 AI 问答与摘要生成外，查询、检索与已有摘要展示全部离线可用。
+- **命令行运维**：目录构建与发行前校验通过 `scripts/build_tag_wiki_catalog.py` 完成，不在浏览器内修改 Wiki 数据。
+- **离线友好**：目录浏览、搜索、词条详情和已有摘要展示全部离线可用。
 
 <a id="output-format"></a>
 
@@ -434,10 +431,8 @@ gpu_concurrency = 1
 allow_unsafe_pickle = false
 
 [tag_wiki]
-# Tag Wiki 嵌入模型（首次构建自动下载，约 470 MB），可改为镜像或本地 repo id
-embed_model_repo = "intfloat/multilingual-e5-small"
-# 「高频标签」翻译范围默认阈值
-min_post_count = 1000
+# 「高频标签」目录构建范围默认阈值
+min_post_count = 100
 ```
 
 ### 重要安全约束
@@ -655,6 +650,10 @@ Tagger2_Inference_Rebuild2/
 - [Dataset Workflow 路径操作说明](docs/workflow_manual_paths.md)
 - [固定上游兼容性报告](docs/workflow_compatibility_report.md)
 - [发行包内容与资源指纹](docs/release_package_contents.md)
+- [V1.10.5 发布说明](docs/V1.10.5_RELEASE_NOTES.md)
+- [V1.10.4 发布说明](docs/V1.10.4_RELEASE_NOTES.md)
+- [V1.10.3 发布说明](docs/V1.10.3_RELEASE_NOTES.md)
+- [V1.10.2 发布说明](docs/V1.10.2_RELEASE_NOTES.md)
 - [V1.10.1 发布说明](docs/V1.10.1_RELEASE_NOTES.md)
 - [V1.10 发布说明](docs/V1.10_RELEASE_NOTES.md)
 - [V1.06.1 发布说明](docs/V1.06.1_RELEASE_NOTES.md)

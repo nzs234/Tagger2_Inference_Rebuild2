@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, Mapping, Sequence
 
+from ..nine_field_schema import NINE_FIELDS
 from ..workflow.raw_e621 import RawE621JsonError, parse_raw_e621_annotation
 
 SidecarKind = Literal[
@@ -27,18 +28,8 @@ SidecarKind = Literal[
     "raw_e621_json",
 ]
 
-# Same frozen order as the workflow nine-field contract.
-NINE_FIELDS = (
-    "quality",
-    "count",
-    "character",
-    "series",
-    "artist",
-    "appearance",
-    "tags",
-    "environment",
-    "nl",
-)
+# Re-exported from the shared schema module (single source of truth for the
+# workflow contract; the drift-guard test pins the workflow's own copy).
 
 # A sidecar may legitimately carry two thousand tag objects; the limit exists
 # to bound memory and editor payloads, not to mirror the workflow's tighter
@@ -55,8 +46,10 @@ class SidecarContent:
     """Parsed sidecar payload.
 
     ``tags`` is always the flat, order-preserved tag view used for indexing
-    and filtering.  Only one of ``raw_text`` / ``tag_entries`` / ``document``
-    carries the format-native payload.
+    and filtering.  ``tag_entries`` carries the tags_json entry objects and
+    ``document`` the full parsed document (tags_json container and nine-field
+    standard JSON alike), so unknown metadata survives a read-render round
+    trip; ``raw_text`` is the tag_txt source.
     """
 
     kind: SidecarKind
@@ -196,6 +189,7 @@ def load_sidecar(txt_path: Path | None, json_path: Path | None) -> SidecarConten
                     kind="tags_json",
                     tags=tuple(str(entry["text"]) for entry in entries),
                     tag_entries=tuple(entries),
+                    document=document,
                 )
             raise SidecarError(
                 f"{json_path.name} is neither a nine-field document nor a tags container"

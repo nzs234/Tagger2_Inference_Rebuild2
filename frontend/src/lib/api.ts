@@ -106,7 +106,8 @@ export async function request<T>(path: string, init: RequestInit = {}): Promise<
   return JSON.parse(bodyText) as T
 }
 
-async function requestBlob(path: string): Promise<Blob> {
+/** Authorized binary fetch for endpoints consumed as object URLs. */
+export async function requestBlob(path: string): Promise<Blob> {
   const headers = new Headers(authHeaders())
   const response = await fetch(`${API_BASE}${path}`, { headers })
   if (!response.ok) {

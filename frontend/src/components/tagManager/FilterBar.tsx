@@ -1,34 +1,120 @@
+import { useState, type ReactNode } from 'react'
+import { X } from 'lucide-react'
 import { Field } from '../ui'
 import {
-  formatTagFilterInput,
-  parseTagFilterInput,
+  formatTagForDisplay,
+  translationFor,
   type ImageFilterState,
+  type TagManagerProfile,
   type TagManagerSidecarFilter,
   type TagManagerSort,
 } from '../../lib/tagManager'
+import { tagCategoryClass } from '../../lib/tagCategories'
 import { usePreferences } from '../../store/app'
+import { useTagTranslationMemory } from '../../store/tagTranslationMemory'
+import { TagInput } from './TagInput'
 
-export function FilterBar({ filter, sort, disabled, onChange, onSortChange }: {
+/**
+ * Field shell for one filter tag list.  Built from the same classes as the
+ * shared `Field` but without its labelled group wrapper, so the autocomplete
+ * input stays the single element named 包含标签/排除标签.
+ */
+function TagFilterField({ label, hint, children }: { label: string; hint: string; children: ReactNode }) {
+  return <div className="field">
+    <div className="field-label-row"><span className="field-label">{label}</span></div>
+    {children}
+    <span className="field-hint">{hint}</span>
+  </div>
+}
+
+/**
+ * One selected filter tag as a removable category-coloured pill.  The Chinese
+ * name shows only when the session-local translation memory already knows the
+ * tag; no lookups are fired for it.
+ */
+function FilterChip({ tag, category, removeLabel, onRemove }: {
+  tag: string
+  category?: string
+  removeLabel: string
+  onRemove: (tag: string) => void
+}) {
+  const bilingual = usePreferences((state) => state.bilingualTags)
+  const tagStyle = usePreferences((state) => state.tagStyle)
+  const memory = useTagTranslationMemory((state) => state.map)
+  const translation = bilingual ? translationFor(memory, tag) : null
+
+  return <span className={`tm-pill ${tagCategoryClass(category)}`}>
+    <span>{formatTagForDisplay(tag, tagStyle)}</span>
+    {translation && <span className="tm-pill-zh">{translation}</span>}
+    <button
+      type="button"
+      className="tm-pill-remove"
+      aria-label={removeLabel}
+      title={removeLabel}
+      onClick={() => onRemove(tag)}
+    >
+      <X size={11} aria-hidden="true" />
+    </button>
+  </span>
+}
+
+/**
+ * Image filter bar.  Include/exclude tags are picked through the shared
+ * autocomplete input and kept as chips — one tag per chip, so a tag that
+ * itself contains a comma never needs escaping.  The raw tags go straight
+ * into the filter state and are escaped per tag when the images query is
+ * serialised.
+ */
+export function FilterBar({ filter, sort, profile, disabled, onChange, onSortChange }: {
   filter: ImageFilterState
   sort: TagManagerSort
+  profile: TagManagerProfile
   disabled?: boolean
   onChange: (next: ImageFilterState) => void
   onSortChange: (sort: TagManagerSort) => void
 }) {
   const tagStyle = usePreferences((state) => state.tagStyle)
-  const render = (tags: string[]) => formatTagFilterInput(tags, tagStyle)
+  // Categories seen through the autocomplete, so chips keep their colour;
+  // tags added elsewhere (e.g. from the stats panel) fall back to the general
+  // palette instead of firing extra tag-db lookups.
+  const [categories, setCategories] = useState<Record<string, string>>({})
+
+  const addIncludeTag = (tag: string, category?: string) => {
+    if (category && !categories[tag]) setCategories({ ...categories, [tag]: category })
+    if (filter.includeTags.includes(tag)) return
+    onChange({ ...filter, includeTags: [...filter.includeTags, tag] })
+  }
+  const addExcludeTag = (tag: string, category?: string) => {
+    if (category && !categories[tag]) setCategories({ ...categories, [tag]: category })
+    if (filter.excludeTags.includes(tag)) return
+    onChange({ ...filter, excludeTags: [...filter.excludeTags, tag] })
+  }
+  const removeIncludeTag = (tag: string) => {
+    if (!filter.includeTags.includes(tag)) return
+    onChange({ ...filter, includeTags: filter.includeTags.filter((entry) => entry !== tag) })
+  }
+  const removeExcludeTag = (tag: string) => {
+    if (!filter.excludeTags.includes(tag)) return
+    onChange({ ...filter, excludeTags: filter.excludeTags.filter((entry) => entry !== tag) })
+  }
 
   return <div className="tm-filter-grid">
-    <Field label="包含标签" hint="逗号分隔，下划线或空格均可；含逗号的标签写作 a\,b">
-      <input
-        value={render(filter.includeTags)}
-        aria-label="包含标签"
-        disabled={disabled}
-        spellCheck={false}
-        placeholder="solo, long_hair"
-        onChange={(event) => onChange({ ...filter, includeTags: parseTagFilterInput(event.target.value) })}
-      />
-    </Field>
+    <TagFilterField label="包含标签" hint="自动补全；回车或点建议添加，点 × 移除">
+      <div className="tm-filter-tags">
+        {filter.includeTags.length > 0 && <div className="tm-pill-row">
+          {filter.includeTags.map((tag) => (
+            <FilterChip
+              key={tag}
+              tag={tag}
+              category={categories[tag]}
+              removeLabel={`移除筛选 ${formatTagForDisplay(tag, tagStyle)}`}
+              onRemove={removeIncludeTag}
+            />
+          ))}
+        </div>}
+        <TagInput profile={profile} label="包含标签" disabled={disabled} onAdd={addIncludeTag} />
+      </div>
+    </TagFilterField>
     <Field label="匹配模式">
       <select
         value={filter.includeMode}
@@ -40,16 +126,22 @@ export function FilterBar({ filter, sort, disabled, onChange, onSortChange }: {
         <option value="any">包含任意标签</option>
       </select>
     </Field>
-    <Field label="排除标签" hint="逗号分隔；含逗号的标签写作 a\,b">
-      <input
-        value={render(filter.excludeTags)}
-        aria-label="排除标签"
-        disabled={disabled}
-        spellCheck={false}
-        placeholder="comic"
-        onChange={(event) => onChange({ ...filter, excludeTags: parseTagFilterInput(event.target.value) })}
-      />
-    </Field>
+    <TagFilterField label="排除标签" hint="自动补全；回车或点建议添加，点 × 移除">
+      <div className="tm-filter-tags">
+        {filter.excludeTags.length > 0 && <div className="tm-pill-row">
+          {filter.excludeTags.map((tag) => (
+            <FilterChip
+              key={tag}
+              tag={tag}
+              category={categories[tag]}
+              removeLabel={`移除排除 ${formatTagForDisplay(tag, tagStyle)}`}
+              onRemove={removeExcludeTag}
+            />
+          ))}
+        </div>}
+        <TagInput profile={profile} label="排除标签" disabled={disabled} onAdd={addExcludeTag} />
+      </div>
+    </TagFilterField>
     <Field label="Sidecar 类型">
       <select
         value={filter.kind}

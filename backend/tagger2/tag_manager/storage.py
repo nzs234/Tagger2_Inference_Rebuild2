@@ -141,6 +141,13 @@ class TagManagerStore:
 
     def _init_file_db(self) -> None:
         with self.connection() as conn:
+            # WAL mode: every store operation (reads included) still takes the
+            # shared write lock, so reads and writes inside this process stay
+            # serialized.  WAL instead buys crash safety over a rollback
+            # journal, readers in other processes that keep working while this
+            # one writes, and cheap transactions — the scan's per-chunk commits
+            # yield the lock between chunks instead of one commit per image.
+            conn.execute("PRAGMA journal_mode=WAL")
             conn.executescript(SCHEMA_SQL)
             row = conn.execute(
                 "SELECT version FROM schema_migrations ORDER BY version DESC LIMIT 1"
@@ -266,45 +273,29 @@ class TagManagerStore:
         ids: list[int] = []
         with self.connection() as conn:
             for image in images:
-                relative = str(image["relative_path"])
-                conn.execute(
-                    "INSERT INTO dataset_images"
-                    " (session_id, relative_path, file_name, image_format,"
-                    "  sidecar_kind, sidecar_path, mtime, sidecar_mtime,"
-                    "  width, height, tag_count)"
-                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
-                    " ON CONFLICT(session_id, relative_path) DO UPDATE SET"
-                    "  file_name = excluded.file_name,"
-                    "  image_format = excluded.image_format,"
-                    "  sidecar_kind = excluded.sidecar_kind,"
-                    "  sidecar_path = excluded.sidecar_path,"
-                    "  mtime = excluded.mtime,"
-                    "  sidecar_mtime = excluded.sidecar_mtime,"
-                    "  width = excluded.width,"
-                    "  height = excluded.height,"
-                    "  tag_count = excluded.tag_count",
-                    (
-                        session_id,
-                        relative,
-                        str(image["file_name"]),
-                        str(image.get("image_format", "")),
-                        str(image.get("sidecar_kind", "none")),
-                        image.get("sidecar_path"),
-                        float(image.get("mtime", 0.0)),
-                        image.get("sidecar_mtime"),
-                        image.get("width"),
-                        image.get("height"),
-                        int(image.get("tag_count", 0)),
-                    ),
-                )
-                row = conn.execute(
-                    "SELECT id FROM dataset_images WHERE session_id = ? AND relative_path = ?",
-                    (session_id, relative),
-                ).fetchone()
-                if row is None:
-                    raise TagManagerStoreError("image row missing after upsert")
-                ids.append(int(row["id"]))
+                ids.append(_upsert_image_row(conn, session_id, image))
         return ids
+
+    def upsert_rows(self, session_id: str, rows: Sequence[Mapping[str, Any]]) -> int:
+        """Upsert scan rows together with their tags in one transaction.
+
+        Each row carries the scan fields plus ``_tags`` — the categorized tag
+        pairs produced by the indexer.  One transaction for the whole chunk
+        keeps a large scan from paying a connection and a commit per image.
+        """
+
+        with self.connection() as conn:
+            for row in rows:
+                image = {key: value for key, value in row.items() if key != "_tags"}
+                image_id = _upsert_image_row(conn, session_id, image)
+                _replace_image_tags(
+                    conn,
+                    image_id,
+                    list(row["_tags"]),
+                    sidecar_kind=str(image.get("sidecar_kind", "none")),
+                    sidecar_mtime=image.get("sidecar_mtime"),
+                )
+        return len(rows)
 
     def prune_images_missing(self, session_id: str, keep_paths: set[str]) -> int:
         with self.connection() as conn:
@@ -321,26 +312,38 @@ class TagManagerStore:
                     removed += 1
             return removed
 
+    def scan_state(self, session_id: str) -> dict[str, tuple[float, float | None, str]]:
+        """Snapshot the indexed rows as the baseline for an incremental rescan.
+
+        Maps relative_path -> (image mtime, sidecar mtime, sidecar kind).  The
+        scan reuses rows whose image and sidecar files still carry exactly
+        these ``st_mtime`` stamps and the same kind, so unchanged files are not
+        re-parsed and keep their image ids and tag rows.
+        """
+
+        with self.connection() as conn:
+            rows = conn.execute(
+                "SELECT relative_path, mtime, sidecar_mtime, sidecar_kind"
+                " FROM dataset_images WHERE session_id = ?",
+                (session_id,),
+            ).fetchall()
+        return {
+            str(row["relative_path"]): (
+                float(row["mtime"]),
+                None if row["sidecar_mtime"] is None else float(row["sidecar_mtime"]),
+                str(row["sidecar_kind"]),
+            )
+            for row in rows
+        }
+
     def set_image_tags(
         self, image_id: int, tags: list[tuple[str, str]], *, sidecar_kind: str, sidecar_mtime: float | None
     ) -> None:
         """Replace the tag rows of one image and refresh its denormalized columns."""
 
         with self.connection() as conn:
-            conn.execute("DELETE FROM dataset_image_tags WHERE image_id = ?", (image_id,))
-            for position, (tag, category) in enumerate(tags):
-                conn.execute(
-                    "INSERT OR IGNORE INTO dataset_image_tags (image_id, tag, category, position)"
-                    " VALUES (?, ?, ?, ?)",
-                    (image_id, tag, category, position),
-                )
-            conn.execute(
-                "UPDATE dataset_images"
-                " SET tag_count = (SELECT COUNT(*) FROM dataset_image_tags WHERE image_id = ?),"
-                "     sidecar_kind = ?,"
-                "     sidecar_mtime = ?"
-                " WHERE id = ?",
-                (image_id, sidecar_kind, sidecar_mtime, image_id),
+            _replace_image_tags(
+                conn, image_id, tags, sidecar_kind=sidecar_kind, sidecar_mtime=sidecar_mtime
             )
 
     def get_image(self, session_id: str, image_id: int) -> dict[str, Any] | None:
@@ -444,15 +447,21 @@ class TagManagerStore:
         limit: int = 200,
         min_count: int = 1,
     ) -> list[dict[str, Any]]:
+        # Group on the same normalized key the tag filters match, so a tag
+        # stored with spaces and one stored with underscores does not split
+        # into two rows; MIN(t.tag) picks a representative spelling.  The
+        # count is the number of images carrying the tag, not the number of
+        # rows: one image holding both spellings must not count twice.
         with self.connection() as conn:
             rows = conn.execute(
-                "SELECT t.tag AS tag, MIN(t.category) AS category, COUNT(*) AS count"
+                f"SELECT MIN(t.tag COLLATE NOCASE) AS tag, MIN(t.category) AS category,"
+                " COUNT(DISTINCT t.image_id) AS count"
                 " FROM dataset_image_tags t"
                 " JOIN dataset_images d ON t.image_id = d.id"
                 " WHERE d.session_id = ?"
-                " GROUP BY t.tag COLLATE NOCASE"
-                " HAVING COUNT(*) >= ?"
-                " ORDER BY count DESC, t.tag COLLATE NOCASE ASC"
+                f" GROUP BY {_TAG_KEY_SQL}"
+                " HAVING COUNT(DISTINCT t.image_id) >= ?"
+                " ORDER BY count DESC, tag COLLATE NOCASE ASC"
                 " LIMIT ?",
                 (session_id, min_count, limit),
             ).fetchall()
@@ -508,6 +517,22 @@ class TagManagerStore:
                 (1 if undone else 0, entry_id),
             )
 
+    def discard_redo_stack(self, session_id: str) -> int:
+        """Drop the undone entries of one session.
+
+        A fresh edit or batch makes the previously undone history unreachable:
+        replaying it would collide with the new state (and fail the text
+        equality guard), so the entries are removed instead of lingering as a
+        redo button that can only 409.
+        """
+
+        with self.connection() as conn:
+            cursor = conn.execute(
+                "DELETE FROM undo_journal WHERE session_id = ? AND undone = 1",
+                (session_id,),
+            )
+            return int(cursor.rowcount or 0)
+
     def trim_journal(self, session_id: str, keep: int) -> None:
         with self.connection() as conn:
             conn.execute(
@@ -515,6 +540,76 @@ class TagManagerStore:
                 " SELECT id FROM undo_journal WHERE session_id = ? ORDER BY id DESC LIMIT ?)",
                 (session_id, session_id, keep),
             )
+
+
+def _upsert_image_row(
+    conn: sqlite3.Connection, session_id: str, image: Mapping[str, Any]
+) -> int:
+    """Upsert one scanned row; returns the stable image id."""
+
+    relative = str(image["relative_path"])
+    conn.execute(
+        "INSERT INTO dataset_images"
+        " (session_id, relative_path, file_name, image_format,"
+        "  sidecar_kind, sidecar_path, mtime, sidecar_mtime,"
+        "  width, height, tag_count)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        " ON CONFLICT(session_id, relative_path) DO UPDATE SET"
+        "  file_name = excluded.file_name,"
+        "  image_format = excluded.image_format,"
+        "  sidecar_kind = excluded.sidecar_kind,"
+        "  sidecar_path = excluded.sidecar_path,"
+        "  mtime = excluded.mtime,"
+        "  sidecar_mtime = excluded.sidecar_mtime,"
+        "  width = excluded.width,"
+        "  height = excluded.height,"
+        "  tag_count = excluded.tag_count",
+        (
+            session_id,
+            relative,
+            str(image["file_name"]),
+            str(image.get("image_format", "")),
+            str(image.get("sidecar_kind", "none")),
+            image.get("sidecar_path"),
+            float(image.get("mtime", 0.0)),
+            image.get("sidecar_mtime"),
+            image.get("width"),
+            image.get("height"),
+            int(image.get("tag_count", 0)),
+        ),
+    )
+    row = conn.execute(
+        "SELECT id FROM dataset_images WHERE session_id = ? AND relative_path = ?",
+        (session_id, relative),
+    ).fetchone()
+    if row is None:
+        raise TagManagerStoreError("image row missing after upsert")
+    return int(row["id"])
+
+
+def _replace_image_tags(
+    conn: sqlite3.Connection,
+    image_id: int,
+    tags: Sequence[tuple[str, str]],
+    *,
+    sidecar_kind: str,
+    sidecar_mtime: float | None,
+) -> None:
+    conn.execute("DELETE FROM dataset_image_tags WHERE image_id = ?", (image_id,))
+    for position, (tag, category) in enumerate(tags):
+        conn.execute(
+            "INSERT OR IGNORE INTO dataset_image_tags (image_id, tag, category, position)"
+            " VALUES (?, ?, ?, ?)",
+            (image_id, tag, category, position),
+        )
+    conn.execute(
+        "UPDATE dataset_images"
+        " SET tag_count = (SELECT COUNT(*) FROM dataset_image_tags WHERE image_id = ?),"
+        "     sidecar_kind = ?,"
+        "     sidecar_mtime = ?"
+        " WHERE id = ?",
+        (image_id, sidecar_kind, sidecar_mtime, image_id),
+    )
 
 
 def _session_dict(row: sqlite3.Row) -> dict[str, Any]:

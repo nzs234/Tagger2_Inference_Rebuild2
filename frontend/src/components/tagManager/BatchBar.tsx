@@ -3,6 +3,7 @@ import { LoaderCircle, Wand2 } from 'lucide-react'
 import { Button, ConfirmDialog, Field, Panel } from '../ui'
 import {
   formatTagForDisplay,
+  toBatchFilter,
   toWriteStyle,
   type ImageFilterState,
   type TagManagerBatchRequest,
@@ -15,6 +16,10 @@ type BatchOp = TagManagerBatchRequest['op']
 type BatchScope = 'selected' | 'filtered'
 
 const OP_LABELS: Record<BatchOp, string> = { add: '添加', remove: '删除', replace: '替换' }
+
+// Mirrors the backend's MAX_BATCH_IMAGES; blocked before submit so the user
+// never discovers the cap through a 413 after filling in the whole form.
+const MAX_BATCH_IMAGES = 2000
 
 /**
  * Multi-image batch operations bar. The actual submission is confirmed with a
@@ -34,12 +39,19 @@ export function BatchBar({ profile, filter, selectedIds, filteredTotal, submitti
   const [tags, setTags] = useState<PillEntry[]>([])
   const [replacement, setReplacement] = useState('')
   const [useRegex, setUseRegex] = useState(false)
-  const [scope, setScope] = useState<BatchScope>('selected')
+  const [scopeChoice, setScopeChoice] = useState<BatchScope | null>(null)
   const [confirming, setConfirming] = useState(false)
   const tagStyle = usePreferences((state) => state.tagStyle)
 
+  // The scope follows the selection until the user picks one explicitly:
+  // selecting images targets them, dropping back to zero targets the filtered
+  // result — the batch bar stays usable without ever selecting anything.
+  const scope: BatchScope = scopeChoice
+    ?? (selectedIds.length > 0 ? 'selected' : 'filtered')
+
   const scopeCount = scope === 'selected' ? selectedIds.length : filteredTotal
-  const canSubmit = tags.length > 0 && scopeCount > 0 && !submitting && !disabled
+  const overLimit = scopeCount > MAX_BATCH_IMAGES
+  const canSubmit = tags.length > 0 && scopeCount > 0 && !overLimit && !submitting && !disabled
 
   const buildBody = (): TagManagerBatchRequest => ({
     op,
@@ -50,7 +62,7 @@ export function BatchBar({ profile, filter, selectedIds, filteredTotal, submitti
       : undefined,
     use_regex: useRegex,
     image_ids: scope === 'selected' ? [...selectedIds].sort((left, right) => left - right) : undefined,
-    filter: scope === 'filtered' ? filter : undefined,
+    filter: scope === 'filtered' ? toBatchFilter(filter) : undefined,
   })
 
   return <Panel
@@ -60,8 +72,8 @@ export function BatchBar({ profile, filter, selectedIds, filteredTotal, submitti
   >
     <div className="tm-batch-body">
       <div className="tm-scope-switch" role="group" aria-label="操作范围">
-        <button type="button" className={scope === 'selected' ? 'mode-active' : ''} aria-pressed={scope === 'selected'} onClick={() => setScope('selected')}>选中图片（{selectedIds.length}）</button>
-        <button type="button" className={scope === 'filtered' ? 'mode-active' : ''} aria-pressed={scope === 'filtered'} onClick={() => setScope('filtered')}>当前过滤结果（{filteredTotal}）</button>
+        <button type="button" className={scope === 'selected' ? 'mode-active' : ''} aria-pressed={scope === 'selected'} onClick={() => setScopeChoice('selected')}>选中图片（{selectedIds.length}）</button>
+        <button type="button" className={scope === 'filtered' ? 'mode-active' : ''} aria-pressed={scope === 'filtered'} onClick={() => setScopeChoice('filtered')}>当前过滤结果（{filteredTotal}）</button>
       </div>
       <Field label="操作">
         <select aria-label="批量操作类型" value={op} disabled={disabled} onChange={(event) => setOp(event.target.value as BatchOp)}>
@@ -78,9 +90,12 @@ export function BatchBar({ profile, filter, selectedIds, filteredTotal, submitti
         onAdd={(tag, category) => { if (!tags.some((entry) => entry.text === tag)) setTags([...tags, category ? { text: tag, category } : { text: tag }]) }}
         onRemove={(index) => setTags(tags.filter((_, candidate) => candidate !== index))}
       />
-      {op === 'replace' && <Field label="替换为" hint={useRegex ? '支持正则替换，可用 $1 引用分组' : '与上方标签一一对应'}>
+      {op === 'replace' && <Field label="替换为" hint={useRegex ? '正则替换：单个模式匹配每个标签，可用 $1 引用分组' : '匹配到的每个标签都会统一替换为该值'}>
         <input aria-label="替换为" value={replacement} disabled={disabled} spellCheck={false} onChange={(event) => setReplacement(event.target.value)} placeholder="replacement" />
       </Field>}
+      {overLimit && <p className="tm-batch-warning" role="alert">
+        当前过滤结果有 {filteredTotal} 张，超过单批 {MAX_BATCH_IMAGES} 张的上限。请先缩小过滤范围（例如排除部分标签）再执行。
+      </p>}
       <label className="toggle standalone">
         <input aria-label="使用正则表达式" type="checkbox" checked={useRegex} disabled={disabled} onChange={(event) => setUseRegex(event.target.checked)} />
         <span />使用正则表达式
@@ -104,7 +119,13 @@ export function BatchBar({ profile, filter, selectedIds, filteredTotal, submitti
       </span>}
       confirmLabel="确认执行"
       busy={submitting}
-      onConfirm={() => onSubmit(buildBody())}
+      onConfirm={() => {
+        onSubmit(buildBody())
+        // Close on confirmation: the mutation's progress is visible on the
+        // 执行 button and in the notice queue, and leaving the dialog mounted
+        // would show a stale scope count once the batch clears the selection.
+        setConfirming(false)
+      }}
       onClose={() => setConfirming(false)}
     />}
   </Panel>

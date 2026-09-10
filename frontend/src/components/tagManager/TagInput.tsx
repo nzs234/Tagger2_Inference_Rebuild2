@@ -29,6 +29,7 @@ export function TagInput({ profile, label, placeholder, disabled, onAdd }: {
   const [suggestions, setSuggestions] = useState<TagDbEntry[]>([])
   const [open, setOpen] = useState(false)
   const [loading, setLoading] = useState(false)
+  const [activeIndex, setActiveIndex] = useState(-1)
   const requestId = useRef(0)
 
   useEffect(() => {
@@ -48,6 +49,7 @@ export function TagInput({ profile, label, placeholder, disabled, onAdd }: {
         const result = await tagManagerApi.tagDb(profile, query, 20)
         if (requestId.current !== id) return
         setSuggestions(result.items)
+        setActiveIndex(result.items.length > 0 ? 0 : -1)
         setOpen(result.items.length > 0)
       } catch {
         if (requestId.current === id) {
@@ -82,18 +84,28 @@ export function TagInput({ profile, label, placeholder, disabled, onAdd }: {
       aria-expanded={open}
       aria-controls={`${label}-suggestions`}
       onChange={(event) => setText(event.target.value)}
+      aria-activedescendant={open && activeIndex >= 0 ? `${label}-suggestion-${activeIndex}` : undefined}
       onKeyDown={(event) => {
-        if (event.key === 'Enter') {
+        if (event.key === 'ArrowDown' && open && suggestions.length > 0) {
           event.preventDefault()
-          const first = open ? suggestions[0] : undefined
-          commit(first ? first.name : text, first?.category)
+          setActiveIndex((index) => (index + 1) % suggestions.length)
+        } else if (event.key === 'ArrowUp' && open && suggestions.length > 0) {
+          event.preventDefault()
+          setActiveIndex((index) => (index - 1 + suggestions.length) % suggestions.length)
+        } else if (event.key === 'Enter') {
+          event.preventDefault()
+          const selected = open && activeIndex >= 0 ? suggestions[activeIndex] : undefined
+          commit(selected ? selected.name : text, selected?.category)
+        } else if (event.key === 'Escape') {
+          event.preventDefault()
+          setOpen(false)
+          setActiveIndex(-1)
         }
-        if (event.key === 'Escape') setOpen(false)
       }}
     />
     {loading && <LoaderCircle className="spin tm-autocomplete-spinner" size={13} aria-hidden="true" />}
     {open && suggestions.length > 0 && <ul id={`${label}-suggestions`} className="tm-suggest-list" role="listbox" aria-label={`${label}建议`}>
-      {suggestions.map((entry) => {
+      {suggestions.map((entry, index) => {
         const displayTag = formatTagForDisplay(entry.name, tagStyle)
         const showTranslation = bilingual && Boolean(entry.translation)
         const titleText = entry.alias_of
@@ -103,7 +115,7 @@ export function TagInput({ profile, label, placeholder, disabled, onAdd }: {
             : displayTag
 
         return (
-          <li key={entry.name} role="option" aria-selected="false">
+          <li key={entry.name} id={`${label}-suggestion-${index}`} role="option" aria-selected={index === activeIndex}>
             <button
               type="button"
               className="tm-suggest-item"

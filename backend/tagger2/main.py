@@ -374,11 +374,14 @@ class Runtime:
         )
 
         tag_manager_data_dir = settings.data_dir or settings.project_root / "data"
+        # One shared tag database instance: the tag manager consumes it through
+        # its minimal protocol, the tag wiki through the concrete class.
+        tag_database = TagDatabase()
         self.tag_manager = TagManagerService(
             store=TagManagerStore(default_tag_manager_database_path()),
             allowlist=self.allowlist,
             thumbnails=ThumbnailService(tag_manager_data_dir / "tag_manager" / "thumbnails"),
-            tag_database=TagDatabase(),
+            tag_database=tag_database,
             provider_factory=self.provider,
             provider_ids=self._enabled_provider_ids,
         )
@@ -387,7 +390,7 @@ class Runtime:
         from .tag_wiki import TagWikiService
 
         self.tag_wiki = TagWikiService(
-            tag_database=self.tag_manager.tag_database,
+            tag_database=tag_database,
             translations=self.tag_manager.translations,
             provider_factory=self.provider,
             provider_ids=self._enabled_provider_ids,

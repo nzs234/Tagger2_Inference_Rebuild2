@@ -1,6 +1,6 @@
 # Tagger2 发布包说明
 
-这个压缩包用于分享和部署 Tagger2 Inference 1.10.3。基础发行模式（`base-python-with-wiki`）内置便携式 Python
+这个压缩包用于分享和部署 Tagger2 Inference 1.10.5。基础发行模式（`base-python-with-wiki`）内置便携式 Python
 3.12、构建完成的 Wiki 数据库和应用代码，但不包含第三方 site-packages；解压后运行 `setup.bat`，脚本会在该 runtime 中首次安装锁定依赖，之后运行 `start.bat`，浏览器打开 `http://127.0.0.1:20000`。CPU/CUDA 依赖均在首次启动时按 lockfile 下载；也可以在启动前设置 `TAGGER2_TORCH_VARIANT=cpu` 强制使用 CPU。
 
 ## 已包含

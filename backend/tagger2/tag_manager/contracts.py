@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from typing import Annotated, Literal, Union
+from typing import Annotated, Any, Literal, Union
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -195,13 +195,41 @@ class BatchOperationRequest(BaseModel):
 
 
 class TagEdit(BaseModel):
-    """One tag inside a tags_json sidecar."""
+    """One tag inside a tags_json sidecar.
 
-    model_config = ConfigDict(extra="forbid")
+    Unknown keys round-trip: sidecar entries may carry extra metadata next to
+    ``category``/``score`` and a save must not drop what the editor did not
+    touch.  The values are constrained to plain scalars (or flat lists of
+    them) so a client cannot smuggle nested structures into the sidecar.
+    """
+
+    model_config = ConfigDict(extra="allow")
 
     text: str = Field(min_length=1, max_length=512)
     category: str | None = Field(default=None, max_length=32)
     score: float | None = Field(default=None, ge=0.0, le=1.0)
+
+    @model_validator(mode="after")
+    def _check_extra_values(self) -> "TagEdit":
+        _validate_extra_values(self.__pydantic_extra__ or {}, where="tag entry")
+        return self
+
+
+def _validate_extra_values(values: dict[str, Any], *, where: str) -> None:
+    """Allow only flat JSON values in pass-through extras."""
+
+    for key, value in values.items():
+        if isinstance(value, (bool, int, float, str)) or value is None:
+            continue
+        if isinstance(value, list) and all(
+            isinstance(item, (bool, int, float, str)) or item is None
+            for item in value
+        ):
+            continue
+        raise ValueError(
+            f"{where}: extra key {key!r} must be a plain value or a flat list"
+            " of plain values"
+        )
 
 
 class NineFieldEdit(BaseModel):
@@ -230,21 +258,40 @@ class TagTxtContent(BaseModel):
 
 
 class TagsJsonContent(BaseModel):
-    """Local tags JSON payload: an object tag list with optional metadata."""
+    """Local tags JSON payload: an object tag list with optional metadata.
 
-    model_config = ConfigDict(extra="forbid")
+    Unknown keys are the container-level extras of the original document
+    (everything beside ``tags``); they round-trip on save so editing tags
+    never rewrites the sidecar without them.
+    """
+
+    model_config = ConfigDict(extra="allow")
 
     kind: Literal["tags_json"] = "tags_json"
     tags: list[TagEdit] = Field(max_length=2048)
 
+    @model_validator(mode="after")
+    def _check_extra_values(self) -> "TagsJsonContent":
+        _validate_extra_values(self.__pydantic_extra__ or {}, where="tags_json content")
+        return self
+
 
 class StandardJsonContent(BaseModel):
-    """Nine-field standard JSON payload."""
+    """Nine-field standard JSON payload.
 
-    model_config = ConfigDict(extra="forbid")
+    Unknown keys are the document's top-level extras outside the nine frozen
+    fields; they round-trip on save.
+    """
+
+    model_config = ConfigDict(extra="allow")
 
     kind: Literal["standard_json"] = "standard_json"
     fields: NineFieldEdit
+
+    @model_validator(mode="after")
+    def _check_extra_values(self) -> "StandardJsonContent":
+        _validate_extra_values(self.__pydantic_extra__ or {}, where="standard_json content")
+        return self
 
 
 SaveTagsContent = Annotated[

@@ -13,7 +13,12 @@ export interface PillEntry {
   translation?: string | null
 }
 
-/** Removable category-coloured tag pills plus an autocomplete add input. */
+/**
+ * Category-coloured tag pills plus an autocomplete add input.  The pill body
+ * is presentational; the two sibling buttons (wiki lookup and explicit remove)
+ * carry all interaction, so no interactive element is ever nested inside
+ * another and the accessible names stay stable for tests and screen readers.
+ */
 export function TagPillEditor({ entries, profile, addLabel, onAdd, onRemove, disabled }: {
   entries: PillEntry[]
   profile: TagManagerProfile
@@ -37,28 +42,12 @@ export function TagPillEditor({ entries, profile, addLabel, onAdd, onRemove, dis
         } else {
           titleParts.push(displayTag)
         }
-        titleParts.push('点击移除')
 
         return (
           <span
             key={`${entry.text}:${index}`}
-            role="button"
-            tabIndex={disabled ? undefined : 0}
             className={`tm-pill ${tagCategoryClass(entry.category)}`}
-            aria-label={`移除 ${displayTag}`}
-            aria-disabled={disabled || undefined}
             title={titleParts.join(' · ')}
-            onClick={() => {
-              if (!disabled) onRemove(index)
-            }}
-            onKeyDown={(event) => {
-              // Only react when the pill itself is focused; the nested wiki
-              // button must not trigger removal via bubbling key events.
-              if (event.target !== event.currentTarget) return
-              if (disabled || (event.key !== 'Enter' && event.key !== ' ')) return
-              event.preventDefault()
-              onRemove(index)
-            }}
           >
             <span>{displayTag}</span>
             {showTranslation && entry.translation && <span className="tm-pill-zh">{entry.translation}</span>}
@@ -68,14 +57,19 @@ export function TagPillEditor({ entries, profile, addLabel, onAdd, onRemove, dis
               className="tm-pill-wiki-btn"
               title={`查看 ${entry.text} 的 Wiki`}
               aria-label={`查看 ${entry.text} 的 Wiki`}
-              onClick={(e) => {
-                e.stopPropagation()
-                setWikiTag(entry.text)
-              }}
+              onClick={() => setWikiTag(entry.text)}
             >
               <BookOpen size={12} aria-hidden="true" />
             </button>
-            {!disabled && <X size={11} aria-hidden="true" />}
+            {!disabled && <button
+              type="button"
+              className="tm-pill-remove"
+              title={`移除 ${displayTag}`}
+              aria-label={`移除 ${displayTag}`}
+              onClick={() => onRemove(index)}
+            >
+              <X size={11} aria-hidden="true" />
+            </button>}
           </span>
         )
       })}

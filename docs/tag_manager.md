@@ -4,16 +4,24 @@
 
 ## 功能概览
 
-- **数据集会话**：选择一个已注册的根目录（root）+ 相对路径打开一个数据集目录，后台扫描图片与标注文件并建立索引。支持递归扫描、增量刷新（按 mtime 差异）、多会话并行。
-- **网格浏览**：虚拟化缩略图网格，按文件名 / 修改时间 / 标签数排序；按标签组合（包含 all/any、排除）、标注格式、有无 sidecar 过滤。
-- **逐图编辑**：点击图片进入编辑面板，按格式提供编辑界面（见下），保存时带乐观并发校验（mtime 不一致返回 409）。
-- **批量操作**：多选图片或按当前过滤器圈定范围，执行 添加 / 删除 / 替换（支持正则）标签。
-- **撤销 / 重做**：每个会话保留最近 20 步操作日志，可逐步撤销与重做。
-- **标签统计**：数据集内标签频次排行（带分类），点击即加入过滤。
+- **数据集会话**：选择一个已注册的根目录（root）+ 相对路径打开一个数据集目录，后台扫描图片与标注文件并建立索引。支持递归扫描、增量刷新（图片与 sidecar 的 mtime 都未变化的文件跳过重新解析）、多会话并行。刷新与写操作并发时会话忙时返回 409 `session_busy`（可重试），不会静默跳过扫描。
+- **网格浏览**：虚拟化缩略图网格，按文件名 / 修改时间 / 标签数排序；按标签组合（包含 all/any、排除）、标注格式、有无 sidecar 过滤。**单击卡片切换选择**（shift/ctrl 范围选择、复选框可用），**双击或卡片角落的「编辑」按钮打开编辑器**；支持键盘操作：方向键移动焦点、空格选择、回车打开。选择锚点使用稳定图片 id，翻页/重排/改筛选后 shift 范围选择不会圈选错位。筛选条件以可删除的标签 chips 呈现（输入框带标签库自动补全），筛选/排序/页码/会话选择在刷新后保留。
+- **逐图编辑**：双击图片（或点编辑按钮）进入编辑面板，按格式提供编辑界面（见下），保存时带乐观并发校验（mtime 不一致返回 409，可复制草稿或重新加载）。编辑器在保存后保持打开（不重置滚动与焦点），支持「保存并下一张 / 保存并上一张」连续修图并在页边界自动翻页；关闭或切换时有未保存草稿会先确认；无 sidecar 的图片可直接在编辑器内选择格式新建。
+- **批量操作**：多选图片或按当前过滤器圈定范围，执行 添加 / 删除 / 替换（支持正则）标签。批量面板在会话就绪后常驻显示；未勾选任何图片时操作范围自动指向当前过滤结果，超过单批 2000 张上限会在执行前拦截提示。
+- **撤销 / 重做**：每个会话保留最近 20 步操作日志，可逐步撤销与重做。撤销后再次编辑或执行批量会清空重做栈（新历史分支后旧的重做条目已不可重放）。
+- **标签统计**：数据集内标签频次排行（带分类，空格/下划线拼写合并计数），点击行加入包含过滤，行内「排除」按钮加入排除过滤。
 - **标签库自动补全**：基于 workflow 模块的 classify-snapshot 资源（官方 DB 导出），返回名称、分类、post_count 与别名指向。
 - **中英双语显示**：所有标签（网格卡片、编辑面板、自动补全、统计榜）都可同时显示英文原名与中文译名，词库随仓库离线提供，可一键关闭。
 - **下划线 / 空格切换**：切换标签分隔符风格。该开关同时决定保存时写入 sidecar 的拼写，与 BooruDatasetTagManager 的行为一致。
 - **NL 在线翻译**：九字段的 `nl` 段落可调用已配置的在线大模型翻译（中↔英），结果需显式点击「替换 NL」才会写入草稿。
+
+## Sidecar 元数据保留
+
+编辑器只修改标签相关字段；sidecar 中的未知键会原样保留：
+
+- `tags_json` 容器级额外键（如 `schema`）、条目级额外键（如 `origin`、自定义元数据）在保存时原样写回。
+- 九字段文档的顶层额外键（九个冻结字段之外的键）同样保留。
+- 平铺的额外键（字符串/数字/布尔/null 或其平铺数组）随编辑载荷往返；嵌套结构不进入客户端契约，由服务端在保存时从磁盘原文合并回来，保证任何编辑都不会丢失它们。
 
 ## 中英双语标签
 
@@ -100,7 +108,7 @@ POST   /datasets/{id}/batch            批量 add/remove/replace（image_ids 或
 POST   /datasets/{id}/undo             撤销最近一步
 POST   /datasets/{id}/redo             重做
 GET    /datasets/{id}/tags/stats       标签频次统计（含 translation）
-GET    /datasets/{id}/images/{iid}/thumbnail?size=256   缩略图（JPEG，磁盘缓存）
+GET    /datasets/{id}/images/{iid}/thumbnail?size=256   缩略图（JPEG，磁盘缓存；经前端授权客户端以 blob 方式获取，LAN+token 模式下正常显示）
 GET    /tag-db?profile=&query=&limit=  标签库自动补全（含 translation）
 GET    /tag-db/info                    标签库快照 + 中文词库状态
 POST   /translations/lookup            批量查询中文译名（最多 500 个标签）
@@ -108,25 +116,32 @@ POST   /translations/translate         在线模型补译缺失标签并保存�
 POST   /nl/translate                   用在线模型翻译 NL 段落（target=zh|en）
 ```
 
-错误统一为 `{"detail": {"code", "message", "retryable"}}`（应用的错误中间件会把它平铺到响应体并附加 `request_id`）；常见错误码：`sidecar_conflict`（mtime 过期，重新加载即可）、`sidecar_kind_mismatch`（编辑负载与 sidecar 格式不符）、`sidecar_read_only`（raw e621 只读）、`batch_too_large`（单批上限 2000 张）、`root_not_writable`（数据集根目录未开启可写）、`tag_db_unavailable`（该 profile 没有已注册的分类快照）、`nl_translate_unavailable`/`tag_translate_unavailable`（没有已启用且已配置密钥的在线模型）、`nl_translate_failed`/`tag_translate_failed`（在线模型调用失败，可重试）。
+错误统一为 `{"detail": {"code", "message", "retryable"}}`（应用的错误中间件会把它平铺到响应体并附加 `request_id`）；常见错误码：`sidecar_conflict`（mtime 过期，重新加载即可）、`sidecar_kind_mismatch`（编辑负载与 sidecar 格式不符）、`sidecar_read_only`（raw e621 只读）、`batch_too_large`（单批上限 2000 张）、`session_busy`（会话级写互斥：保存/批量/撤销/扫描进行中，可重试）、`root_not_writable`（数据集根目录未开启可写）、`tag_db_unavailable`（该 profile 没有已注册的分类快照）、`nl_translate_unavailable`/`tag_translate_unavailable`（没有已启用且已配置密钥的在线模型）、`nl_translate_failed`/`tag_translate_failed`（在线模型调用失败，可重试）。
 
 ## 架构与数据存储
 
 ```
-backend/tagger2/tag_manager/
-├─ api.py         路由（/api/v1/tag-manager）
-├─ service.py     会话、索引、编辑、批量、撤销重做、双语标注、NL 翻译编排
-├─ sidecar_io.py  三种可编辑格式 + raw e621 的读判/渲染/原子写
-├─ storage.py     SQLite 索引（sessions / images / image_tags / undo_journal）
-├─ tag_db.py      e621/danbooru 标签库进程级索引（复用 workflow 资源）
-├─ translations.py 离线中文词库加载与查询（进程级缓存，缺失即降级）
-├─ thumbnails.py  缩略图生成与磁盘缓存
-└─ contracts.py   严格请求模型（pydantic，extra="forbid"）
+backend/tagger2/
+├─ nine_field_schema.py        九字段冻结顺序的唯一共享来源（漂移守卫测试对齐 workflow 契约）
+└─ tag_manager/
+   ├─ api.py             路由（/api/v1/tag-manager）
+   ├─ service.py         TagManagerService 兼容门面（浏览/统计/补全直接实现，其余委托）
+   ├─ indexing.py        会话 CRUD、增量索引扫描（mtime 跳过未变文件）、调度与 Future 追踪、会话锁
+   ├─ editing.py         单图保存、批量操作、undo/redo replay、sidecar 载荷渲染与 extras 保留
+   ├─ online_translation.py  NL/标签在线翻译编排与 provider 解析
+   ├─ protocols.py       可插拔协作者的最小 Protocol（缩略图/标签库/在线模型）
+   ├─ sidecar_io.py      三种可编辑格式 + raw e621 的读判/渲染/原子写
+   ├─ storage.py         SQLite 索引（sessions / images / image_tags / undo_journal；文件库启用 WAL，扫描按 chunk 单事务写入）
+   ├─ tag_db.py          e621/danbooru 标签库进程级索引（复用 workflow 资源）
+   ├─ translations.py    离线中文词库加载与查询（进程级缓存，缺失即降级）
+   ├─ thumbnails.py      缩略图生成与磁盘缓存
+   └─ contracts.py       请求模型（pydantic；标签条目/容器允许平铺额外键并保留）
 ```
 
 - 独立数据库 `data/tag_manager/tag_manager.sqlite3`；缩略图缓存 `data/tag_manager/thumbnails/`。与 jobs / workflows / image_generation 三个库严格分离，删除会话只清索引与日志，不触碰数据集文件。
 - 图片 id 跨刷新稳定（按相对路径 upsert），编辑选中项不会因重扫失效。
 - 索引仅保存标签的规范化视图；编辑面板始终从磁盘实时读取 sidecar 内容，保存前以 mtime 校验外部修改（fail-closed）。
+- 索引性能可用 `runtime\python.exe scripts\benchmark_tag_manager_index.py`（默认 2000 张，完全离线）测量：扫描 + 入库、过滤列表与标签统计的耗时。
 
 ## 安全模型
 

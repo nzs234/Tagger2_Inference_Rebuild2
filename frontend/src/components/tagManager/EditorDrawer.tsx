@@ -1,6 +1,6 @@
-import { LoaderCircle, RotateCcw, X } from 'lucide-react'
-import { useMemo, useState } from 'react'
-import { Button, DialogLayer, EmptyState, Field, IconButton, Notice } from '../ui'
+import { Copy, LoaderCircle, RotateCcw, X } from 'lucide-react'
+import { useEffect, useMemo, useRef, useState } from 'react'
+import { Button, ConfirmDialog, DialogLayer, EmptyState, Field, IconButton, Notice } from '../ui'
 import { tagCategoryClass } from '../../lib/tagCategories'
 import {
   formatTagForDisplay,
@@ -33,10 +33,39 @@ const COUNT_CHOICES: Array<{ value: StandardJsonFields['count']; label: string }
   { value: 'group', label: 'group · 多人' },
 ]
 
+// Formats a sidecar-less image can be created with; only raw_e621_json stays
+// out because it is a verbatim external dump, not an editable shape.
+const CREATE_KINDS: Array<{ value: 'tag_txt' | 'tags_json' | 'standard_json'; label: string }> = [
+  { value: 'tag_txt', label: 'tag_txt（TXT，每行一个标签）' },
+  { value: 'tags_json', label: 'tags_json（JSON 条目，可带分类）' },
+  { value: 'standard_json', label: 'standard_json（标准九字段 JSON）' },
+]
+
+function emptyEditableContent(kind: 'tag_txt' | 'tags_json' | 'standard_json'): TagManagerEditableContent {
+  if (kind === 'tags_json') return { kind: 'tags_json', tags: [] }
+  if (kind === 'standard_json') {
+    return {
+      kind: 'standard_json',
+      fields: {
+        quality: [],
+        count: '',
+        character: '',
+        series: '',
+        artist: '',
+        appearance: [],
+        tags: [],
+        environment: [],
+        nl: '',
+      },
+    }
+  }
+  return { kind: 'tag_txt', tags: [] }
+}
+
 type Translations = Record<string, string>
 
 function isReadOnly(content: TagManagerImageContent): boolean {
-  return content.kind === 'raw_e621_json' || content.kind === 'none'
+  return content.kind === 'raw_e621_json'
 }
 
 /** Every tag-like text a sidecar kind renders; `nl` and single-value fields are excluded. */
@@ -67,7 +96,9 @@ function missingTagTexts(content: TagManagerImageContent, translations: Translat
   return missing
 }
 
-/** Rewrite every tag-like value of an outgoing payload in the active style. */
+/** Rewrite every tag-like value of an outgoing payload in the active style.
+ * Unknown keys (sidecar extras) spread along untouched, so metadata the editor
+ * never renders still round-trips to the save request. */
 function applyWriteStyle(
   content: TagManagerEditableContent,
   style: TagStyle,
@@ -77,13 +108,13 @@ function applyWriteStyle(
   }
   if (content.kind === 'tags_json') {
     return {
-      kind: 'tags_json',
+      ...content,
       tags: content.tags.map((entry) => ({ ...entry, text: toWriteStyle(entry.text, style) })),
     }
   }
   const fields = content.fields
   return {
-    kind: 'standard_json',
+    ...content,
     fields: {
       ...fields,
       quality: fields.quality.map((tag) => toWriteStyle(tag, style)),
@@ -95,20 +126,35 @@ function applyWriteStyle(
 }
 
 /**
- * Right-hand drawer for one image's sidecar content. The parent remounts this
- * component (via `key`) when the image or its sidecar mtime changes, which
- * resets the local draft back to the freshly loaded content.
+ * Right-hand drawer for one image's sidecar content.
+ *
+ * The parent keys this component by image id only (NOT sidecar mtime): saving
+ * must not remount the editor, or scroll position, focus and half-typed input
+ * are lost mid-review. A `syncToken` bump forces the draft back to the
+ * server content (explicit reload after a conflict).
  */
-export function EditorDrawer({ detail, profile, saving, conflict, onClose, onSave, onReload }: {
+export function EditorDrawer({ detail, profile, saving, conflict, hasPrev, hasNext, onClose, onNavigate, onSave, onReload, syncToken, saveRevision }: {
   detail: TagManagerImageDetail
   profile: TagManagerProfile
   saving: boolean
   conflict: boolean
+  hasPrev: boolean
+  hasNext: boolean
   onClose: () => void
-  onSave: (content: TagManagerEditableContent) => void
+  onNavigate: (delta: -1 | 1) => void
+  onSave: (content: TagManagerEditableContent, action?: 'close' | 'next' | 'prev') => void
   onReload: () => void
+  syncToken?: string | number
+  saveRevision?: number
 }) {
   const [draft, setDraft] = useState<TagManagerImageContent>(() => detail.content)
+  // Clean baseline for the dirty guard; it is updated only after the parent
+  // reports a successful save or an explicit reload.
+  const [baseline, setBaseline] = useState<TagManagerImageContent>(() => detail.content)
+  const [pendingNav, setPendingNav] = useState<'close' | 'prev' | 'next' | null>(null)
+  const [copyState, setCopyState] = useState<'idle' | 'copied' | 'failed'>('idle')
+  const copyTimer = useRef<number | null>(null)
+  const pendingBaseline = useRef<TagManagerImageContent | null>(null)
   const tagStyle = usePreferences((state) => state.tagStyle)
   const readOnly = isReadOnly(draft)
   // Server-provided translations merged with the session-local on-demand ones.
@@ -118,15 +164,74 @@ export function EditorDrawer({ detail, profile, saving, conflict, onClose, onSav
     [detail.translations, memory],
   )
   const missingTags = useMemo(() => missingTagTexts(draft, translations), [draft, translations])
+  const dirty = JSON.stringify(draft) !== JSON.stringify(baseline)
 
-  return <DialogLayer onClose={onClose}>
+  // Explicit reload (conflict recovery): resync draft and baseline from the
+  // `detail` prop when syncToken changes. Timing contract: the parent bumps
+  // syncToken only AFTER the detail refetch resolves, so this effect always
+  // reads fresh server content; normal refetches never bump the token and
+  // never clobber the draft.
+  useEffect(() => {
+    setDraft(detail.content)
+    setBaseline(detail.content)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [syncToken])
+
+  useEffect(() => {
+    if (saveRevision == null || pendingBaseline.current == null) return
+    setBaseline(pendingBaseline.current)
+    pendingBaseline.current = null
+  }, [saveRevision])
+
+  const editable = draft.kind === 'tag_txt' || draft.kind === 'tags_json' || draft.kind === 'standard_json'
+  const requestNav = (target: 'close' | 'prev' | 'next') => {
+    if (dirty && editable && !saving) {
+      setPendingNav(target)
+      return
+    }
+    if (target === 'close') onClose()
+    else onNavigate(target === 'next' ? 1 : -1)
+  }
+  const save = (action?: 'close' | 'next' | 'prev') => {
+    if (!editable || saving) return
+    const payload = applyWriteStyle(draft, tagStyle)
+    pendingBaseline.current = draft
+    onSave(payload, action)
+  }
+  const discardAndNav = () => {
+    const target = pendingNav
+    setPendingNav(null)
+    if (target === 'close') onClose()
+    else if (target) onNavigate(target === 'next' ? 1 : -1)
+  }
+  const navLabels: Record<'close' | 'prev' | 'next', string> = {
+    close: '关闭编辑器',
+    prev: '上一张',
+    next: '下一张',
+  }
+  /** Conflict recovery escape hatch: copy the unsaved draft out before the
+   * reload discards it.  jsdom (and hardened browsers) may not expose the
+   * clipboard, so failures degrade to a brief 复制失败 feedback. */
+  const copyDraft = async () => {
+    try {
+      if (!navigator.clipboard) throw new Error('Clipboard API unavailable')
+      await navigator.clipboard.writeText(JSON.stringify(draft, null, 2))
+      setCopyState('copied')
+    } catch {
+      setCopyState('failed')
+    }
+    if (copyTimer.current != null) window.clearTimeout(copyTimer.current)
+    copyTimer.current = window.setTimeout(() => setCopyState('idle'), 1500)
+  }
+
+  return <DialogLayer onClose={() => requestNav('close')}>
     <div className="tm-drawer drawer" role="dialog" aria-modal="true" aria-labelledby="tm-drawer-title">
       <header className="drawer-header">
         <div className="tm-drawer-heading">
           <p className="eyebrow">IMAGE EDITOR</p>
           <h2 id="tm-drawer-title">{detail.file_name}</h2>
         </div>
-        <IconButton label="关闭" onClick={onClose}><X size={17} /></IconButton>
+        <IconButton label="关闭" onClick={() => requestNav('close')}><X size={17} /></IconButton>
       </header>
       <div className="drawer-body tm-drawer-body">
         <div className="tm-drawer-meta">
@@ -136,7 +241,10 @@ export function EditorDrawer({ detail, profile, saving, conflict, onClose, onSav
           {!readOnly && <TranslateMissingButton profile={profile} tags={missingTags} />}
         </div>
         {conflict && <Notice tone="warning">
-          <span>sidecar 在编辑期间被外部修改，本次保存已被拒绝以避免覆盖他人改动。</span>
+          <span>sidecar 在编辑期间被外部修改，本次保存已被拒绝以避免覆盖他人改动。可先把当前草稿复制到剪贴板留底（避免重新加载时丢失），再决定是否重新加载。</span>
+          <Button size="sm" variant="outline" icon={<Copy size={13} />} onClick={copyDraft}>
+            {copyState === 'copied' ? '已复制' : copyState === 'failed' ? '复制失败' : '复制草稿'}
+          </Button>
           <Button size="sm" variant="outline" icon={<RotateCcw size={13} />} onClick={onReload}>重新加载</Button>
         </Notice>}
         <EditorBody
@@ -149,22 +257,37 @@ export function EditorDrawer({ detail, profile, saving, conflict, onClose, onSav
       </div>
       <footer className="tm-drawer-footer">
         <span className="muted">
-          保存会写入 sidecar 并记入撤销日志{tagStyle === 'space' ? '，标签以空格写入' : ''}
+          保存会写入 sidecar 并记入撤销日志{tagStyle === 'space' ? '，标签以空格写入' : ''}{dirty && ' · 有未保存更改'}
         </span>
         <div className="tm-drawer-footer-actions">
-          <Button variant="secondary" onClick={onClose}>关闭</Button>
+          <Button variant="quiet" disabled={!hasPrev || saving} onClick={() => requestNav('prev')}>上一张</Button>
+          <Button variant="quiet" disabled={!hasNext || saving} onClick={() => requestNav('next')}>下一张</Button>
+          <Button variant="secondary" onClick={() => requestNav('close')}>关闭</Button>
+          {hasPrev && <Button
+            icon={saving ? <LoaderCircle className="spin" size={15} /> : undefined}
+            disabled={readOnly || !editable || saving}
+            onClick={() => save('prev')}
+          >保存并上一张</Button>}
           <Button
             icon={saving ? <LoaderCircle className="spin" size={15} /> : undefined}
-            disabled={readOnly || saving}
-            onClick={() => {
-              if (draft.kind === 'tag_txt' || draft.kind === 'tags_json' || draft.kind === 'standard_json') {
-                onSave(applyWriteStyle(draft, tagStyle))
-              }
-            }}
+            disabled={readOnly || !editable || saving}
+            onClick={() => save()}
           >保存</Button>
+          {hasNext && <Button
+            icon={saving ? <LoaderCircle className="spin" size={15} /> : undefined}
+            disabled={readOnly || !editable || saving}
+            onClick={() => save('next')}
+          >保存并下一张</Button>}
         </div>
       </footer>
     </div>
+    {pendingNav != null && <ConfirmDialog
+      title={dirty ? `有未保存的更改，仍要${navLabels[pendingNav]}？` : navLabels[pendingNav]}
+      detail={<span>当前草稿尚未保存，{pendingNav === 'close' ? '关闭编辑器' : '切换图片'}会丢弃这些更改。</span>}
+      confirmLabel="丢弃更改"
+      onConfirm={discardAndNav}
+      onClose={() => setPendingNav(null)}
+    />}
   </DialogLayer>
 }
 
@@ -178,7 +301,7 @@ function EditorBody({ draft, profile, readOnly, translations, onDraft }: {
   if (draft.kind === 'tag_txt') {
     const content = draft as TagTxtContent
     return <section className="tm-editor-section" aria-label="tag_txt 编辑器">
-      <p className="tm-editor-hint">点击标签即可移除；回车或点击建议添加新标签。</p>
+      <p className="tm-editor-hint">点 × 移除标签；回车或点击建议添加新标签。</p>
       <TagPillEditor
         entries={content.tags.map((text) => ({ text, translation: translationFor(translations, text) }))}
         profile={profile}
@@ -194,7 +317,7 @@ function EditorBody({ draft, profile, readOnly, translations, onDraft }: {
   if (draft.kind === 'tags_json') {
     const content = draft as TagsJsonContent
     return <section className="tm-editor-section" aria-label="tags_json 编辑器">
-      <p className="tm-editor-hint">条目可携带分类与置信度；新标签的分类来自标签库查询结果。</p>
+      <p className="tm-editor-hint">条目可携带分类与置信度；新标签的分类来自标签库查询结果。点 × 移除标签。</p>
       <TagPillEditor
         entries={content.tags.map((entry) => ({
           text: entry.text,
@@ -207,10 +330,10 @@ function EditorBody({ draft, profile, readOnly, translations, onDraft }: {
         disabled={readOnly}
         onAdd={(tag, category) => {
           if (!content.tags.some((entry) => entry.text === tag)) {
-            onDraft({ kind: 'tags_json', tags: [...content.tags, category ? { text: tag, category } : { text: tag }] })
+            onDraft({ ...content, tags: [...content.tags, category ? { text: tag, category } : { text: tag }] })
           }
         }}
-        onRemove={(index) => onDraft({ kind: 'tags_json', tags: content.tags.filter((_, candidate) => candidate !== index) })}
+        onRemove={(index) => onDraft({ ...content, tags: content.tags.filter((_, candidate) => candidate !== index) })}
       />
     </section>
   }
@@ -226,7 +349,33 @@ function EditorBody({ draft, profile, readOnly, translations, onDraft }: {
   if (draft.kind === 'raw_e621_json') {
     return <RawE621View tags={draft.tags} translations={translations} />
   }
-  return <EmptyState title="暂无 sidecar" detail="该图片还没有标签文件。可以先使用批量操作为多张图片添加标签，保存后会生成 sidecar。" />
+  return <NoneSidecarCreator onCreate={onDraft} />
+}
+
+/** Sidecar-less image: pick a format, then edit and save the empty draft
+ * (the PATCH turns kind `none` into any editable kind server-side). */
+function NoneSidecarCreator({ onCreate }: { onCreate: (content: TagManagerImageContent) => void }) {
+  const [kind, setKind] = useState<'tag_txt' | 'tags_json' | 'standard_json'>('tag_txt')
+  return <section className="tm-editor-section" aria-label="新建 sidecar">
+    <EmptyState title="暂无 sidecar" detail="该图片还没有标签文件。选择一个格式创建空草稿，编辑后保存即可生成 sidecar。" />
+    <div className="tm-create-kind" role="radiogroup" aria-label="sidecar 格式">
+      {CREATE_KINDS.map((choice) => (
+        <label key={choice.value} className="tm-create-kind-option">
+          <input
+            type="radio"
+            name="tm-sidecar-kind"
+            value={choice.value}
+            checked={kind === choice.value}
+            onChange={() => setKind(choice.value)}
+          />
+          <span>{choice.label}</span>
+        </label>
+      ))}
+    </div>
+    <div>
+      <Button onClick={() => onCreate(emptyEditableContent(kind))}>创建</Button>
+    </div>
+  </section>
 }
 
 function RawE621View({ tags, translations }: { tags: string[]; translations: Translations }) {
@@ -255,7 +404,7 @@ function StandardJsonEditor({ content, profile, readOnly, translations, onDraft 
   onDraft: (next: TagManagerImageContent) => void
 }) {
   const fields = content.fields
-  const setFields = (patch: Partial<StandardJsonFields>) => onDraft({ kind: 'standard_json', fields: { ...fields, ...patch } })
+  const setFields = (patch: Partial<StandardJsonFields>) => onDraft({ ...content, fields: { ...fields, ...patch } })
   const toggleQuality = (choice: string) => {
     setFields({
       quality: fields.quality.includes(choice)

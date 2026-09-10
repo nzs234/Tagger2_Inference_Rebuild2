@@ -1,5 +1,5 @@
 import { useQuery } from '@tanstack/react-query'
-import { LoaderCircle } from 'lucide-react'
+import { Ban, LoaderCircle } from 'lucide-react'
 import { EmptyState, Notice } from '../ui'
 import { tagCategoryClass, tagCategoryLabel } from '../../lib/tagCategories'
 import { formatTagForDisplay, tagManagerApi } from '../../lib/tagManager'
@@ -7,12 +7,14 @@ import { usePreferences } from '../../store/app'
 
 /**
  * Top-tags leaderboard. Clicking a tag appends it to the include filter,
- * which is how users narrow the grid down to a specific tag.
+ * which is how users narrow the grid down to a specific tag; the small
+ * exclude button on each row appends it to the exclude filter instead.
  */
-export function StatsPanel({ sessionId, enabled, onTagClick }: {
+export function StatsPanel({ sessionId, enabled, onTagClick, onTagExclude }: {
   sessionId: string
   enabled: boolean
   onTagClick: (tag: string) => void
+  onTagExclude: (tag: string) => void
 }) {
   const bilingual = usePreferences((state) => state.bilingualTags)
   const tagStyle = usePreferences((state) => state.tagStyle)
@@ -37,7 +39,7 @@ export function StatsPanel({ sessionId, enabled, onTagClick }: {
     {items.map((item) => {
       const display = formatTagForDisplay(item.tag, tagStyle)
       const translation = bilingual ? item.translation : null
-      return <li key={item.tag}>
+      return <li key={item.tag} className="tm-stats-item">
         <button
           type="button"
           className="tm-stats-row"
@@ -50,6 +52,15 @@ export function StatsPanel({ sessionId, enabled, onTagClick }: {
             {translation && <span className="tm-stats-zh">{translation}</span>}
           </span>
           <small>{item.count}</small>
+        </button>
+        <button
+          type="button"
+          className="tm-stats-exclude"
+          title={translation ? `筛选排除 ${display} · ${translation}` : `筛选排除 ${display}`}
+          aria-label={`排除 ${display}`}
+          onClick={() => onTagExclude(item.tag)}
+        >
+          <Ban size={13} aria-hidden="true" />
         </button>
       </li>
     })}

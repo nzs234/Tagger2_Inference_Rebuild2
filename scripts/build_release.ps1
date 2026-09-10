@@ -226,6 +226,7 @@ try {
     "docs/V1.10.2_RELEASE_NOTES.md",
     "docs/V1.10.3_RELEASE_NOTES.md",
     "docs/V1.10.4_RELEASE_NOTES.md",
+    "docs/V1.10.5_RELEASE_NOTES.md",
     "docs/tag_manager.md",
     "docs/tag_wiki.md",
     "docs/release_package_contents.md",

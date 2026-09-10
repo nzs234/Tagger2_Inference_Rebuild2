@@ -176,7 +176,7 @@ describe('tag manager API client', () => {
       replacement: 'dog',
       use_regex: true,
       image_ids: [1, 2],
-      filter: { ...emptyImageFilter, sidecar: 'present' },
+      filter: { include_tags: [], exclude_tags: [], include_mode: 'all', kind: 'any', sidecar: 'present' },
     })
     expect(batch).toEqual({ affected: 3, journal_id: 'j-2' })
     const [batchUrl, batchInit] = fetchMock.mock.calls[0] as [string, RequestInit]
@@ -188,7 +188,7 @@ describe('tag manager API client', () => {
       replacement: 'dog',
       use_regex: true,
       image_ids: [1, 2],
-      filter: { includeTags: [], excludeTags: [], includeMode: 'all', kind: 'any', sidecar: 'present' },
+      filter: { include_tags: [], exclude_tags: [], include_mode: 'all', kind: 'any', sidecar: 'present' },
     })
 
     await expect(tagManagerApi.undo('ds-1')).resolves.toEqual({ journal_id: 'j-3' })

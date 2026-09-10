@@ -54,6 +54,15 @@ interface HarnessState {
   undoCalls: number
   redoCalls: number
   tagDbQueries: string[]
+  imageQueries: string[]
+  detail: TagManagerImageDetail
+  patchConflict: boolean
+  thumbnailCalls: number[]
+  /** When set, the next undo request fails with this error envelope. */
+  undoError: { code: string; message: string } | null
+  /** When set, the images endpoint slices by offset: page one = `first`,
+   * page two = `second`; `total` drives the page count (PAGE_SIZE is 60). */
+  pagedPages: { first: TagManagerImageSummary[]; second: TagManagerImageSummary[]; total: number } | null
 }
 
 function renderPage() {
@@ -101,6 +110,7 @@ function setupFetch(state: HarnessState) {
       return json({ affected: 2, journal_id: 'j-batch' })
     }
     if (/\/tag-manager\/datasets\/ds-1\/undo$/.test(path)) {
+      if (state.undoError) return json(state.undoError, 409)
       state.undoCalls += 1
       return json({ journal_id: 'j-undo' })
     }
@@ -111,14 +121,39 @@ function setupFetch(state: HarnessState) {
     if (/\/tag-manager\/datasets\/ds-1\/tags\/stats$/.test(path)) {
       return json({ items: [{ tag: 'solo', category: 'general', count: 3 }] })
     }
-    if (/\/tag-manager\/datasets\/ds-1\/images\/1$/.test(path)) {
+    const thumbnailMatch = /\/tag-manager\/datasets\/ds-1\/images\/(\d+)\/thumbnail$/.exec(path)
+    if (thumbnailMatch) {
+      state.thumbnailCalls.push(Number(thumbnailMatch[1]))
+      return json({})
+    }
+    const detailMatch = /\/tag-manager\/datasets\/ds-1\/images\/(\d+)$/.exec(path)
+    if (detailMatch) {
+      const imageId = Number(detailMatch[1])
       if (method === 'PATCH') {
         state.patchBodies.push(JSON.parse(init?.body as string) as Record<string, unknown>)
-        return json({ image_id: 1, journal_id: 'j-1', sidecar_kind: 'tag_txt' })
+        if (state.patchConflict) {
+          return json({ code: 'sidecar_conflict', message: 'sidecar 在编辑期间被外部修改' }, 409)
+        }
+        return json({ image_id: imageId, journal_id: `j-${imageId}`, sidecar_kind: 'tag_txt' })
       }
-      return json(detail)
+      // Every image shares the tag_txt detail shape; the drawer is keyed by
+      // image id so navigating refetches the detail under a new key.
+      const knownSummaries = [
+        ...imageItems,
+        ...(state.pagedPages ? [...state.pagedPages.first, ...state.pagedPages.second] : []),
+      ]
+      const summary = knownSummaries.find((item) => item.id === imageId) ?? imageItems[0]
+      return json({ ...state.detail, ...summary, tags: [{ tag: 'solo', category: 'general' }] })
     }
-    if (/\/tag-manager\/datasets\/ds-1\/images$/.test(path)) return json({ items: imageItems, total: imageItems.length })
+    if (/\/tag-manager\/datasets\/ds-1\/images$/.test(path)) {
+      state.imageQueries.push(url.search)
+      if (state.pagedPages) {
+        const offset = Number(url.searchParams.get('offset') ?? '0')
+        const items = offset === 0 ? state.pagedPages.first : state.pagedPages.second
+        return json({ items, total: state.pagedPages.total })
+      }
+      return json({ items: imageItems, total: imageItems.length })
+    }
     return json({})
   })
 }
@@ -135,6 +170,12 @@ describe('TagManager page', () => {
       undoCalls: 0,
       redoCalls: 0,
       tagDbQueries: [],
+      imageQueries: [],
+      detail: { ...detail },
+      patchConflict: false,
+      thumbnailCalls: [],
+      undoError: null,
+      pagedPages: null,
     }
   })
 
@@ -200,7 +241,7 @@ describe('TagManager page', () => {
     renderPage()
     await screen.findByAltText('a.png')
 
-    fireEvent.click(screen.getByTitle('a.png'))
+    fireEvent.dblClick(screen.getByTitle('a.png'))
     const dialog = await screen.findByRole('dialog', { name: 'a.png' })
     expect(screen.getByRole('button', { name: '移除 solo' })).toBeInTheDocument()
     expect(screen.getByRole('button', { name: '移除 long_hair' })).toBeInTheDocument()
@@ -287,7 +328,451 @@ describe('TagManager page', () => {
     await screen.findByAltText('a.png')
 
     fireEvent.click(screen.getByTitle('筛选包含 solo'))
-    const includeInput = screen.getByLabelText('包含标签') as HTMLInputElement
-    await waitFor(() => expect(includeInput.value).toBe('solo'))
+    await waitFor(() => expect(screen.getByRole('button', { name: '移除筛选 solo' })).toBeInTheDocument())
+    await waitFor(() => expect(state.imageQueries.at(-1)).toContain('include_tags=solo'))
+  })
+
+  it('adds a filter chip from the include autocomplete and queries include_tags', async () => {
+    setupFetch(state)
+    renderPage()
+    await screen.findByAltText('a.png')
+
+    const includeInput = screen.getByLabelText('包含标签')
+    fireEvent.change(includeInput, { target: { value: 'long' } })
+    const suggestion = await screen.findByRole('option', { name: /long_hair/ })
+    expect(state.tagDbQueries.at(-1)).toBe('long')
+    fireEvent.mouseDown(within(suggestion).getByRole('button'))
+
+    await waitFor(() => expect(screen.getByRole('button', { name: '移除筛选 long_hair' })).toBeInTheDocument())
+    await waitFor(() => expect(state.imageQueries.at(-1)).toContain('include_tags=long_hair'))
+  })
+
+  it('removes a filter chip and drops include_tags from the query', async () => {
+    setupFetch(state)
+    renderPage()
+    await screen.findByAltText('a.png')
+
+    const includeInput = screen.getByLabelText('包含标签')
+    fireEvent.change(includeInput, { target: { value: 'long' } })
+    const suggestion = await screen.findByRole('option', { name: /long_hair/ })
+    fireEvent.mouseDown(within(suggestion).getByRole('button'))
+    await waitFor(() => expect(state.imageQueries.at(-1)).toContain('include_tags=long_hair'))
+
+    fireEvent.click(screen.getByRole('button', { name: '移除筛选 long_hair' }))
+    expect(screen.queryByRole('button', { name: '移除筛选 long_hair' })).not.toBeInTheDocument()
+    await waitFor(() => expect(state.imageQueries.at(-1)).not.toContain('include_tags'))
+  })
+
+  it('excludes a tag from the stats panel into the exclude filter', async () => {
+    setupFetch(state)
+    renderPage()
+    await screen.findByAltText('a.png')
+
+    fireEvent.click(screen.getByRole('button', { name: '排除 solo' }))
+    await waitFor(() => expect(screen.getByRole('button', { name: '移除排除 solo' })).toBeInTheDocument())
+    await waitFor(() => expect(state.imageQueries.at(-1)).toContain('exclude_tags=solo'))
+
+    // The row click still includes the tag, so both chips coexist.
+    fireEvent.click(screen.getByTitle('筛选包含 solo'))
+    await waitFor(() => expect(screen.getByRole('button', { name: '移除筛选 solo' })).toBeInTheDocument())
+    await waitFor(() => {
+      expect(state.imageQueries.at(-1)).toContain('include_tags=solo')
+      expect(state.imageQueries.at(-1)).toContain('exclude_tags=solo')
+    })
+  })
+
+  it('restores filter and sort from the persisted view after remount', async () => {
+    setupFetch(state)
+    const first = renderPage()
+    await screen.findByAltText('a.png')
+
+    fireEvent.click(screen.getByTitle('筛选包含 solo'))
+    fireEvent.change(screen.getByLabelText('排序'), { target: { value: 'mtime' } })
+    await waitFor(() => {
+      expect(state.imageQueries.at(-1)).toContain('include_tags=solo')
+      expect(state.imageQueries.at(-1)).toContain('sort=mtime')
+    })
+
+    // The persist middleware has already mirrored the view into storage.
+    const stored = JSON.parse(window.localStorage.getItem('tagger2-tm-view') ?? '{}') as {
+      state?: { filter?: { includeTags?: string[] }; sort?: string }
+    }
+    expect(stored.state?.filter?.includeTags).toContain('solo')
+    expect(stored.state?.sort).toBe('mtime')
+
+    first.unmount()
+    cleanup()
+    // The fetch spy from the first mount is still active; just remount.
+    renderPage()
+    await screen.findByAltText('a.png')
+
+    expect(screen.getByRole('button', { name: '移除筛选 solo' })).toBeInTheDocument()
+    expect(screen.getByLabelText('排序')).toHaveValue('mtime')
+  })
+
+  it('warns before closing the editor with unsaved changes', async () => {
+    setupFetch(state)
+    renderPage()
+    await screen.findByAltText('a.png')
+
+    // Clean draft: closing goes straight through, no confirm dialog.
+    fireEvent.dblClick(screen.getByTitle('a.png'))
+    let dialog = await screen.findByRole('dialog', { name: 'a.png' })
+    let footer = dialog.querySelector('.tm-drawer-footer') as HTMLElement
+    fireEvent.click(within(footer).getByRole('button', { name: '关闭' }))
+    expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument()
+
+    // Dirty draft: closing asks before discarding.
+    fireEvent.dblClick(screen.getByTitle('a.png'))
+    dialog = await screen.findByRole('dialog', { name: 'a.png' })
+    footer = dialog.querySelector('.tm-drawer-footer') as HTMLElement
+    fireEvent.click(screen.getByRole('button', { name: '移除 solo' }))
+    fireEvent.click(within(footer).getByRole('button', { name: '关闭' }))
+    const confirm = screen.getByRole('alertdialog')
+    expect(confirm.textContent).toContain('未保存')
+
+    // Cancel keeps the editor and the draft intact.
+    fireEvent.click(within(confirm).getByRole('button', { name: '取消' }))
+    expect(screen.getByRole('dialog', { name: 'a.png' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '移除 long_hair' })).toBeInTheDocument()
+
+    // Discarding closes the editor without a save request.
+    fireEvent.click(within(footer).getByRole('button', { name: '关闭' }))
+    fireEvent.click(within(screen.getByRole('alertdialog')).getByRole('button', { name: '丢弃更改' }))
+    expect(screen.queryByRole('dialog', { name: 'a.png' })).not.toBeInTheDocument()
+    expect(state.patchBodies).toHaveLength(0)
+  })
+  it('keeps the draft after a save instead of remounting the editor', async () => {
+    setupFetch(state)
+    renderPage()
+    await screen.findByAltText('a.png')
+    fireEvent.dblClick(screen.getByTitle('a.png'))
+    const dialog = await screen.findByRole('dialog', { name: 'a.png' })
+    fireEvent.click(screen.getByRole('button', { name: '移除 solo' }))
+    fireEvent.click(within(dialog).getByRole('button', { name: '保存' }))
+    await waitFor(() => expect(state.patchBodies).toHaveLength(1))
+    // The editor stays open with the saved state — a remount would flash the
+    // loading drawer and drop the pill row the user was looking at.
+    expect(screen.getByRole('dialog', { name: 'a.png' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '移除 long_hair' })).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: '移除 solo' })).not.toBeInTheDocument()
+    expect(dialog.textContent).not.toContain('未保存更改')
+  })
+  it('saves and moves to the next image in the current page', async () => {
+    setupFetch(state)
+    renderPage()
+    await screen.findByAltText('a.png')
+    fireEvent.dblClick(screen.getByTitle('a.png'))
+    const dialog = await screen.findByRole('dialog', { name: 'a.png' })
+    fireEvent.click(screen.getByRole('button', { name: '移除 solo' }))
+    fireEvent.click(within(dialog).getByRole('button', { name: '保存并下一张' }))
+    await waitFor(() => expect(state.patchBodies).toHaveLength(1))
+    // The editor switches to b.png without an intermediate loading state.
+    await screen.findByRole('dialog', { name: 'b.png' })
+    expect(state.patchBodies[0]).toEqual({
+      content: { kind: 'tag_txt', tags: ['long_hair'] },
+      expected_sidecar_mtime: 1_725_148_800,
+    })
+  })
+  it('runs a batch against the filtered result without selecting anything', async () => {
+    setupFetch(state)
+    renderPage()
+    await screen.findByAltText('a.png')
+    // No checkbox touched: the batch bar is already mounted and the scope
+    // follows the (empty) selection to the filtered result.
+    expect(screen.getByRole('button', { name: '当前过滤结果（3）' })).toHaveAttribute('aria-pressed', 'true')
+    const tagInput = screen.getByRole('combobox', { name: '批量标签' })
+    fireEvent.change(tagInput, { target: { value: '1g' } })
+    await screen.findByRole('option', { name: /1girl/ })
+    fireEvent.keyDown(tagInput, { key: 'Enter' })
+    fireEvent.click(screen.getByRole('button', { name: '执行' }))
+    const confirmation = screen.getByRole('alertdialog', { name: '对 3 张图片执行「添加」？' })
+    expect(confirmation.textContent).toContain('当前过滤结果的全部 3 张图片')
+    fireEvent.click(screen.getByRole('button', { name: '确认执行' }))
+    await waitFor(() => expect(state.batchBodies).toHaveLength(1))
+    expect(state.batchBodies[0]).toEqual({
+      op: 'add',
+      tags: ['1girl'],
+      filter: {
+        include_tags: [],
+        exclude_tags: [],
+        include_mode: 'all',
+        kind: 'any',
+        sidecar: 'any',
+      },
+      use_regex: false,
+    })
+  })
+
+  it('fetches each visible thumbnail once across unrelated re-renders', async () => {
+    setupFetch(state)
+    renderPage()
+    await screen.findByAltText('a.png')
+    await waitFor(() => expect(state.thumbnailCalls).toHaveLength(3))
+
+    // Selecting a card and toggling the stats panel re-render the whole grid;
+    // neither may refetch the thumbnails that are already on screen.
+    fireEvent.click(screen.getByRole('checkbox', { name: '选择 a.png' }))
+    await waitFor(() => expect(screen.getByText('选中图片（1）')).toBeInTheDocument())
+    fireEvent.click(screen.getByRole('button', { name: '收起' }))
+    await waitFor(() => expect(screen.getByRole('button', { name: '展开' })).toBeInTheDocument())
+
+    expect(state.thumbnailCalls).toHaveLength(3)
+    expect(state.thumbnailCalls).toEqual([1, 2, 3])
+  })
+
+  it('reloads the fresh server content after a save conflict', async () => {
+    setupFetch(state)
+    renderPage()
+    await screen.findByAltText('a.png')
+
+    // Draft an edit, then the server rejects the save: the sidecar changed
+    // externally while the drawer was open.
+    fireEvent.dblClick(screen.getByTitle('a.png'))
+    const dialog = await screen.findByRole('dialog', { name: 'a.png' })
+    fireEvent.click(screen.getByRole('button', { name: '移除 solo' }))
+    state.patchConflict = true
+    state.detail = {
+      ...detail,
+      content: { kind: 'tag_txt', tags: ['solo', 'long_hair', '1girl'] },
+      sidecar_mtime: 1_999_999_999,
+    }
+    fireEvent.click(within(dialog).getByRole('button', { name: '保存' }))
+    await waitFor(() => expect(screen.getByText(/sidecar 在编辑期间被外部修改/)).toBeInTheDocument())
+
+    // 重新加载 discards the stale draft and resyncs from the refetched detail:
+    // the new server tag appears and the removed pill is back.
+    fireEvent.click(screen.getByRole('button', { name: '重新加载' }))
+    await screen.findByRole('button', { name: '移除 1girl' })
+    expect(screen.getByRole('button', { name: '移除 solo' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '移除 long_hair' })).toBeInTheDocument()
+    const reloaded = screen.getByRole('dialog', { name: 'a.png' })
+    expect(reloaded.textContent).not.toContain('未保存更改')
+    expect(screen.queryByText(/sidecar 在编辑期间被外部修改/)).not.toBeInTheDocument()
+
+    // The next save carries the fresh mtime, so the stale-draft loophole
+    // (old draft + new mtime) is closed.
+    state.patchConflict = false
+    fireEvent.click(within(reloaded).getByRole('button', { name: '保存' }))
+    await waitFor(() => expect(state.patchBodies).toHaveLength(2))
+    expect(state.patchBodies[1]).toEqual({
+      content: { kind: 'tag_txt', tags: ['solo', 'long_hair', '1girl'] },
+      expected_sidecar_mtime: 1_999_999_999,
+    })
+  })
+
+  it('toggles selection with a single card click instead of opening the editor', async () => {
+    setupFetch(state)
+    renderPage()
+    await screen.findByAltText('a.png')
+
+    fireEvent.click(screen.getByTitle('a.png'))
+    expect(screen.getByText('选中图片（1）')).toBeInTheDocument()
+    expect(screen.getByRole('checkbox', { name: '选择 a.png' })).toBeChecked()
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+
+    // A second plain click deselects; the editor only opens on double click.
+    fireEvent.click(screen.getByTitle('a.png'))
+    expect(screen.getByText('选中图片（0）')).toBeInTheDocument()
+    expect(screen.getByRole('checkbox', { name: '选择 a.png' })).not.toBeChecked()
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+  })
+
+  it('opens the editor from the card corner edit button', async () => {
+    setupFetch(state)
+    renderPage()
+    await screen.findByAltText('a.png')
+
+    fireEvent.click(screen.getByRole('button', { name: '编辑 a.png' }))
+    expect(await screen.findByRole('dialog', { name: 'a.png' })).toBeInTheDocument()
+  })
+
+  it('navigates the grid with the keyboard: arrows move focus, space selects, enter opens', async () => {
+    setupFetch(state)
+    renderPage()
+    await screen.findByAltText('a.png')
+
+    // The first card is the grid's roving tab stop; everything else is -1.
+    const first = screen.getByTitle('a.png')
+    expect(first).toHaveAttribute('tabindex', '0')
+    expect(screen.getByTitle('b.png')).toHaveAttribute('tabindex', '-1')
+    expect(first.closest('[role="grid"]')).toHaveAttribute('aria-label', '图片网格')
+
+    fireEvent.keyDown(first, { key: 'ArrowRight' })
+    const second = screen.getByTitle('b.png')
+    expect(second).toHaveAttribute('tabindex', '0')
+    expect(first).toHaveAttribute('tabindex', '-1')
+    expect(document.activeElement).toBe(second)
+
+    // Space toggles the focused card's selection without opening the editor.
+    fireEvent.keyDown(second, { key: ' ' })
+    expect(screen.getByRole('checkbox', { name: '选择 b.png' })).toBeChecked()
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+
+    // Enter opens the editor for the focused card.
+    fireEvent.keyDown(second, { key: 'Enter' })
+    expect(await screen.findByRole('dialog', { name: 'b.png' })).toBeInTheDocument()
+  })
+
+  it('removes a tag only through the explicit remove button, not the pill body', async () => {
+    setupFetch(state)
+    renderPage()
+    await screen.findByAltText('a.png')
+
+    fireEvent.dblClick(screen.getByTitle('a.png'))
+    await screen.findByRole('dialog', { name: 'a.png' })
+
+    // The pill body is presentational: clicking it must not remove anything.
+    const pill = screen.getByRole('button', { name: '移除 solo' }).closest('.tm-pill')
+    expect(pill).not.toBeNull()
+    expect(pill).not.toHaveAttribute('role', 'button')
+    fireEvent.click(pill as HTMLElement)
+    expect(screen.getByRole('button', { name: '移除 solo' })).toBeInTheDocument()
+
+    // Wiki lookup and removal are sibling buttons of the pill.
+    expect(screen.getByRole('button', { name: '查看 solo 的 Wiki' })).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: '移除 solo' }))
+    expect(screen.queryByRole('button', { name: '移除 solo' })).not.toBeInTheDocument()
+  })
+
+  it('creates a sidecar for an image without one and saves it as tag_txt', async () => {
+    state.detail = { ...detail, content: { kind: 'none' } }
+    setupFetch(state)
+    renderPage()
+    await screen.findByAltText('b.png')
+
+    fireEvent.dblClick(screen.getByTitle('b.png'))
+    const dialog = await screen.findByRole('dialog', { name: 'b.png' })
+    expect(screen.getByText('暂无 sidecar')).toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('radio', { name: /tag_txt/ }))
+    fireEvent.click(within(dialog).getByRole('button', { name: '创建' }))
+
+    const addInput = screen.getByRole('combobox', { name: '添加标签' })
+    fireEvent.change(addInput, { target: { value: 'hakurei' } })
+    const suggestion = await screen.findByRole('option', { name: /hakurei_reimu/ })
+    fireEvent.mouseDown(within(suggestion).getByRole('button'))
+    await waitFor(() => expect(screen.getByRole('button', { name: '移除 hakurei_reimu' })).toBeInTheDocument())
+
+    fireEvent.click(within(dialog).getByRole('button', { name: '保存' }))
+    await waitFor(() => expect(state.patchBodies).toHaveLength(1))
+    expect(state.patchBodies[0]).toEqual({
+      content: { kind: 'tag_txt', tags: ['hakurei_reimu'] },
+      expected_sidecar_mtime: 1_725_148_800,
+    })
+  })
+
+  it('saves and moves to the previous image', async () => {
+    setupFetch(state)
+    renderPage()
+    await screen.findByAltText('b.png')
+
+    fireEvent.dblClick(screen.getByTitle('b.png'))
+    const dialog = await screen.findByRole('dialog', { name: 'b.png' })
+    fireEvent.click(screen.getByRole('button', { name: '移除 solo' }))
+    fireEvent.click(within(dialog).getByRole('button', { name: '保存并上一张' }))
+
+    await waitFor(() => expect(state.patchBodies).toHaveLength(1))
+    await screen.findByRole('dialog', { name: 'a.png' })
+    expect(state.patchBodies[0]).toEqual({
+      content: { kind: 'tag_txt', tags: ['long_hair'] },
+      expected_sidecar_mtime: 1_725_148_800,
+    })
+  })
+
+  it('crosses page boundaries when saving and navigating', async () => {
+    const pageTwo: TagManagerImageSummary[] = [
+      summary(101, 'd.png', 'tag_txt', 2),
+      summary(102, 'e.png', 'tags_json', 3),
+      summary(103, 'f.png', 'standard_json', 1),
+    ]
+    // PAGE_SIZE is 60, so a total above 60 produces two pages; the mock slices
+    // its items by offset instead of returning full pages.
+    state.pagedPages = { first: imageItems, second: pageTwo, total: 61 }
+    setupFetch(state)
+    renderPage()
+    await screen.findByAltText('a.png')
+
+    // Last image of page 1 → 保存并下一张 flips to page 2 and opens its first.
+    fireEvent.dblClick(screen.getByTitle('c.png'))
+    const firstDialog = await screen.findByRole('dialog', { name: 'c.png' })
+    fireEvent.click(screen.getByRole('button', { name: '移除 solo' }))
+    fireEvent.click(within(firstDialog).getByRole('button', { name: '保存并下一张' }))
+
+    await waitFor(() => expect(state.patchBodies).toHaveLength(1))
+    await screen.findByRole('dialog', { name: 'd.png' })
+    expect(state.imageQueries.some((query) => query.includes('offset=60'))).toBe(true)
+    expect(screen.getByText(/第 2 \/ 2 页/)).toBeInTheDocument()
+
+    // First image of page 2 → 保存并上一张 returns to page 1's last image.
+    fireEvent.click(screen.getByRole('button', { name: '移除 solo' }))
+    fireEvent.click(within(screen.getByRole('dialog', { name: 'd.png' })).getByRole('button', { name: '保存并上一张' }))
+    await waitFor(() => expect(state.patchBodies).toHaveLength(2))
+    await screen.findByRole('dialog', { name: 'c.png' })
+    expect(state.imageQueries.some((query) => query.includes('offset=0'))).toBe(true)
+    expect(screen.getByText(/第 1 \/ 2 页/)).toBeInTheDocument()
+    expect(screen.getByAltText('a.png')).toBeInTheDocument()
+  })
+
+  it('copies the unsaved draft to the clipboard from the conflict notice', async () => {
+    setupFetch(state)
+    renderPage()
+    await screen.findByAltText('a.png')
+
+    fireEvent.dblClick(screen.getByTitle('a.png'))
+    const dialog = await screen.findByRole('dialog', { name: 'a.png' })
+    fireEvent.click(screen.getByRole('button', { name: '移除 solo' }))
+    state.patchConflict = true
+    fireEvent.click(within(dialog).getByRole('button', { name: '保存' }))
+    expect(await screen.findByText(/sidecar 在编辑期间被外部修改/)).toBeInTheDocument()
+
+    const clipboard = { writeText: vi.fn().mockResolvedValue(undefined) }
+    Object.defineProperty(window.navigator, 'clipboard', { value: clipboard, configurable: true })
+    fireEvent.click(screen.getByRole('button', { name: '复制草稿' }))
+    expect(await screen.findByRole('button', { name: '已复制' })).toBeInTheDocument()
+    expect(clipboard.writeText).toHaveBeenCalledWith(JSON.stringify({ kind: 'tag_txt', tags: ['long_hair'] }, null, 2))
+    Object.defineProperty(window.navigator, 'clipboard', { value: undefined, configurable: true })
+  })
+
+  it('stacks page notices in a queue and closes each independently', async () => {
+    setupFetch(state)
+    renderPage()
+    await screen.findByAltText('a.png')
+
+    fireEvent.click(screen.getByRole('button', { name: '撤销' }))
+    await waitFor(() => expect(state.undoCalls).toBe(1))
+    fireEvent.click(screen.getByRole('button', { name: '重做' }))
+    await waitFor(() => expect(state.redoCalls).toBe(1))
+
+    // Both notices stay visible instead of the second overwriting the first.
+    expect(await screen.findByText('已撤销上一次操作')).toBeInTheDocument()
+    expect(screen.getByText('已重做操作')).toBeInTheDocument()
+    const closeButtons = screen.getAllByRole('button', { name: '关闭提示' })
+    expect(closeButtons).toHaveLength(2)
+
+    // Each entry carries its own close button; closing one keeps the other.
+    fireEvent.click(closeButtons[0] as HTMLElement)
+    expect(screen.queryByText('已撤销上一次操作')).not.toBeInTheDocument()
+    expect(screen.getByText('已重做操作')).toBeInTheDocument()
+  })
+
+  it('maps known backend error codes to the Chinese notice copy', async () => {
+    state.undoError = { code: 'session_busy', message: 'Session is busy with another write' }
+    setupFetch(state)
+    renderPage()
+    await screen.findByAltText('a.png')
+
+    fireEvent.click(screen.getByRole('button', { name: '撤销' }))
+    expect(await screen.findByText('会话正在执行其它操作，请稍后重试')).toBeInTheDocument()
+  })
+
+  it('falls back to the backend message for unknown error codes', async () => {
+    state.undoError = { code: 'mystery_code', message: 'Unknown backend failure' }
+    setupFetch(state)
+    renderPage()
+    await screen.findByAltText('a.png')
+
+    fireEvent.click(screen.getByRole('button', { name: '撤销' }))
+    expect(await screen.findByText('Unknown backend failure')).toBeInTheDocument()
   })
 })

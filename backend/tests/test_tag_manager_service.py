@@ -1,8 +1,11 @@
 """Service-level tests for the tag manager: index, edit, batch, undo/redo, routes."""
 
+import asyncio
 import json
 import logging
 import os
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -11,6 +14,7 @@ from fastapi.testclient import TestClient
 from PIL import Image
 
 from tagger2.security import PathAllowlist
+from tagger2.tag_manager import indexing
 from tagger2.tag_manager.api import create_tag_manager_router
 from tagger2.tag_manager.contracts import (
     BatchOperationRequest,
@@ -778,6 +782,29 @@ def test_write_operations_reject_while_session_locked(workspace):
     service.save_image(session_id, a_id, ImageEditRequest(content=TagTxtContent(tags=["x"])))
 
 
+def test_save_rejects_sidecar_created_after_no_sidecar_load(workspace):
+    service, _store, session, dataset = workspace
+    session_id = str(session["id"])
+    a_id = _image_ids_by_name(service, session_id)["a.png"]
+    (dataset / "a.txt").unlink()
+    service.index_session(session_id)
+    detail = service.get_image(session_id, a_id)
+    assert detail["content"]["kind"] == "none"
+
+    (dataset / "a.txt").write_text("external\n", encoding="utf-8")
+    with pytest.raises(TagManagerError) as excinfo:
+        service.save_image(
+            session_id,
+            a_id,
+            ImageEditRequest(
+                content=TagTxtContent(tags=["solo"]),
+                expected_sidecar_mtime=detail["sidecar_mtime"],
+            ),
+        )
+    assert excinfo.value.code == "sidecar_conflict"
+    assert (dataset / "a.txt").read_text(encoding="utf-8") == "external\n"
+
+
 def test_save_falls_back_to_indexed_mtime_on_external_change(workspace):
     """Without a client-supplied mtime, the indexed mtime guards against
     silently overwriting an externally modified sidecar."""
@@ -803,3 +830,494 @@ def test_save_falls_back_to_indexed_mtime_on_external_change(workspace):
         session_id, a_id, ImageEditRequest(content=TagTxtContent(tags=["solo"]))
     )
     assert (dataset / "a.txt").read_text(encoding="utf-8") == "solo\n"
+
+
+# -- P0 regression coverage: extras round-trip, redo stack, refresh, stats -----
+
+
+def test_save_preserves_tags_json_container_and_entry_extras(workspace):
+    """Container-level and entry-level extras survive a save untouched."""
+
+    service, _store, session, dataset = workspace
+    session_id = str(session["id"])
+    _make_image(dataset, "e.png")
+    sidecar = {
+        "schema": "local-tags-v2",
+        "source": {"tool": "test"},  # nested extra: not editable, but present
+        "tags": [
+            {"text": "solo", "category": "general", "score": 0.5, "origin": "importer"},
+            {"text": "wolf", "locked": True, "aliases": ["canis"]},
+        ],
+    }
+    (dataset / "e.json").write_text(json.dumps(sidecar, ensure_ascii=False), encoding="utf-8")
+    service.index_session(session_id)
+    e_id = _image_ids_by_name(service, session_id)["e.png"]
+
+    detail = service.get_image(session_id, e_id)
+    # The read payload ships flat extras to the editor; nested ones (source)
+    # are stripped from the client contract and re-merged from disk on save.
+    payload = detail["content"]
+    assert payload["schema"] == "local-tags-v2"
+    assert "source" not in payload
+    assert payload["tags"][0].get("origin") == "importer"
+    assert payload["tags"][1].get("locked") is True
+    assert payload["tags"][1].get("aliases") == ["canis"]
+
+    # Save exactly what the editor received: flat extras round-trip and the
+    # nested ones are merged back server-side.
+    content = TagsJsonContent(
+        **{key: value for key, value in payload.items() if key not in {"kind", "tags"}},
+        tags=[TagEdit(**entry) for entry in payload["tags"]],
+    )
+    service.save_image(session_id, e_id, ImageEditRequest(
+        content=content, expected_sidecar_mtime=detail["sidecar_mtime"]
+    ))
+    saved = json.loads((dataset / "e.json").read_text(encoding="utf-8"))
+    assert saved["schema"] == "local-tags-v2"
+    assert saved["source"] == {"tool": "test"}
+    assert saved["tags"][0]["origin"] == "importer"
+    assert saved["tags"][1]["locked"] is True
+    assert saved["tags"][1]["aliases"] == ["canis"]
+
+
+def test_save_preserves_standard_json_top_level_extras(workspace):
+    """Top-level keys outside the nine frozen fields survive a save."""
+
+    service, _store, session, dataset = workspace
+    session_id = str(session["id"])
+    b_id = _image_ids_by_name(service, session_id)["b.png"]
+    document = {**STANDARD_JSON, "meta_version": 3, "reviewed": True, "labels": ["curated"]}
+    (dataset / "b.json").write_text(json.dumps(document), encoding="utf-8")
+    service.index_session(session_id)
+
+    detail = service.get_image(session_id, b_id)
+    payload = detail["content"]
+    assert payload["meta_version"] == 3
+    assert payload["reviewed"] is True
+    assert payload["labels"] == ["curated"]
+
+    fields = payload["fields"]
+    fields["tags"] = ["wolf", "night"]
+    content = StandardJsonContent(
+        **{key: value for key, value in payload.items() if key not in {"kind", "fields"}},
+        fields=fields,
+    )
+    service.save_image(session_id, b_id, ImageEditRequest(
+        content=content, expected_sidecar_mtime=detail["sidecar_mtime"]
+    ))
+    saved = json.loads((dataset / "b.json").read_text(encoding="utf-8"))
+    assert saved["meta_version"] == 3
+    assert saved["reviewed"] is True
+    assert saved["labels"] == ["curated"]
+    assert saved["tags"] == ["wolf", "night"]
+
+
+def test_save_rejects_nested_extra_values(workspace):
+    """A client cannot smuggle nested structures through extras."""
+
+    from tagger2.tag_manager.contracts import TagEdit
+
+    with pytest.raises(Exception):
+        TagEdit(text="solo", deep={"a": {"b": 1}})
+
+
+def test_fresh_edit_after_undo_clears_redo_stack(workspace):
+    """A new save after an undo drops the unreachable redo entries."""
+
+    service, store, session, dataset = workspace
+    session_id = str(session["id"])
+    a_id = _image_ids_by_name(service, session_id)["a.png"]
+
+    detail = service.get_image(session_id, a_id)
+    service.save_image(session_id, a_id, ImageEditRequest(
+        content=TagTxtContent(tags=["solo", "wolf", "rex"]),
+        expected_sidecar_mtime=detail["sidecar_mtime"],
+    ))
+    service.undo(session_id)
+    assert store.latest_journal_entry(session_id, undone=True) is not None
+
+    # A new edit branches the history; the redo entry must be gone.
+    detail = service.get_image(session_id, a_id)
+    service.save_image(session_id, a_id, ImageEditRequest(
+        content=TagTxtContent(tags=["night"]),
+        expected_sidecar_mtime=detail["sidecar_mtime"],
+    ))
+    assert store.latest_journal_entry(session_id, undone=True) is None
+    with pytest.raises(TagManagerError) as excinfo:
+        service.redo(session_id)
+    assert excinfo.value.code == "redo_empty"
+
+
+def test_fresh_batch_after_undo_clears_redo_stack(workspace):
+    service, store, session, _dataset = workspace
+    session_id = str(session["id"])
+    a_id = _image_ids_by_name(service, session_id)["a.png"]
+
+    service.batch_operation(
+        session_id, BatchOperationRequest(op="add", tags=["night"], image_ids=[a_id])
+    )
+    service.undo(session_id)
+    assert store.latest_journal_entry(session_id, undone=True) is not None
+
+    service.batch_operation(
+        session_id, BatchOperationRequest(op="remove", tags=["wolf"], image_ids=[a_id])
+    )
+    assert store.latest_journal_entry(session_id, undone=True) is None
+
+
+def test_refresh_reports_session_busy_under_write(workspace):
+    """A refresh during an in-flight write returns 409 instead of a fake 202."""
+
+    service, _store, session, _dataset = workspace
+    session_id = str(session["id"])
+
+    lock = service._session_lock(session_id)
+    assert lock.acquire(blocking=False)
+    try:
+        with pytest.raises(TagManagerError) as excinfo:
+            service.refresh_session(session_id)
+        assert excinfo.value.code == "session_busy"
+        assert excinfo.value.retryable
+    finally:
+        lock.release()
+
+    # Once free, the refresh schedules the rescan normally.
+    refreshed = service.refresh_session(session_id)
+    assert refreshed["status"] in {"indexing", "ready", "error"}
+
+
+def test_async_index_scan_future_is_tracked_then_cleared(workspace):
+    """The async scan path keeps its future until the scan has finished."""
+
+    service, _store, session, _dataset = workspace
+    session_id = str(session["id"])
+    lock = service._session_lock(session_id)
+
+    async def drive():
+        # Hold the session lock so the scheduled scan cannot complete while
+        # the tracking assertion runs.
+        with lock:
+            service.schedule_index(session_id)
+            future = service._index_futures.get(session_id)
+            assert future is not None, "the async path must track its scan future"
+        deadline = time.monotonic() + 10.0
+        while session_id in service._index_futures:
+            if time.monotonic() > deadline:
+                raise AssertionError("index future was never cleared")
+            await asyncio.sleep(0.01)
+
+    asyncio.run(drive())
+    assert service.get_session(session_id)["status"] == "ready"
+
+
+def test_async_index_scan_logs_errors_that_escape_the_scan(workspace, caplog):
+    """A failed scan future is logged instead of vanishing silently."""
+
+    service, _store, session, _dataset = workspace
+    session_id = str(session["id"])
+
+    def explode(_session_id):
+        raise RuntimeError("scan exploded")
+
+    service.index_session = explode
+
+    async def drive():
+        service.schedule_index(session_id)
+        deadline = time.monotonic() + 10.0
+        while session_id in service._index_futures:
+            if time.monotonic() > deadline:
+                raise AssertionError("failed index future was never cleared")
+            await asyncio.sleep(0.01)
+
+    with caplog.at_level(logging.WARNING, logger="tagger2.tag_manager"):
+        asyncio.run(drive())
+    assert "scan exploded" in caplog.text
+
+
+def test_delete_session_cancels_a_queued_index_scan(workspace):
+    """A queued (not yet started) scan is cancelled when its session dies."""
+
+    service, _store, session, _dataset = workspace
+    session_id = str(session["id"])
+    block = threading.Event()
+
+    async def drive():
+        loop = asyncio.get_running_loop()
+        # Saturate the default executor with blocked workers so the scheduled
+        # scan stays queued while delete_session runs.
+        occupied = [loop.run_in_executor(None, block.wait) for _ in range(64)]
+        service.schedule_index(session_id)
+        future = service._index_futures[session_id]
+        service.delete_session(session_id)
+        assert future.cancelled(), "a queued scan must be cancelled on delete"
+        assert session_id not in service._index_futures
+        block.set()
+        await asyncio.gather(*occupied)
+
+    asyncio.run(drive())
+
+
+def test_tag_stats_merges_underscore_and_space_spellings(workspace):
+    """`long hair` and `long_hair` count as one tag in the stats panel."""
+
+    service, _store, session, dataset = workspace
+    session_id = str(session["id"])
+    _make_image(dataset, "f.png")
+    _make_image(dataset, "g.png")
+    (dataset / "f.txt").write_text("long hair, solo\n", encoding="utf-8")
+    (dataset / "g.txt").write_text("long_hair, duo\n", encoding="utf-8")
+    service.index_session(session_id)
+
+    stats = service.tag_stats(session_id)
+    counts = {row["tag"]: row["count"] for row in stats}
+    assert counts.get("long_hair", counts.get("long hair")) == 2
+    assert not ("long_hair" in counts and "long hair" in counts)
+
+
+def test_get_image_strips_nested_entry_extras_and_save_keeps_them(workspace):
+    """Nested per-entry extras never enter the client contract (the strict
+    TagEdit model would reject them with a 422), yet saving the payload the
+    editor received keeps them on disk via the server-side merge."""
+
+    service, _store, session, dataset = workspace
+    session_id = str(session["id"])
+    _make_image(dataset, "h.png")
+    (dataset / "h.json").write_text(
+        json.dumps({
+            "tags": [
+                {"text": "solo", "category": "general"},
+                {"text": "wolf", "meta": {"a": 1}},
+            ],
+        }),
+        encoding="utf-8",
+    )
+    service.index_session(session_id)
+    h_id = _image_ids_by_name(service, session_id)["h.png"]
+
+    detail = service.get_image(session_id, h_id)
+    payload = detail["content"]
+    wolf_entry = next(entry for entry in payload["tags"] if entry["text"] == "wolf")
+    assert "meta" not in wolf_entry
+
+    # Save exactly what the client received: without the strip this strict
+    # construction (and therefore the PATCH request) would fail validation.
+    content = TagsJsonContent(
+        **{key: value for key, value in payload.items() if key not in {"kind", "tags"}},
+        tags=[TagEdit(**entry) for entry in payload["tags"]],
+    )
+    result = service.save_image(session_id, h_id, ImageEditRequest(
+        content=content, expected_sidecar_mtime=detail["sidecar_mtime"],
+    ))
+    assert result["sidecar_kind"] == "tags_json"
+
+    # The nested extra is merged back from the disk original, not dropped.
+    saved = json.loads((dataset / "h.json").read_text(encoding="utf-8"))
+    saved_wolf = next(entry for entry in saved["tags"] if entry["text"] == "wolf")
+    assert saved_wolf["meta"] == {"a": 1}
+
+
+def test_failed_save_keeps_redo_stack_replayable(workspace):
+    """A save that fails (sidecar conflict here) must not drop the redo
+    history: the stack is discarded only after a journal entry lands."""
+
+    service, store, session, dataset = workspace
+    session_id = str(session["id"])
+    a_id = _image_ids_by_name(service, session_id)["a.png"]
+
+    service.batch_operation(
+        session_id, BatchOperationRequest(op="add", tags=["night"], image_ids=[a_id])
+    )
+    service.undo(session_id)
+    assert store.latest_journal_entry(session_id, undone=True) is not None
+    assert (dataset / "a.txt").read_text(encoding="utf-8") == "solo, wolf\n"
+
+    detail = service.get_image(session_id, a_id)
+    # An external rewrite pins a mtime the editor cannot know about.
+    (dataset / "a.txt").write_text("changed externally\n", encoding="utf-8")
+    os.utime(dataset / "a.txt", (1_000_000_000, 1_000_000_000))
+    with pytest.raises(TagManagerError) as excinfo:
+        service.save_image(
+            session_id, a_id, ImageEditRequest(
+                content=TagTxtContent(tags=["solo", "wolf"]),
+                expected_sidecar_mtime=detail["sidecar_mtime"],
+            )
+        )
+    assert excinfo.value.code == "sidecar_conflict"
+    # The failed save appended nothing and kept the redo entry.
+    assert len(store.journal_entries(session_id)) == 1
+    assert store.latest_journal_entry(session_id, undone=True) is not None
+
+    # Once the sidecar matches the journalled before-state, redo still works.
+    (dataset / "a.txt").write_text("solo, wolf\n", encoding="utf-8")
+    assert service.redo(session_id)["reapplied"] == 1
+    assert (dataset / "a.txt").read_text(encoding="utf-8") == "solo, wolf, night\n"
+
+
+def test_noop_batch_keeps_redo_stack_and_skips_journal(workspace):
+    """A batch with nothing to do branches no history: no journal entry, redo
+    stack untouched, and the response reports affected 0 without a journal."""
+
+    service, store, session, _dataset = workspace
+    session_id = str(session["id"])
+    a_id = _image_ids_by_name(service, session_id)["a.png"]
+
+    service.batch_operation(
+        session_id, BatchOperationRequest(op="add", tags=["night"], image_ids=[a_id])
+    )
+    service.undo(session_id)
+    assert store.latest_journal_entry(session_id, undone=True) is not None
+
+    # Zero matching targets.
+    result = service.batch_operation(
+        session_id,
+        BatchOperationRequest(op="add", tags=["night"], image_ids=None,
+                              filter=ImageFilter(include_tags=["no-such-tag"])),
+    )
+    assert result["affected"] == 0
+    assert result["journal_id"] is None
+    assert store.latest_journal_entry(session_id, undone=True) is not None
+
+    # Targets exist but every one is a no-op (the tag is already present).
+    result = service.batch_operation(
+        session_id, BatchOperationRequest(op="add", tags=["wolf"], image_ids=[a_id])
+    )
+    assert result["affected"] == 0
+    assert result["journal_id"] is None
+    assert store.latest_journal_entry(session_id, undone=True) is not None
+    # Neither run appended an (empty) journal entry.
+    assert len(store.journal_entries(session_id)) == 1
+
+
+def test_refresh_session_rescans_in_sync_context(workspace):
+    """A synchronous refresh (no running event loop) actually rescans: the
+    busy probe releases the lock before scheduling, so the inline index run
+    can acquire it instead of silently skipping."""
+
+    service, _store, session, dataset = workspace
+    session_id = str(session["id"])
+    assert service.get_session(session_id)["status"] == "ready"
+
+    _make_image(dataset, "added_later.png")
+    service.refresh_session(session_id)
+
+    names = {item["file_name"] for item in service.list_images(session_id)["items"]}
+    assert "added_later.png" in names
+    assert service.get_session(session_id)["status"] == "ready"
+
+
+def test_tag_stats_counts_image_once_for_double_spelling(workspace):
+    """One image carrying both `long hair` and `long_hair` counts once in the
+    stats panel, not once per spelling."""
+
+    service, _store, session, dataset = workspace
+    session_id = str(session["id"])
+    _make_image(dataset, "i.png")
+    (dataset / "i.txt").write_text("long hair, long_hair, solo\n", encoding="utf-8")
+    service.index_session(session_id)
+
+    stats = service.tag_stats(session_id)
+    counts = {row["tag"]: row["count"] for row in stats}
+    assert counts.get("long_hair", counts.get("long hair")) == 1
+
+
+# -- incremental rescans -------------------------------------------------------
+
+
+def test_incremental_rescan_skips_unchanged_files(workspace, monkeypatch):
+    """A rescan over an unchanged dataset reuses the indexed rows: no sidecar
+    is re-parsed and no image header is probed again."""
+
+    service, _store, session, _dataset = workspace
+    session_id = str(session["id"])
+
+    real_open = Image.open
+    opened: list[str] = []
+
+    def counting_open(path, *args, **kwargs):
+        opened.append(Path(path).name)
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Image, "open", counting_open)
+    real_load = indexing.load_sidecar
+    loaded: list[str | None] = []
+
+    def counting_load(txt_path, json_path):
+        source = txt_path or json_path
+        loaded.append(source.name if source is not None else None)
+        return real_load(txt_path, json_path)
+
+    monkeypatch.setattr(indexing, "load_sidecar", counting_load)
+
+    service.index_session(session_id)  # second scan: nothing changed
+
+    assert opened == []
+    assert loaded == []
+    refreshed = service.get_session(session_id)
+    assert refreshed["status"] == "ready"
+    assert refreshed["image_count"] == 3  # skipped images still count
+
+
+def test_incremental_rescan_reindexes_only_changed_sidecars(workspace, monkeypatch):
+    """Sidecars that changed, appeared or disappeared are re-parsed; the image
+    files themselves are untouched, so nothing else is re-indexed."""
+
+    service, store, session, dataset = workspace
+    session_id = str(session["id"])
+    items = {item["file_name"]: item for item in service.list_images(session_id)["items"]}
+    b_id = int(items["b.png"]["id"])
+
+    real_load = indexing.load_sidecar
+    loaded: list[str | None] = []
+
+    def counting_load(txt_path, json_path):
+        source = txt_path or json_path
+        loaded.append(source.name if source is not None else None)
+        return real_load(txt_path, json_path)
+
+    monkeypatch.setattr(indexing, "load_sidecar", counting_load)
+
+    # a's sidecar is modified, c gains a sidecar (none -> tag_txt), b's
+    # sidecar is deleted; a far-away mtime rules out float-rounding luck.
+    (dataset / "a.txt").write_text("solo, wolf, night\n", encoding="utf-8")
+    os.utime(dataset / "a.txt", (1_100_000_000, 1_100_000_000))
+    (dataset / "c.txt").write_text("fresh\n", encoding="utf-8")
+    os.remove(dataset / "b.json")
+
+    service.index_session(session_id)
+
+    # Scan order is a.png, b.png, c.png; b's deleted sidecar parses as none.
+    assert loaded == ["a.txt", None, "c.txt"]
+
+    updated = {item["file_name"]: item for item in service.list_images(session_id)["items"]}
+    assert "night" in {tag["tag"] for tag in updated["a.png"]["tags"]}
+    assert updated["a.png"]["sidecar_mtime"] == 1_100_000_000.0
+    assert updated["c.png"]["sidecar_kind"] == "tag_txt"
+    assert store.get_image(session_id, b_id)["sidecar_kind"] == "none"
+
+
+def test_incremental_rescan_picks_up_added_and_removed_images(workspace):
+    """New images are indexed and deleted images (plus their tags) pruned."""
+
+    service, store, session, dataset = workspace
+    session_id = str(session["id"])
+    items = {item["file_name"]: item for item in service.list_images(session_id)["items"]}
+    b_id = int(items["b.png"]["id"])
+
+    _make_image(dataset, "added.png")
+    (dataset / "added.txt").write_text("fresh\n", encoding="utf-8")
+    os.remove(dataset / "b.png")
+    os.remove(dataset / "b.json")
+
+    service.index_session(session_id)
+
+    names = {item["file_name"] for item in service.list_images(session_id)["items"]}
+    assert names == {"a.png", "c.png", "added.png"}
+    refreshed = service.get_session(session_id)
+    assert refreshed["status"] == "ready"
+    assert refreshed["image_count"] == 3
+    assert store.get_image(session_id, b_id) is None
+    added_tags = {
+        item["file_name"]: {tag["tag"] for tag in item["tags"]}
+        for item in service.list_images(session_id)["items"]
+    }
+    assert added_tags["added.png"] == {"fresh"}

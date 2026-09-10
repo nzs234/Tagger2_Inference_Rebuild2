@@ -302,7 +302,7 @@ describe('TagManager bilingual display', () => {
 
     expect(await screen.findByTitle('筛选包含 blue_eyes · 蓝瞳')).toBeInTheDocument()
 
-    fireEvent.click(screen.getByTitle('a.png'))
+    fireEvent.dblClick(screen.getByTitle('a.png'))
     await screen.findByRole('dialog', { name: 'a.png' })
     fireEvent.change(screen.getByRole('combobox', { name: '添加标签' }), { target: { value: 'long' } })
 
@@ -342,7 +342,7 @@ describe('TagManager separator style', () => {
     fireEvent.click(screen.getByRole('button', { name: '空格' }))
     await waitFor(() => expect(screen.getByTitle('blue eyes · 蓝瞳')).toBeInTheDocument())
 
-    fireEvent.click(screen.getByTitle('a.png'))
+    fireEvent.dblClick(screen.getByTitle('a.png'))
     const dialog = await screen.findByRole('dialog', { name: 'a.png' })
     expect(within(dialog).getByRole('button', { name: '移除 blue eyes' })).toBeInTheDocument()
 
@@ -360,7 +360,7 @@ describe('TagManager separator style', () => {
     renderPage()
     await screen.findByAltText('a.png')
 
-    fireEvent.click(screen.getByTitle('a.png'))
+    fireEvent.dblClick(screen.getByTitle('a.png'))
     const dialog = await screen.findByRole('dialog', { name: 'a.png' })
     fireEvent.click(within(dialog).getByRole('button', { name: '保存' }))
 
@@ -377,7 +377,7 @@ describe('TagManager separator style', () => {
     await screen.findByAltText('b.png')
 
     fireEvent.click(screen.getByRole('button', { name: '空格' }))
-    fireEvent.click(screen.getByTitle('b.png'))
+    fireEvent.dblClick(screen.getByTitle('b.png'))
     const dialog = await screen.findByRole('dialog', { name: 'b.png' })
     fireEvent.click(within(dialog).getByRole('button', { name: '保存' }))
 
@@ -451,7 +451,7 @@ describe('TagManager NL translation', () => {
     setupFetch(state)
     renderPage()
     await screen.findByAltText('b.png')
-    fireEvent.click(screen.getByTitle('b.png'))
+    fireEvent.dblClick(screen.getByTitle('b.png'))
     return screen.findByRole('dialog', { name: 'b.png' })
   }
 
@@ -563,13 +563,16 @@ describe('on-demand tag translation', () => {
     renderPage()
     await screen.findByAltText('a.png')
 
-    fireEvent.click(screen.getByTitle('a.png'))
+    fireEvent.dblClick(screen.getByTitle('a.png'))
     const dialog = await screen.findByRole('dialog', { name: 'a.png' })
     fireEvent.click(within(dialog).getByRole('button', { name: '在线翻译缺失标签（1）' }))
 
     await waitFor(() => expect(state.tagTranslateBodies).toHaveLength(1))
     // The pill now renders bilingually and the button disappears after saving.
-    const pill = await within(dialog).findByRole('button', { name: '移除 unmapped_tag' })
+    // The remove control is a button inside the presentational pill span.
+    const removeButton = await within(dialog).findByRole('button', { name: '移除 unmapped_tag' })
+    const pill = removeButton.closest('.tm-pill')
+    expect(pill).not.toBeNull()
     expect(pill).toHaveTextContent('已映射')
     expect(await within(dialog).findByText(/已翻译 1 条并保存到本地词库/)).toBeInTheDocument()
     expect(within(dialog).queryByRole('button', { name: /在线翻译缺失标签/ })).not.toBeInTheDocument()
@@ -580,7 +583,7 @@ describe('on-demand tag translation', () => {
     renderPage()
     await screen.findByAltText('a.png')
 
-    fireEvent.click(screen.getByTitle('b.png'))
+    fireEvent.dblClick(screen.getByTitle('b.png'))
     const dialog = await screen.findByRole('dialog', { name: 'b.png' })
 
     expect(within(dialog).queryByRole('button', { name: /在线翻译缺失标签/ })).not.toBeInTheDocument()

@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from tagger2.nine_field_schema import NINE_FIELDS as SHARED_NINE_FIELDS
 from tagger2.tag_manager.sidecar_io import (
     SidecarError,
     dedup_tags,
@@ -14,6 +15,7 @@ from tagger2.tag_manager.sidecar_io import (
     render_tags_json,
 )
 from tagger2.tag_manager.storage import TagManagerStore
+from tagger2.workflow.pipeline import NINE_FIELDS as WORKFLOW_NINE_FIELDS
 
 
 RAW_E621_DOCUMENT = {
@@ -131,6 +133,27 @@ def test_standard_json_render_freezes_field_order_and_keeps_extras() -> None:
     payload = json.loads(rendered)
     assert payload["extra_key"] == "kept"
     assert payload["count"] == "solo"
+
+
+def test_shared_nine_fields_match_workflow_contract() -> None:
+    """Sidecar IO and the workflow must never drift on the nine-field order.
+
+    ``tagger2.nine_field_schema`` is the single source the tag manager imports;
+    the workflow keeps its own tuple, so only this guard keeps the two honest.
+    """
+
+    assert SHARED_NINE_FIELDS == WORKFLOW_NINE_FIELDS
+    assert SHARED_NINE_FIELDS == (
+        "quality",
+        "count",
+        "character",
+        "series",
+        "artist",
+        "appearance",
+        "tags",
+        "environment",
+        "nl",
+    )
 
 
 def test_raw_e621_json_is_recognized_read_only(tmp_path: Path) -> None:

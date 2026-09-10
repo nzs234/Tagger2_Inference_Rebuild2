@@ -1,4 +1,4 @@
-import { API_BASE, request } from './api'
+import { API_BASE, request, requestBlob } from './api'
 
 // --- Tag Manager types ---
 
@@ -84,10 +84,24 @@ export interface TagManagerImageQuery {
   filter?: ImageFilterState
 }
 
-/** Payload for PATCH image content; discriminated by `kind`. */
+/** Payload for PATCH image content; discriminated by `kind`.
+ *
+ * JSON kinds carry sidecar extras (container-level and top-level unknown keys
+ * plus per-entry metadata) that must round-trip unchanged on save: the payload
+ * mirrors what GET returned, so `{ ...content }` preserves them. */
 export interface TagTxtContent { kind: 'tag_txt'; tags: string[] }
-export interface TagsJsonEntry { text: string; category?: string; score?: number }
-export interface TagsJsonContent { kind: 'tags_json'; tags: TagsJsonEntry[] }
+export type TagsJsonExtraValue = string | number | boolean | null | Array<string | number | boolean | null>
+export interface TagsJsonEntry {
+  text: string
+  category?: string
+  score?: number
+  [extra: string]: TagsJsonExtraValue | string | number | undefined
+}
+export interface TagsJsonContent {
+  kind: 'tags_json'
+  tags: TagsJsonEntry[]
+  [extra: string]: TagsJsonExtraValue | TagsJsonEntry[] | 'tags_json' | undefined
+}
 export interface StandardJsonFields {
   quality: string[]
   count: '' | 'solo' | 'duo' | 'trio' | 'group'
@@ -99,7 +113,11 @@ export interface StandardJsonFields {
   environment: string[]
   nl: string
 }
-export interface StandardJsonContent { kind: 'standard_json'; fields: StandardJsonFields }
+export interface StandardJsonContent {
+  kind: 'standard_json'
+  fields: StandardJsonFields
+  [extra: string]: TagsJsonExtraValue | StandardJsonFields | 'standard_json' | undefined
+}
 export interface RawE621JsonContent { kind: 'raw_e621_json'; tags: string[]; read_only: true }
 export interface TagManagerContentNone { kind: 'none' }
 
@@ -114,8 +132,18 @@ export interface TagManagerImageDetail extends TagManagerImageSummary {
 
 export interface TagManagerUpdateResult {
   image_id: number
-  journal_id: string
+  /** Backend returns an integer journal id. */
+  journal_id: number
   sidecar_kind: TagManagerSidecarKind
+  sidecar_mtime: number | string | null
+}
+
+export interface TagManagerBatchFilter {
+  include_tags: string[]
+  exclude_tags: string[]
+  include_mode: TagManagerIncludeMode
+  kind: TagManagerKindFilter
+  sidecar: TagManagerSidecarFilter
 }
 
 export interface TagManagerBatchRequest {
@@ -124,16 +152,28 @@ export interface TagManagerBatchRequest {
   replacement?: string
   use_regex?: boolean
   image_ids?: number[]
-  filter?: ImageFilterState
+  filter?: TagManagerBatchFilter
+}
+
+export function toBatchFilter(filter: ImageFilterState): TagManagerBatchFilter {
+  return {
+    include_tags: [...filter.includeTags],
+    exclude_tags: [...filter.excludeTags],
+    include_mode: filter.includeMode,
+    kind: filter.kind,
+    sidecar: filter.sidecar,
+  }
 }
 
 export interface TagManagerBatchResult {
   affected: number
-  journal_id: string
+  /** A no-op batch does not produce a journal entry, so the id may be absent or null. */
+  journal_id?: number | null
 }
 
 export interface TagManagerJournalResult {
-  journal_id: string
+  /** Backend returns an integer journal id (undo/redo payloads). */
+  journal_id: number
   reverted?: number | boolean
   reapplied?: number | boolean
 }
@@ -246,6 +286,14 @@ export const tagManagerApi = {
       method: 'PATCH',
       body: JSON.stringify(body),
     }),
+
+  /**
+   * Thumbnails are fetched with the shared authorized client (LAN+token mode
+   * rejects plain <img src> URLs) and exposed as an object URL the caller must
+   * revoke.
+   */
+  thumbnailBlob: (sessionId: string, imageId: number, size = 256): Promise<Blob> =>
+    requestBlob(`/tag-manager/datasets/${encodeURIComponent(sessionId)}/images/${imageId}/thumbnail?size=${size}`),
 
   batch: (sessionId: string, body: TagManagerBatchRequest) =>
     request<TagManagerBatchResult>(`${datasetPath(sessionId)}/batch`, { method: 'POST', body: JSON.stringify(body) }),
@@ -383,7 +431,10 @@ export function imageFilterQuery(params: TagManagerImageQuery): URLSearchParams 
   return query
 }
 
-/** Thumbnails are public JWT-less image responses, consumed via <img src>. */
+/**
+ * Thumbnails are fetched through the authorized client as blobs; the plain
+ * URL stays for non-<img> consumers that attach auth headers themselves.
+ */
 export function tagManagerThumbnailUrl(sessionId: string, imageId: number, size = 256): string {
   return `${API_BASE}/tag-manager/datasets/${encodeURIComponent(sessionId)}/images/${imageId}/thumbnail?size=${size}`
 }

@@ -1062,6 +1062,7 @@ small { font-size: 12px; }
 }
 
 /* Tag Manager */
+.tm-notices { display: grid; gap: 8px; }
 .tm-cat-general { color: var(--tm-general); border-color: color-mix(in srgb, var(--tm-general) 32%, var(--line)); background: color-mix(in srgb, var(--tm-general) 10%, var(--surface)); }
 .tm-cat-artist { color: var(--tm-artist); border-color: color-mix(in srgb, var(--tm-artist) 32%, var(--line)); background: color-mix(in srgb, var(--tm-artist) 10%, var(--surface)); }
 .tm-cat-character { color: var(--tm-character); border-color: color-mix(in srgb, var(--tm-character) 32%, var(--line)); background: color-mix(in srgb, var(--tm-character) 10%, var(--surface)); }
@@ -1073,10 +1074,9 @@ small { font-size: 12px; }
 
 .tm-pill { min-height: 24px; display: inline-flex; align-items: center; gap: 4px; padding: 2px 8px; border: 1px solid var(--line-strong); border-radius: 999px; color: var(--ink); background: var(--surface-2); font-size: 11px; font-weight: 650; overflow-wrap: anywhere; }
 .tm-pill-zh { font-weight: 400; font-size: 10px; opacity: 0.75; margin-left: 2px; }
-button.tm-pill, .tm-pill[role="button"] { cursor: pointer; }
-button.tm-pill:hover:not(:disabled), .tm-pill[role="button"]:hover:not([aria-disabled="true"]) { filter: brightness(0.96); text-decoration: line-through; }
-button.tm-pill:disabled, .tm-pill[role="button"][aria-disabled="true"] { cursor: default; }
 .tm-pill small { font-size: 9px; font-weight: 700; opacity: .8; }
+.tm-pill-wiki-btn, .tm-pill-remove { display: inline-flex; align-items: center; justify-content: center; padding: 1px 2px; margin-left: 2px; border: 0; border-radius: 3px; background: transparent; color: inherit; opacity: 0.6; cursor: pointer; transition: opacity .1s ease; }
+.tm-pill-wiki-btn:hover, .tm-pill-remove:hover { opacity: 1; background: rgb(0 0 0 / 10%); }
 .tm-pill-row { display: flex; flex-wrap: wrap; gap: 6px; }
 .tm-pill-empty { margin: 0; color: var(--subtle); font-size: 11px; }
 .tm-pill-editor { display: grid; gap: 9px; }
@@ -1112,16 +1112,22 @@ button.tm-pill:disabled, .tm-pill[role="button"][aria-disabled="true"] { cursor:
 .tm-layout { display: grid; grid-template-columns: minmax(0, 1fr) minmax(300px, .42fr); gap: 18px; align-items: start; }
 .tm-main, .tm-side { display: grid; gap: 18px; min-width: 0; }
 .tm-main .panel > .tm-filter-grid { padding-bottom: 18px; }
+.tm-filter-tags { display: grid; gap: 6px; align-content: start; }
 
-.tm-grid-wrap { overflow-y: auto; scrollbar-width: thin; scrollbar-color: var(--line-strong) transparent; }
+.tm-grid-wrap { overflow-y: auto; max-height: max(420px, calc(100vh - 420px)); scrollbar-width: thin; scrollbar-color: var(--line-strong) transparent; }
 .tm-grid { display: grid; gap: 10px; padding: 15px; }
+.tm-batch-warning { margin: 0 17px 12px; padding: 9px 11px; border: 1px solid var(--warning-line); border-radius: 8px; color: var(--amber); background: var(--amber-soft); font-size: 11px; }
+.tm-thumb-loading { width: 100%; height: 158px; }
 .tm-card { position: relative; overflow: hidden; border: 1px solid var(--line); border-radius: 10px; background: var(--surface-2); transition: border-color .15s, box-shadow .15s, transform .12s; }
 .tm-card:hover { border-color: color-mix(in srgb, var(--accent) 45%, var(--line)); transform: translateY(-1px); box-shadow: var(--shadow-card); }
 .tm-card-selected { border-color: var(--accent); background: var(--accent-soft); box-shadow: inset 0 0 0 1px var(--accent); }
 .tm-card-editing { border-color: var(--accent); box-shadow: 0 0 0 2px rgb(var(--accent-rgb) / 30%); }
 .tm-card-check { position: absolute; top: 7px; left: 7px; z-index: 1; display: grid; place-items: center; width: 24px; height: 24px; border-radius: 7px; background: color-mix(in srgb, var(--surface) 82%, transparent); backdrop-filter: blur(4px); }
 .tm-card-check input { width: 15px; height: 15px; margin: 0; accent-color: var(--accent); }
+.tm-card-edit { position: absolute; top: 7px; right: 7px; z-index: 1; display: grid; place-items: center; width: 24px; height: 24px; border: 0; border-radius: 7px; background: color-mix(in srgb, var(--surface) 82%, transparent); backdrop-filter: blur(4px); color: var(--muted); cursor: pointer; }
+.tm-card-edit:hover { color: var(--accent-strong); background: color-mix(in srgb, var(--surface) 95%, transparent); }
 .tm-card-body { width: 100%; display: grid; gap: 0; padding: 0; border: 0; background: transparent; text-align: left; }
+.tm-card-body:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
 .tm-thumb { width: 100%; height: 158px; object-fit: cover; background: var(--surface-3); }
 .tm-thumb-failed { display: grid; place-items: center; color: var(--subtle); }
 .tm-card-name { display: block; overflow: hidden; padding: 7px 9px 2px; color: var(--ink); font-size: 11px; font-weight: 650; text-overflow: ellipsis; white-space: nowrap; }
@@ -1152,6 +1158,10 @@ button.tm-pill:disabled, .tm-pill[role="button"][aria-disabled="true"] { cursor:
 .tm-stats-name { overflow: hidden; color: var(--ink); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
 .tm-stats-row small { color: var(--muted); font-size: 10px; font-weight: 700; }
 .tm-stats-state { min-height: 64px; display: flex; align-items: center; justify-content: center; gap: 7px; padding: 12px; }
+.tm-stats-item { display: flex; align-items: center; gap: 3px; }
+.tm-stats-item .tm-stats-row { flex: 1; min-width: 0; width: auto; }
+.tm-stats-exclude { flex: none; display: inline-flex; align-items: center; justify-content: center; width: 26px; min-height: 34px; border: 0; border-radius: 7px; background: transparent; color: var(--subtle); cursor: pointer; }
+.tm-stats-exclude:hover { background: var(--surface-3); color: var(--coral); }
 
 .tm-drawer { width: min(520px, 100%); display: flex; flex-direction: column; }
 .tm-drawer-heading h2 { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -1163,6 +1173,9 @@ button.tm-pill:disabled, .tm-pill[role="button"][aria-disabled="true"] { cursor:
 .tm-editor-section { display: grid; gap: 13px; }
 .tm-editor-block { display: grid; gap: 7px; }
 .tm-editor-hint { margin: 0; color: var(--subtle); font-size: 10px; font-weight: 700; }
+.tm-create-kind { display: grid; gap: 7px; }
+.tm-create-kind-option { display: flex; align-items: center; gap: 7px; color: var(--ink); font-size: 12px; cursor: pointer; }
+.tm-create-kind-option input { accent-color: var(--accent); margin: 0; }
 .tm-text-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
 .tm-quality-row { display: flex; flex-wrap: wrap; gap: 6px; }
 .tm-chip { min-height: 27px; padding: 2px 10px; border: 1px solid var(--line-strong); border-radius: 999px; color: var(--muted); background: var(--surface); font-size: 11px; font-weight: 650; }
@@ -1332,9 +1345,9 @@ button.tm-pill:disabled, .tm-pill[role="button"][aria-disabled="true"] { cursor:
 .tw-chip-source { background: var(--surface-3); font-family: monospace; font-size: 10px; }
 .tw-ask-footnote { margin-top: 4px; padding-top: 8px; border-top: 1px dashed var(--line); }
 
-/* Pill wiki buttons */
-.tm-pill-wiki-btn, .tag-pill-wiki-btn { display: inline-flex; align-items: center; justify-content: center; padding: 1px 2px; margin-left: 2px; border: 0; border-radius: 3px; background: transparent; color: inherit; opacity: 0.6; cursor: pointer; transition: opacity .1s ease; }
-.tm-pill-wiki-btn:hover, .tag-pill-wiki-btn:hover { opacity: 1; background: rgb(0 0 0 / 10%); }
+/* Tag pill wiki buttons (Tag Manager shared rule lives with the pill styles) */
+.tag-pill-wiki-btn { display: inline-flex; align-items: center; justify-content: center; padding: 1px 2px; margin-left: 2px; border: 0; border-radius: 3px; background: transparent; color: inherit; opacity: 0.6; cursor: pointer; transition: opacity .1s ease; }
+.tag-pill-wiki-btn:hover { opacity: 1; background: rgb(0 0 0 / 10%); }
 
 /* Tag catalog: read-only booru-style tag directory (front page) */
 .tw-catalog-panel { padding: 0; overflow: hidden; }

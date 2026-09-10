@@ -1,6 +1,6 @@
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { useQuery } from '@tanstack/react-query'
 import { ChartColumn, Images, ListChecks, LoaderCircle, Tags, X } from 'lucide-react'
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useState } from 'react'
 import { BatchBar } from '../components/tagManager/BatchBar'
 import { EditorDrawer } from '../components/tagManager/EditorDrawer'
 import { FilterBar } from '../components/tagManager/FilterBar'
@@ -8,237 +8,138 @@ import { ImageGrid } from '../components/tagManager/ImageGrid'
 import { SessionBar } from '../components/tagManager/SessionBar'
 import { StatsPanel } from '../components/tagManager/StatsPanel'
 import { TagDisplayBar } from '../components/tagManager/TagDisplayBar'
+import { useImageSelection } from '../components/tagManager/useImageSelection'
+import { useNoticeQueue } from '../components/tagManager/useNoticeQueue'
+import { useTagEditor } from '../components/tagManager/useTagEditor'
+import { useTagManagerImages } from '../components/tagManager/useTagManagerImages'
+import { useTagManagerSessions } from '../components/tagManager/useTagManagerSessions'
 import { Button, ConfirmDialog, DialogLayer, EmptyState, Notice, Panel } from '../components/ui'
-import { api, ApiError } from '../lib/api'
+import { api } from '../lib/api'
+import { describeTagManagerError } from '../lib/tagManagerErrors'
 import {
-  emptyImageFilter,
   tagManagerApi,
-  tagManagerThumbnailUrl,
-  translationKey,
   type ImageFilterState,
-  type TagManagerBatchRequest,
-  type TagManagerEditableContent,
-  type TagManagerSession,
+  type TagManagerImageSummary,
   type TagManagerSort,
 } from '../lib/tagManager'
-import { useTagTranslationMemory } from '../store/tagTranslationMemory'
-
-const PAGE_SIZE = 60
-
-type PageNotice = { tone: 'info' | 'warning' | 'danger' | 'success'; text: string }
+import { useTagManagerView } from '../store/tagManagerView'
 
 export function TagManager() {
-  const queryClient = useQueryClient()
-  const [activeId, setActiveId] = useState<string>()
-  const [notice, setNotice] = useState<PageNotice | null>(null)
-  const [filter, setFilterState] = useState<ImageFilterState>(emptyImageFilter)
-  const [sort, setSort] = useState<TagManagerSort>('name')
-  const [page, setPage] = useState(0)
-  const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set())
-  const selectionAnchor = useRef<number | null>(null)
-  const [editingId, setEditingId] = useState<number>()
-  const [saveConflict, setSaveConflict] = useState(false)
-  const [statsOpen, setStatsOpen] = useState(true)
+  // View state (stats panel) lives in a persisted store so a reload restores
+  // the working context; see store/tagManagerView.ts.  Filter/sort/page are
+  // owned by useTagManagerImages, the active session by useTagManagerSessions.
+  const statsOpen = useTagManagerView((state) => state.statsOpen)
+  const setStatsOpen = useTagManagerView((state) => state.setStatsOpen)
   const [confirmDelete, setConfirmDelete] = useState(false)
 
+  // Page notices: a queue rendered as a vertical stack (info/success auto-
+  // dismiss, warning/danger stay).  Known backend error codes map to Chinese
+  // copy; see lib/tagManagerErrors.ts.
+  const { notices, push: pushNotice, dismiss: dismissNotice } = useNoticeQueue()
+  const fail = useCallback((error: unknown, fallback: string) => {
+    pushNotice('danger', describeTagManagerError(error, fallback))
+  }, [pushNotice])
+
+  // Session layer.  The cleanup callbacks only run on mutation success — long
+  // after render — so referring to `selection`/`editor`, which are initialised
+  // further down, is safe here.
+  const {
+    sessions,
+    session,
+    sessionReady,
+    activeId,
+    selectSession,
+    createMutation,
+    refreshMutation,
+    deleteMutation,
+    batchMutation,
+    undoMutation,
+    redoMutation,
+  } = useTagManagerSessions({
+    notify: pushNotice,
+    fail,
+    onSessionRemoved: () => {
+      selection.clear()
+      editor.closeEditor()
+    },
+    onSessionDataChanged: () => selection.clear(),
+  })
+
+  const {
+    images,
+    total,
+    totalPages,
+    page,
+    setPage,
+    filter,
+    sort,
+    setViewFilter,
+    setSort,
+    missingTags,
+    imagesReady,
+    imagesError,
+    retryImages,
+  } = useTagManagerImages({ activeId, sessionReady })
+  const selection = useImageSelection(images)
+  const { selectedIds, selectedIdList, toggle, selectAll, clear } = selection
+
+  const editor = useTagEditor({ activeId, images, imagesReady, page, totalPages, setPage, notify: pushNotice, fail })
+  const {
+    editingId,
+    editingIndex,
+    saveConflict,
+    syncToken,
+    saveRevision,
+    detail,
+    detailError,
+    retryDetail,
+    saving,
+    openImage,
+    closeEditor,
+    cancelPendingNavigate,
+    navigate,
+    save,
+    reload,
+  } = editor
+
   const roots = useQuery({ queryKey: ['roots'], queryFn: api.roots, staleTime: 60_000, retry: false })
-  const datasets = useQuery({
-    queryKey: ['tag-manager', 'datasets'],
-    queryFn: tagManagerApi.datasets,
-    refetchInterval: (query) => (query.state.data?.items.some((item) => item.status === 'indexing') ? 1500 : false),
-    retry: false,
-  })
-
-  const sessions = useMemo(() => datasets.data?.items ?? [], [datasets.data])
-  const sessionFromList = useMemo(
-    () => sessions.find((item) => item.id === activeId),
-    [sessions, activeId],
-  )
-  const activeQuery = useQuery({
-    queryKey: ['tag-manager', 'dataset', activeId],
-    queryFn: () => tagManagerApi.dataset(activeId as string),
-    enabled: Boolean(activeId),
-    refetchInterval: (query) => (query.state.data?.status === 'indexing' ? 1500 : false),
-  })
-  const session: TagManagerSession | undefined = activeQuery.data ?? sessionFromList
-  const sessionReady = session?.status === 'ready'
-
-  useEffect(() => {
-    if (!activeId && sessions.length > 0) setActiveId(sessions[0]?.id)
-  }, [activeId, sessions])
-
-  const previousStatus = useRef<string | undefined>(undefined)
-  useEffect(() => {
-    if (previousStatus.current === 'indexing' && session?.status === 'ready') {
-      void queryClient.invalidateQueries({ queryKey: ['tag-manager'] })
-    }
-    previousStatus.current = session?.status
-  }, [session?.status, queryClient])
-
-  const imagesQuery = useQuery({
-    queryKey: ['tag-manager', 'images', activeId, page, sort, filter],
-    queryFn: () => tagManagerApi.images(activeId as string, { offset: page * PAGE_SIZE, limit: PAGE_SIZE, sort, filter }),
-    enabled: Boolean(activeId) && sessionReady,
-    placeholderData: (previous) => previous,
-  })
-  const images = useMemo(() => imagesQuery.data?.items ?? [], [imagesQuery.data])
-  const total = imagesQuery.data?.total ?? 0
-  const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE))
-
-  // Tags on this page the offline dictionary does not cover and no on-demand
-  // translation has been saved for yet; feeding the 在线翻译 button.
-  const translationMemory = useTagTranslationMemory((state) => state.map)
-  const missingTags = useMemo(() => {
-    const seen = new Set<string>()
-    for (const image of images) {
-      for (const entry of image.tags) {
-        if (entry.translation) continue
-        const key = translationKey(entry.tag)
-        if (key && !seen.has(key) && !translationMemory[key]) seen.add(key)
-      }
-    }
-    return [...seen]
-  }, [images, translationMemory])
-
-  const detailQuery = useQuery({
-    queryKey: ['tag-manager', 'image', activeId, editingId],
-    queryFn: () => tagManagerApi.imageDetail(activeId as string, editingId as number),
-    enabled: Boolean(activeId) && editingId != null,
-  })
-
-  const fail = (error: unknown, fallback: string) =>
-    setNotice({ tone: 'danger', text: error instanceof ApiError ? error.message : fallback })
-
-  const createMutation = useMutation({
-    mutationFn: tagManagerApi.createDataset,
-    onSuccess: (created) => {
-      setActiveId(created.id)
-      const label = created.name || created.relative_path || '数据集'
-      setNotice({ tone: 'info', text: `会话「${label}」已创建，正在索引图片…` })
-      void queryClient.invalidateQueries({ queryKey: ['tag-manager', 'datasets'] })
-    },
-    onError: (error) => fail(error, '会话创建失败'),
-  })
-  const refreshMutation = useMutation({
-    mutationFn: (id: string) => tagManagerApi.refreshDataset(id),
-    onSuccess: (refreshed) => {
-      setNotice({ tone: 'info', text: '正在重新扫描数据集…' })
-      void queryClient.invalidateQueries({ queryKey: ['tag-manager', 'datasets'] })
-      void queryClient.invalidateQueries({ queryKey: ['tag-manager', 'dataset', refreshed.id] })
-    },
-    onError: (error) => fail(error, '重新扫描失败'),
-  })
-  const deleteMutation = useMutation({
-    mutationFn: (id: string) => tagManagerApi.deleteDataset(id),
-    onSuccess: () => {
-      setActiveId(undefined)
-      setSelectedIds(new Set())
-      setEditingId(undefined)
-      setNotice({ tone: 'success', text: '会话已删除' })
-      void queryClient.invalidateQueries({ queryKey: ['tag-manager', 'datasets'] })
-    },
-    onError: (error) => fail(error, '会话删除失败'),
-  })
-  const saveMutation = useMutation({
-    mutationFn: ({ imageId, content, expectedSidecarMtime }: {
-      imageId: number
-      content: TagManagerEditableContent
-      expectedSidecarMtime?: number | string
-    }) => tagManagerApi.updateImage(activeId as string, imageId, {
-      content,
-      expected_sidecar_mtime: expectedSidecarMtime ?? undefined,
-    }),
-    onSuccess: () => {
-      setSaveConflict(false)
-      setNotice({ tone: 'success', text: '标签已保存' })
-      void queryClient.invalidateQueries({ queryKey: ['tag-manager'] })
-    },
-    onError: (error) => {
-      if (error instanceof ApiError && error.code === 'sidecar_conflict') {
-        setSaveConflict(true)
-        return
-      }
-      fail(error, '标签保存失败')
-    },
-  })
-  const batchMutation = useMutation({
-    mutationFn: (body: TagManagerBatchRequest) => tagManagerApi.batch(activeId as string, body),
-    onSuccess: (result) => {
-      setSelectedIds(new Set())
-      setNotice({ tone: 'success', text: `批量操作完成，影响 ${result.affected} 张图片` })
-      void queryClient.invalidateQueries({ queryKey: ['tag-manager'] })
-    },
-    onError: (error) => fail(error, '批量操作失败'),
-  })
-  const undoMutation = useMutation({
-    mutationFn: (id: string) => tagManagerApi.undo(id),
-    onSuccess: () => {
-      setNotice({ tone: 'success', text: '已撤销上一次操作' })
-      void queryClient.invalidateQueries({ queryKey: ['tag-manager'] })
-    },
-    onError: (error) => fail(error, '撤销失败'),
-  })
-  const redoMutation = useMutation({
-    mutationFn: (id: string) => tagManagerApi.redo(id),
-    onSuccess: () => {
-      setNotice({ tone: 'success', text: '已重做操作' })
-      void queryClient.invalidateQueries({ queryKey: ['tag-manager'] })
-    },
-    onError: (error) => fail(error, '重做失败'),
-  })
 
   const actionsDisabled = !sessionReady
   // Editing writes sidecars in place, so only writable roots can host a dataset.
   const writableRoots = (roots.data?.items ?? []).filter((root) => root.writable)
 
+  // Filter/sort changes reset the page and cancel a pending cross-page
+  // navigation: the pending target belongs to the page being left.
   const setFilter = (next: ImageFilterState) => {
-    setFilterState(next)
+    cancelPendingNavigate()
+    setViewFilter(next)
     setPage(0)
   }
   const changeSort = (next: TagManagerSort) => {
+    cancelPendingNavigate()
     setSort(next)
     setPage(0)
   }
 
-  const toggleSelect = (imageId: number, index: number, modifiers: { shift: boolean; ctrl: boolean }) => {
-    setSelectedIds((current) => {
-      const next = new Set(current)
-      const anchor = selectionAnchor.current
-      if (modifiers.shift && anchor != null) {
-        const from = Math.min(anchor, index)
-        const to = Math.max(anchor, index)
-        for (let candidate = from; candidate <= to; candidate += 1) {
-          const item = images[candidate]
-          if (item) next.add(item.id)
-        }
-      } else if (next.has(imageId)) {
-        next.delete(imageId)
-      } else {
-        next.add(imageId)
-      }
-      return next
-    })
-    selectionAnchor.current = index
-  }
-
-  const selectAllPage = () => {
-    setSelectedIds((current) => {
-      const next = new Set(current)
-      images.forEach((image) => next.add(image.id))
-      return next
-    })
+  const toggleSelect = (image: TagManagerImageSummary, _index: number, modifiers: { shift: boolean; ctrl: boolean }) => {
+    toggle(image, modifiers)
   }
 
   const addToIncludeFilter = (tag: string) => {
     if (filter.includeTags.includes(tag)) return
     setFilter({ ...filter, includeTags: [...filter.includeTags, tag] })
   }
-
-  const selectedIdList = useMemo(() => [...selectedIds], [selectedIds])
-  const closeEditor = () => {
-    setEditingId(undefined)
-    setSaveConflict(false)
+  const addToExcludeFilter = (tag: string) => {
+    if (filter.excludeTags.includes(tag)) return
+    setFilter({ ...filter, excludeTags: [...filter.excludeTags, tag] })
   }
+
+  // Stable per-session loader: `useCallback` keyed on the session id keeps the
+  // grid's thumbnail effects from rerunning on unrelated parent renders.
+  const loadThumbnail = useCallback(
+    (imageId: number) => tagManagerApi.thumbnailBlob(activeId as string, imageId),
+    [activeId],
+  )
 
   return <div className="page page-tag-manager">
     <div className="page-heading">
@@ -254,10 +155,12 @@ export function TagManager() {
       </div>
     </div>
 
-    {notice && <Notice tone={notice.tone}>
-      {notice.text}
-      <button type="button" className="icon-button icon-button-quiet" aria-label="关闭提示" onClick={() => setNotice(null)}><X size={15} /></button>
-    </Notice>}
+    {notices.length > 0 && <div className="tm-notices">
+      {notices.map((entry) => <Notice key={entry.id} tone={entry.tone}>
+        {entry.text}
+        <button type="button" className="icon-button icon-button-quiet" aria-label="关闭提示" onClick={() => dismissNotice(entry.id)}><X size={15} /></button>
+      </Notice>)}
+    </div>}
 
     <SessionBar
       sessions={sessions}
@@ -271,11 +174,10 @@ export function TagManager() {
       redoPending={redoMutation.isPending}
       actionsDisabled={actionsDisabled}
       onSelect={(id) => {
-        setActiveId(id)
-        setSelectedIds(new Set())
+        selectSession(id)
+        clear()
         setPage(0)
-        setEditingId(undefined)
-        setSaveConflict(false)
+        closeEditor()
       }}
       onCreate={(body) => createMutation.mutate(body)}
       onRefresh={() => session && refreshMutation.mutate(session.id)}
@@ -287,30 +189,36 @@ export function TagManager() {
     <div className="tm-layout">
       <div className="tm-main">
         <Panel title="筛选与排序" eyebrow="FILTER">
-          <FilterBar filter={filter} sort={sort} disabled={!sessionReady} onChange={setFilter} onSortChange={changeSort} />
+          <FilterBar
+            filter={filter}
+            sort={sort}
+            profile={session?.profile ?? 'e621'}
+            disabled={!sessionReady}
+            onChange={setFilter}
+            onSortChange={changeSort}
+          />
           <TagDisplayBar profile={session?.profile ?? 'e621'} missingTags={missingTags} />
         </Panel>
         <Panel
           title="图片"
           eyebrow="IMAGES"
           actions={<>
-            <Button size="sm" variant="quiet" icon={<ListChecks size={14} />} disabled={images.length === 0} onClick={selectAllPage}>全选本页</Button>
+            <Button size="sm" variant="quiet" icon={<ListChecks size={14} />} disabled={images.length === 0} onClick={selectAll}>全选本页</Button>
             <span className="panel-count">{images.length > 0 ? `${images.length} / ${total}` : '0'}</span>
           </>}
         >
           <ImageGrid
             images={images}
-            thumbnailUrl={(image) => tagManagerThumbnailUrl(activeId ?? '', image.id)}
+            loadThumbnail={loadThumbnail}
             selectedIds={selectedIds}
             editingId={editingId}
-            onToggleSelect={(image, index, modifiers) => toggleSelect(image.id, index, modifiers)}
-            onOpen={(image) => {
-              setEditingId(image.id)
-              setSaveConflict(false)
-            }}
-            empty={session && !sessionReady
-              ? <div className="tm-grid-loading"><LoaderCircle className="spin" size={18} aria-hidden="true" /><span>{session.status === 'indexing' ? '正在索引图片，请稍候…' : session.error || '会话不可用'}</span></div>
-              : <EmptyState icon={<Images size={22} />} title="没有匹配的图片" detail="调整筛选条件，或先创建并打开一个会话。" />}
+            onToggleSelect={toggleSelect}
+            onOpen={(image) => openImage(image.id)}
+            empty={imagesError
+              ? <EmptyState icon={<Images size={22} />} title="图片列表加载失败" detail="请重试，或检查当前会话。" action={<Button variant="secondary" onClick={retryImages}>重试</Button>} />
+              : session && !sessionReady
+                ? <div className="tm-grid-loading"><LoaderCircle className="spin" size={18} aria-hidden="true" /><span>{session.status === 'indexing' ? '正在索引图片，请稍候…' : session.error || '会话不可用'}</span></div>
+                : <EmptyState icon={<Images size={22} />} title="没有匹配的图片" detail="调整筛选条件，或先创建并打开一个会话。" />}
           />
           <div className="tm-pagination">
             <Button size="sm" variant="secondary" disabled={page === 0} onClick={() => setPage(page - 1)}>上一页</Button>
@@ -321,7 +229,9 @@ export function TagManager() {
       </div>
 
       <div className="tm-side">
-        {selectedIds.size > 0 && <BatchBar
+        {/* Always mounted once the session is ready: the whole point of the
+            filter scope is running a batch without selecting anything first. */}
+        {sessionReady && <BatchBar
           profile={session?.profile ?? 'e621'}
           filter={filter}
           selectedIds={selectedIdList}
@@ -336,33 +246,46 @@ export function TagManager() {
           actions={<Button size="sm" variant="quiet" icon={statsOpen ? <X size={14} /> : <ChartColumn size={14} />} aria-expanded={statsOpen} onClick={() => setStatsOpen(!statsOpen)}>{statsOpen ? '收起' : '展开'}</Button>}
         >
           {sessionReady && activeId
-            ? <StatsPanel sessionId={activeId} enabled={statsOpen} onTagClick={addToIncludeFilter} />
+            ? <StatsPanel
+                sessionId={activeId}
+                enabled={statsOpen}
+                onTagClick={addToIncludeFilter}
+                onTagExclude={addToExcludeFilter}
+              />
             : <EmptyState icon={<Tags size={20} />} title="等待会话就绪" detail="会话索引完成后可查看标签统计。" />}
         </Panel>
       </div>
     </div>
 
-    {editingId != null && activeId && (detailQuery.data
+    {editingId != null && activeId && (detail
       ? <EditorDrawer
-          key={`${editingId}:${detailQuery.data.sidecar_mtime ?? 'none'}`}
-          detail={detailQuery.data}
+          // Deliberately NOT keyed by sidecar_mtime: remounting after each
+          // save reset the draft, scroll and focus mid-review. The draft syncs
+          // from the detail query only when the image id changes.
+          key={`image:${editingId}`}
+          detail={detail}
           profile={session?.profile ?? 'e621'}
-          saving={saveMutation.isPending}
+          saving={saving}
           conflict={saveConflict}
+          // Page edges chain into the adjacent page (pendingNavigate): the
+          // first image of a page has a "previous" when page > 0, the last one
+          // has a "next" when further pages exist.  When the editing id is
+          // temporarily absent from the page (filter change, cross-page load)
+          // both directions stay disabled until the state settles.
+          hasPrev={editingIndex > 0 || (editingIndex === 0 && page > 0)}
+          hasNext={editingIndex >= 0 && (editingIndex < images.length - 1 || page < totalPages - 1)}
           onClose={closeEditor}
-          onSave={(content) => saveMutation.mutate({
-            imageId: editingId,
-            content,
-            expectedSidecarMtime: detailQuery.data.sidecar_mtime ?? undefined,
-          })}
-          onReload={() => {
-            setSaveConflict(false)
-            void queryClient.invalidateQueries({ queryKey: ['tag-manager', 'image', activeId, editingId] })
-          }}
+          onNavigate={navigate}
+          onSave={save}
+          onReload={reload}
+          syncToken={syncToken}
+          saveRevision={saveRevision}
         />
       : <DialogLayer onClose={closeEditor}>
-          <div className="tm-drawer drawer" role="dialog" aria-modal="true" aria-label="正在加载图片">
-            <div className="tm-drawer-loading"><LoaderCircle className="spin" size={20} aria-hidden="true" /><span>正在加载图片内容…</span></div>
+          <div className="tm-drawer drawer" role="dialog" aria-modal="true" aria-label={detailError ? '图片内容加载失败' : '正在加载图片'}>
+            {detailError
+              ? <EmptyState title="图片内容加载失败" detail="请重试或关闭编辑器。" action={<><Button variant="secondary" onClick={retryDetail}>重试</Button><Button variant="quiet" onClick={closeEditor}>关闭</Button></>} />
+              : <div className="tm-drawer-loading"><LoaderCircle className="spin" size={20} aria-hidden="true" /><span>正在加载图片内容…</span></div>}
           </div>
         </DialogLayer>)}
 
