@@ -1,8 +1,8 @@
 """Produce clean, compacted copies of the local wiki databases for packaging.
 
-The release ships the fully built wiki databases (pages, chunks, embeddings
-and the generated Chinese summaries) so end users never have to rebuild the
-corpus. The copies are produced with SQLite ``VACUUM INTO``: self-contained
+The release ships the fully built wiki databases (pages, chunks, summaries
+and the generated high-frequency tag catalog) so end users never have to
+rebuild the corpus. The copies are produced with SQLite ``VACUUM INTO``: self-contained
 (no ``-wal``/``-shm`` sidecar files), defragmented and consistent even when
 the application currently holds the databases open.
 """

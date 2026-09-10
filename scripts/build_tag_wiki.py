@@ -164,7 +164,7 @@ async def _main(args: argparse.Namespace) -> int:
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--status", action="store_true", help="print the wiki status document and exit")
-    parser.add_argument("--build", action="store_true", help="download/import the wiki dump and build the vector index")
+    parser.add_argument("--build", action="store_true", help="download/import the wiki dump and refresh the corpus (browse catalog is a separate build_tag_wiki_catalog.py step)")
     parser.add_argument(
         "--profile",
         choices=["e621", "danbooru"],

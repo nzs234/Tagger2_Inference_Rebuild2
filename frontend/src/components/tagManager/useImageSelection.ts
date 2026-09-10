@@ -34,23 +34,32 @@ export function useImageSelection(images: TagManagerImageSummary[]) {
     image: TagManagerImageSummary,
     modifiers: { shift: boolean; ctrl: boolean },
   ) => {
-    setSelectedIds((current) => {
-      const next = new Set(current)
-      const anchor = anchorRef.current
-      if (modifiers.shift && anchor != null) {
-        const anchorIndex = indexOfId(anchor)
-        const targetIndex = indexOfId(image.id)
-        if (anchorIndex !== -1 && targetIndex !== -1) {
-          const from = Math.min(anchorIndex, targetIndex)
-          const to = Math.max(anchorIndex, targetIndex)
+    // The anchor must be read synchronously, BEFORE this click overwrites it:
+    // React defers state updaters, so an anchor read inside the updater would
+    // already see the just-clicked id and every shift-range would degenerate
+    // into a plain toggle of the clicked card.
+    const anchor = anchorRef.current
+    if (modifiers.shift && anchor != null) {
+      const anchorIndex = indexOfId(anchor)
+      const targetIndex = indexOfId(image.id)
+      if (anchorIndex !== -1 && targetIndex !== -1) {
+        const from = Math.min(anchorIndex, targetIndex)
+        const to = Math.max(anchorIndex, targetIndex)
+        setSelectedIds((current) => {
+          const next = new Set(current)
           for (let candidate = from; candidate <= to; candidate += 1) {
             const item = images[candidate]
             if (item) next.add(item.id)
           }
           return next
-        }
-        // Unknown anchor (page changed): fall through to a plain toggle.
+        })
+        anchorRef.current = image.id
+        return
       }
+      // Unknown anchor (page changed): fall through to a plain toggle.
+    }
+    setSelectedIds((current) => {
+      const next = new Set(current)
       if (next.has(image.id)) next.delete(image.id)
       else next.add(image.id)
       return next

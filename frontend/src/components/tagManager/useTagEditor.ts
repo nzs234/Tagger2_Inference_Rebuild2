@@ -11,9 +11,9 @@ import type { NoticeTone } from './useNoticeQueue'
 
 export interface UseTagEditorOptions {
   activeId?: string
-  /** Current page images (the mirror kept by useTagManagerImages). */
+  /** Images of the current page key; empty while the fetched page still belongs to another key (placeholder window). */
   images: TagManagerImageSummary[]
-  /** True once the images query has data for the current page key (placeholder included). */
+  /** True only when `images` was fetched for the current session+page key (placeholder data excluded). */
   imagesReady: boolean
   page: number
   totalPages: number
@@ -35,13 +35,18 @@ export function useTagEditor({ activeId, images, imagesReady, page, totalPages, 
   const [editingId, setEditingId] = useState<number>()
   const [saveConflict, setSaveConflict] = useState(false)
   const [saveRevision, setSaveRevision] = useState(0)
+  // Bumped on every failed save attempt (conflict included); the drawer uses
+  // it to drop the pending baseline of the failed attempt.
+  const [saveErrorToken, setSaveErrorToken] = useState(0)
   // Bumped on an explicit reload after a conflict; the drawer resyncs its
   // draft from the fresh detail once (normal refetches never clobber it).
   const [editorSync, setEditorSync] = useState(0)
   // Cross-page editor navigation: flipping past the page edge stores which end
-  // of the new page to open ('first'/'last'); the effect below consumes it as
-  // soon as the flipped-to page's images arrive.
-  const pendingNavigate = useRef<'first' | 'last' | null>(null)
+  // of the new page to open ('first'/'last') plus the session and page it was
+  // created for; the effect below consumes it as soon as that page's images
+  // arrive.  The stamp keeps a placeholder window (previous session/page still
+  // mirrored) from resolving the target against the wrong image list.
+  const pendingNavigate = useRef<{ end: 'first' | 'last'; sessionId: string; page: number } | null>(null)
 
   // Position of the editing image on the current page; -1 when not open.
   const editingIndex = editingId == null ? -1 : images.findIndex((image) => image.id === editingId)
@@ -58,13 +63,18 @@ export function useTagEditor({ activeId, images, imagesReady, page, totalPages, 
   // neither consume nor cancel the pending target.  The drawer tolerates the
   // transient editingIndex === -1 state by simply disabling its nav buttons.
   useEffect(() => {
-    if (pendingNavigate.current == null || !imagesReady || images.length === 0) return
-    const target = pendingNavigate.current === 'first' ? images[0] : images[images.length - 1]
+    const pending = pendingNavigate.current
+    if (!pending || !imagesReady || images.length === 0) return
     pendingNavigate.current = null
+    // The target belongs to the session/page it was created for: a session
+    // switch (create, auto-fallback, delete) or manual pagination in the
+    // meantime invalidates it instead of opening a surprise image.
+    if (pending.sessionId !== activeId || pending.page !== page) return
+    const target = pending.end === 'first' ? images[0] : images[images.length - 1]
     if (!target) return
     setEditingId(target.id)
     setSaveConflict(false)
-  }, [images, imagesReady])
+  }, [images, imagesReady, activeId, page])
 
   const openImage = (imageId: number) => {
     setEditingId(imageId)
@@ -96,7 +106,10 @@ export function useTagEditor({ activeId, images, imagesReady, page, totalPages, 
       queryClient.setQueryData(
         ['tag-manager', 'image', activeId, result.image_id],
         (current: TagManagerImageDetail | undefined) => current
-          ? { ...current, sidecar_mtime: result.sidecar_mtime }
+          // A response without a usable mtime must never regress the cached
+          // expectation: the next consecutive save would then send the stale
+          // (or a wiped) mtime and either falsely conflict or skip the check.
+          ? { ...current, sidecar_mtime: result.sidecar_mtime ?? current.sidecar_mtime }
           : current,
       )
       notify('success', '标签已保存')
@@ -120,12 +133,13 @@ export function useTagEditor({ activeId, images, imagesReady, page, totalPages, 
           const nextPage = page + delta
           if (nextPage >= 0 && nextPage < totalPages) {
             setPage(nextPage)
-            pendingNavigate.current = delta === 1 ? 'first' : 'last'
+            pendingNavigate.current = { end: delta === 1 ? 'first' : 'last', sessionId, page: nextPage }
           }
         }
       }
     },
     onError: (error) => {
+      setSaveErrorToken((token) => token + 1)
       if (error instanceof ApiError && error.code === 'sidecar_conflict') {
         setSaveConflict(true)
         return
@@ -147,7 +161,7 @@ export function useTagEditor({ activeId, images, imagesReady, page, totalPages, 
     const nextPage = page + delta
     if (nextPage < 0 || nextPage >= totalPages) return
     setPage(nextPage)
-    pendingNavigate.current = delta === 1 ? 'first' : 'last'
+    pendingNavigate.current = { end: delta === 1 ? 'first' : 'last', sessionId: activeId as string, page: nextPage }
   }
 
   /** Save the drawer's draft; the expected mtime comes from the loaded detail. */
@@ -181,6 +195,7 @@ export function useTagEditor({ activeId, images, imagesReady, page, totalPages, 
     saveConflict,
     syncToken,
     saveRevision,
+    saveErrorToken,
     detail: detailQuery.data,
     detailError: detailQuery.isError,
     retryDetail: () => { void detailQuery.refetch() },

@@ -28,7 +28,7 @@
 打包时通过 SQLite `VACUUM INTO` 生成干净紧凑的快照（scripts/snapshot_wiki_databases.py），
 解压即用、无需重建语料。两个库同时携带维护端生成的高频标签目录（`catalog_*` 表，仅收录
 `post_count >= 100` 的标签，由 `scripts/build_tag_wiki_catalog.py` 生成）；打包脚本会校验目录
-完整并在冒烟测试中验证 Tag Wiki 页面可用。
+完整并在冒烟测试中验证 Tag Wiki 目录与 Tag Manager 数据集只读端点可用。
 发行包的 `config/app.toml` 在打包阶段强制 `frozen = true`：Wiki 构建/重建/翻译入口对最终用户关闭
 （后端 403、前端隐藏维护面板），数据维护由发布者完成后随包分发。
 说明：V1.10.4 及更早版本的包曾内置向量库并单独提供 Qwen3 嵌入模型权重资产用于本地语义检索；
@@ -50,7 +50,7 @@
 - `runtime_ocr/`、PaddleOCR 模型缓存和 OCR 资源描述：这些文件体积较大，且描述中可能含
   原机器的绝对路径。需要 OCR 时，请按项目文档单独安装隔离 OCR 运行时并注册本机资源。
 
-以下历史说明适用于旧版 V1.04.1，并非 1.10.3 的当前版本上下文。1.10.3 包内容与资源策略以上文的 Tag Wiki 快照、workflow manifest、迁移和限制说明为准。
+以下历史说明适用于旧版 V1.04.1，并非 1.10.5 的当前版本上下文。1.10.5 包内容与资源策略以上文的 Tag Wiki 快照、workflow manifest、迁移和限制说明为准。
 
 V1.04.1 延续 V1.03 的上游固定基线 `ccc9d07497be637fc097c5da009d791f017144c9`。Replacement
 保留上游的随机 `anthro` → `furry` 规则；调用方按 `job_id + sample_id +

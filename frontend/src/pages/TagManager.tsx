@@ -1,6 +1,6 @@
 import { useQuery } from '@tanstack/react-query'
 import { ChartColumn, Images, ListChecks, LoaderCircle, Tags, X } from 'lucide-react'
-import { useCallback, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { BatchBar } from '../components/tagManager/BatchBar'
 import { EditorDrawer } from '../components/tagManager/EditorDrawer'
 import { FilterBar } from '../components/tagManager/FilterBar'
@@ -67,6 +67,7 @@ export function TagManager() {
 
   const {
     images,
+    pageImages,
     total,
     totalPages,
     page,
@@ -83,13 +84,14 @@ export function TagManager() {
   const selection = useImageSelection(images)
   const { selectedIds, selectedIdList, toggle, selectAll, clear } = selection
 
-  const editor = useTagEditor({ activeId, images, imagesReady, page, totalPages, setPage, notify: pushNotice, fail })
+  const editor = useTagEditor({ activeId, images: pageImages, imagesReady, page, totalPages, setPage, notify: pushNotice, fail })
   const {
     editingId,
     editingIndex,
     saveConflict,
     syncToken,
     saveRevision,
+    saveErrorToken,
     detail,
     detailError,
     retryDetail,
@@ -101,6 +103,19 @@ export function TagManager() {
     save,
     reload,
   } = editor
+
+  // Any change of the active session — manual switch, create, the automatic
+  // fallback after a deletion or a stale restored id — starts a new working
+  // context.  Grid selection, the editor and the page are session-scoped
+  // state and must never leak into the next session.
+  const lastActiveIdRef = useRef(activeId)
+  useEffect(() => {
+    if (lastActiveIdRef.current === activeId) return
+    lastActiveIdRef.current = activeId
+    selection.clear()
+    editor.closeEditor()
+    setPage(0)
+  }, [activeId, selection, editor, setPage])
 
   const roots = useQuery({ queryKey: ['roots'], queryFn: api.roots, staleTime: 60_000, retry: false })
 
@@ -273,13 +288,14 @@ export function TagManager() {
           // temporarily absent from the page (filter change, cross-page load)
           // both directions stay disabled until the state settles.
           hasPrev={editingIndex > 0 || (editingIndex === 0 && page > 0)}
-          hasNext={editingIndex >= 0 && (editingIndex < images.length - 1 || page < totalPages - 1)}
+          hasNext={editingIndex >= 0 && (editingIndex < pageImages.length - 1 || page < totalPages - 1)}
           onClose={closeEditor}
           onNavigate={navigate}
           onSave={save}
           onReload={reload}
           syncToken={syncToken}
           saveRevision={saveRevision}
+          saveErrorToken={saveErrorToken}
         />
       : <DialogLayer onClose={closeEditor}>
           <div className="tm-drawer drawer" role="dialog" aria-modal="true" aria-label={detailError ? '图片内容加载失败' : '正在加载图片'}>

@@ -96,7 +96,7 @@ Tagger2 Inference Rebuild 将本地 Caption 模型、在线视觉模型、多供
 5. 等待便携 Python 和锁定依赖安装完成，浏览器访问 `http://127.0.0.1:20000`。
 6. 以后启动只需双击 `start.bat`。
 
-发行包内置基础 Python 3.12 运行时和已经构建的前端，不要求目标电脑预装 Python 或 Node.js。首次安装机器学习依赖需要联网，下载量可能达到数 GB。**模型类资源一律不随包**（嵌入模型、数据集分类快照、Tokenizer 等）：在首次使用时自动下载并校验 SHA-256 指纹；也可以提前运行 `runtime\python.exe scripts\fetch_workflow_resources.py` 预取数据集资源。
+发行包内置基础 Python 3.12 运行时和已经构建的前端，不要求目标电脑预装 Python 或 Node.js。首次安装机器学习依赖需要联网，下载量可能达到数 GB。**模型类资源一律不随包**（数据集分类快照、Tokenizer 等）：在首次使用时自动下载并校验 SHA-256 指纹；也可以提前运行 `runtime\python.exe scripts\fetch_workflow_resources.py` 预取数据集资源。
 
 V1.04.1 起，`setup.bat` 会检查 pip 是否真正可用，并在基础运行时中自动执行随包附带的 pip 引导；`start.bat` 也提供相同兜底。首次部署不需要手动安装 pip。
 
@@ -310,7 +310,7 @@ Count Review 确认后只叠加人工 count，再执行 Policy；Token Review �
 
 本地化的 e621 / Danbooru 标签百科目录，支持按分类浏览高频标签、模糊搜索、中文摘要与关联标签。页面右上角可切换语料库；构建完成的 Wiki 数据库随发行包分发，解压即用。完整说明见 [docs/tag_wiki.md](docs/tag_wiki.md)。
 
-- **本地数据**：e621 wiki 正文来自官方 `db_export` 的 `wiki_pages` 每日导出（约 17 MB），应用内一键下载入库到 `data/tag_wiki/tag_wiki.sqlite3`；Danbooru 语料自 V1.10.1 起随包提供（也可用 `scripts/fetch_danbooru_wiki.py` 经官方 API 增量抓取）。tag 类别、post_count、别名与 implications 复用分类快照资源。
+- **本地数据**：e621 wiki 正文来自官方 `db_export` 的 `wiki_pages` 每日导出（约 17 MB），由维护端 `scripts/build_tag_wiki.py --build` 下载入库到 `data/tag_wiki/tag_wiki.sqlite3`（发行包内的 Wiki 数据库已预先构建，无需重建语料）；Danbooru 语料自 V1.10.1 起随包提供（也可用 `scripts/fetch_danbooru_wiki.py` 经官方 API 增量抓取）。tag 类别、post_count、别名与 implications 复用分类快照资源。
 - **目录查询**：按官方分类与二级语义组浏览高频标签，支持名称、别名、前缀和包含匹配；打开词条可查看中文摘要、热度与关联标签。
 - **中文摘要**：维护端为高频标签生成结构化中文摘要，发行包中的目录与摘要只读。
 - **快捷入口**：标签管理器与工作台的标签药丸上有“查 Wiki”按钮，弹出抽屉直接查看该标签的中文释义与搭配。
@@ -431,8 +431,11 @@ gpu_concurrency = 1
 allow_unsafe_pickle = false
 
 [tag_wiki]
-# 「高频标签」目录构建范围默认阈值
-min_post_count = 100
+# 「高频标签」翻译范围 post_count 阈值的默认值
+# （目录构建阈值不在此配置，由维护端 CLI --min-post-count 指定，默认 100）
+min_post_count = 1000
+# 成品包只读模式：true 时 /build 与 /translate 端点返回 403
+frozen = false
 ```
 
 ### 重要安全约束
@@ -563,7 +566,7 @@ CI 会从固定提交检出上游项目，并执行完整后端、前端和 Play
 Tagger2_Inference_Rebuild2/
 ├─ backend/tagger2/          FastAPI 服务、模型运行时、任务与安全模块
 │  ├─ image_generation/      多供应商图像请求、能力表、持久任务与产物校验
-│  ├─ tag_wiki/              本地 e621 标签百科：导入、混合检索、中文摘要
+│  ├─ tag_wiki/              本地 e621 / Danbooru 标签百科：导入、目录检索、中文摘要
 │  └─ workflow/              数据集工作流、数据库、stage、review 与 commit
 ├─ backend/tests/            后端单元、集成、恢复、安全和规模测试
 ├─ frontend/src/             React 用户界面

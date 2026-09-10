@@ -133,7 +133,7 @@ function applyWriteStyle(
  * are lost mid-review. A `syncToken` bump forces the draft back to the
  * server content (explicit reload after a conflict).
  */
-export function EditorDrawer({ detail, profile, saving, conflict, hasPrev, hasNext, onClose, onNavigate, onSave, onReload, syncToken, saveRevision }: {
+export function EditorDrawer({ detail, profile, saving, conflict, hasPrev, hasNext, onClose, onNavigate, onSave, onReload, syncToken, saveRevision, saveErrorToken }: {
   detail: TagManagerImageDetail
   profile: TagManagerProfile
   saving: boolean
@@ -146,6 +146,7 @@ export function EditorDrawer({ detail, profile, saving, conflict, hasPrev, hasNe
   onReload: () => void
   syncToken?: string | number
   saveRevision?: number
+  saveErrorToken?: number
 }) {
   const [draft, setDraft] = useState<TagManagerImageContent>(() => detail.content)
   // Clean baseline for the dirty guard; it is updated only after the parent
@@ -182,6 +183,14 @@ export function EditorDrawer({ detail, profile, saving, conflict, hasPrev, hasNe
     setBaseline(pendingBaseline.current)
     pendingBaseline.current = null
   }, [saveRevision])
+
+  // A failed save attempt (network error or sidecar conflict) must never let
+  // its in-flight draft become the baseline: drop the pending baseline so the
+  // draft stays dirty and only a fresh successful save can bless it.
+  useEffect(() => {
+    if (saveErrorToken == null) return
+    pendingBaseline.current = null
+  }, [saveErrorToken])
 
   const editable = draft.kind === 'tag_txt' || draft.kind === 'tags_json' || draft.kind === 'standard_json'
   const requestNav = (target: 'close' | 'prev' | 'next') => {

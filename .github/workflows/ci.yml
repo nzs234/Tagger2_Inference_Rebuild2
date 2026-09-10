@@ -62,5 +62,7 @@ jobs:
       - name: Browser tests
         working-directory: frontend
         run: |
-          npx playwright install --with-deps chromium
+          # playwright.config.ts runs with channel: 'chrome' — install Google
+          # Chrome itself, not the bundled chromium build.
+          npx playwright install --with-deps chrome
           npm run test:e2e

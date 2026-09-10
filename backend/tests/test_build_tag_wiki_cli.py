@@ -177,11 +177,19 @@ def _install_fake_service(monkeypatch: pytest.MonkeyPatch, service: FakeWikiServ
 
 def test_skip_reindex_help_documents_real_semantics() -> None:
     """The help text no longer implies only dump parsing is skipped: the dump
-    refresh check, pruning, model check and vector pass still run."""
+    refresh check and the pruning sweep still run."""
     module = _load_cli_module()
     help_text = module._build_parser().format_help()
     assert "skip re-importing the dump" in help_text
     assert "--no-download" in help_text
+
+
+def test_build_help_does_not_advertise_retired_vector_index() -> None:
+    """The vector index was retired; --build must not claim to build one."""
+    module = _load_cli_module()
+    help_text = module._build_parser().format_help()
+    assert "vector" not in help_text.lower()
+    assert "build_tag_wiki_catalog" in help_text
 
 
 @pytest.mark.parametrize(

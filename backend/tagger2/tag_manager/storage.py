@@ -21,9 +21,18 @@ from ..workflow.contracts import utc_now
 
 SCHEMA_VERSION = 1
 
+# Host parameters per chunked IN () query: a 2000-image batch must stay
+# inside SQLite's variable budget regardless of the build's compile limits.
+_SQL_PARAMETER_CHUNK = 500
+
 # SQLite side of ``canonical_tag_key``: the same lowercase underscore form
 # so a filter typed with spaces matches a sidecar written with underscores.
-_TAG_KEY_SQL = "REPLACE(LOWER(t.tag), ' ', '_')"
+# CASEFOLD is a scalar function registered on every connection (see
+# ``_register_sql_functions``): SQLite's built-in LOWER() folds ASCII only,
+# while the Python side of the rule (``canonical_tag_key``) casefolds full
+# Unicode, so filter and stats queries must fold through the same function
+# to agree with the normalized values the client sends.
+_TAG_KEY_SQL = "REPLACE(CASEFOLD(t.tag), ' ', '_')"
 
 
 def normalize_tag_key(tag: str) -> str:
@@ -34,6 +43,25 @@ def normalize_tag_key(tag: str) -> str:
     """
 
     return canonical_tag_key(tag)
+
+
+def _sql_casefold(value: Any) -> Any:
+    """``str.casefold`` exposed to SQLite (built-in LOWER is ASCII-only)."""
+
+    return value.casefold() if isinstance(value, str) else value
+
+
+def _register_sql_functions(conn: sqlite3.Connection) -> None:
+    """Register the Python-backed scalar functions every connection needs.
+
+    ``_TAG_KEY_SQL`` folds tag spellings through CASEFOLD so the SQL side of
+    the filter/stats normalization matches ``normalize_tag_key`` for
+    non-ASCII tags too.  File-backed connections are opened per operation,
+    so the registration rides along with the connection setup.
+    """
+
+    conn.create_function("CASEFOLD", 1, _sql_casefold, deterministic=True)
+
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -127,6 +155,7 @@ class TagManagerStore:
                 ":memory:", timeout=30.0, check_same_thread=False
             )
             self._memory_conn.row_factory = sqlite3.Row
+            _register_sql_functions(self._memory_conn)
             self._memory_conn.execute("PRAGMA foreign_keys=ON")
             self._memory_conn.execute("PRAGMA busy_timeout=30000")
             self._memory_conn.executescript(SCHEMA_SQL)
@@ -178,6 +207,7 @@ class TagManagerStore:
         else:
             conn = sqlite3.connect(self.db_path, timeout=30.0)
             conn.row_factory = sqlite3.Row
+            _register_sql_functions(conn)
             conn.execute("PRAGMA foreign_keys=ON")
             conn.execute("PRAGMA busy_timeout=30000")
             try:
@@ -353,6 +383,33 @@ class TagManagerStore:
                 (session_id, image_id),
             ).fetchone()
         return _image_dict(row) if row is not None else None
+
+    def get_images(
+        self, session_id: str, image_ids: Sequence[int]
+    ) -> dict[int, dict[str, Any]]:
+        """Fetch several indexed images in one chunked query, keyed by id.
+
+        Batch resolution must not pay a connection per id, so the ids are
+        fetched in ``_SQL_PARAMETER_CHUNK``-sized IN () queries (a 2000-image
+        batch would otherwise exceed the host-parameter budget one id at a
+        time).  Missing ids are simply absent from the result.
+        """
+
+        result: dict[int, dict[str, Any]] = {}
+        unique = list(dict.fromkeys(int(image_id) for image_id in image_ids))
+        for start in range(0, len(unique), _SQL_PARAMETER_CHUNK):
+            chunk = unique[start : start + _SQL_PARAMETER_CHUNK]
+            placeholders = ", ".join("?" for _ in chunk)
+            with self.connection() as conn:
+                rows = conn.execute(
+                    "SELECT * FROM dataset_images WHERE session_id = ?"
+                    f" AND id IN ({placeholders})",
+                    [session_id, *chunk],
+                ).fetchall()
+            for row in rows:
+                image = _image_dict(row)
+                result[int(image["id"])] = image
+        return result
 
     def list_images(
         self,

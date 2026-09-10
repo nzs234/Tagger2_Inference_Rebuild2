@@ -3,12 +3,19 @@ import { useEffect, useMemo, useState } from 'react'
 import {
   tagManagerApi,
   translationKey,
+  type ImageFilterState,
   type TagManagerImageSummary,
+  type TagManagerSort,
 } from '../../lib/tagManager'
 import { useTagManagerView } from '../../store/tagManagerView'
 import { useTagTranslationMemory } from '../../store/tagTranslationMemory'
 
 const PAGE_SIZE = 60
+
+/** Identity of one fetched page: session, page, sort and filter. */
+function pageKey(activeId: string | undefined, page: number, sort: TagManagerSort, filter: ImageFilterState): string {
+  return `${activeId ?? ''}|${page}|${sort}|${JSON.stringify(filter)}`
+}
 
 export interface UseTagManagerImagesOptions {
   activeId?: string
@@ -19,8 +26,13 @@ export interface UseTagManagerImagesOptions {
 /**
  * Paginated image list for the active session.  Page/sort/filter come from the
  * persisted view store; a local mirror of the fetched page keeps consumers
- * (grid selection, editor) stable between refetches, and a restored page
- * pointing past the last page is clamped as soon as a real result arrives.
+ * (grid selection) stable between refetches, and a restored page pointing past
+ * the last page is clamped as soon as a real result arrives.
+ *
+ * The fetched payload carries the key it was requested for, so a placeholder
+ * window (previous session/page still shown while the next page loads) is
+ * distinguishable from real data for the current key: `pageImages`/`imagesReady`
+ * only expose data that genuinely belongs to the current key.
  */
 export function useTagManagerImages({ activeId, sessionReady }: UseTagManagerImagesOptions) {
   const page = useTagManagerView((state) => state.page)
@@ -30,18 +42,28 @@ export function useTagManagerImages({ activeId, sessionReady }: UseTagManagerIma
   const setViewFilter = useTagManagerView((state) => state.setFilter)
   const setSort = useTagManagerView((state) => state.setSort)
 
+  const currentKey = pageKey(activeId, page, sort, filter)
   const [images, setImages] = useState<TagManagerImageSummary[]>([])
   const imagesQuery = useQuery({
     queryKey: ['tag-manager', 'images', activeId, page, sort, filter],
-    queryFn: () => tagManagerApi.images(activeId as string, { offset: page * PAGE_SIZE, limit: PAGE_SIZE, sort, filter }),
+    queryFn: async () => {
+      const result = await tagManagerApi.images(activeId as string, { offset: page * PAGE_SIZE, limit: PAGE_SIZE, sort, filter })
+      return { key: pageKey(activeId, page, sort, filter), result }
+    },
     enabled: Boolean(activeId) && sessionReady,
     placeholderData: (previous) => previous,
   })
-  // Keep a local mirror so the selection hook and the editor always see the
-  // latest page even between refetches; derived memos stay for translations.
-  const fetchedImages = useMemo(() => imagesQuery.data?.items ?? [], [imagesQuery.data])
-  useEffect(() => setImages(fetchedImages), [fetchedImages])
-  const total = imagesQuery.data?.total ?? 0
+  // Only a payload fetched for the current key counts; the placeholder (the
+  // previous key's data, kept visible in the grid meanwhile) does not.
+  const payload = imagesQuery.data
+  const currentPayload = payload && payload.key === currentKey ? payload.result : undefined
+  const fetchedImages = currentPayload?.items
+  // Keep a local mirror so the selection hook and the grid always see the
+  // latest fetched page even between refetches and across placeholder windows.
+  useEffect(() => {
+    if (fetchedImages) setImages(fetchedImages)
+  }, [fetchedImages])
+  const total = (currentPayload ?? payload?.result)?.total ?? 0
   const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE))
   // A restored page may point past the last page after the data changed; clamp
   // it as soon as a real page result (not a disabled query) is available.
@@ -65,7 +87,12 @@ export function useTagManagerImages({ activeId, sessionReady }: UseTagManagerIma
   }, [images, translationMemory])
 
   return {
+    /** Mirrored page for grid/selection: stays visible across placeholder windows. */
     images,
+    /** Images fetched for the current session+page key; empty while a placeholder window is open. */
+    pageImages: fetchedImages ?? [],
+    /** True when `pageImages` really belongs to the current session+page key. */
+    imagesReady: currentPayload != null,
     total,
     totalPages,
     page,
@@ -75,8 +102,6 @@ export function useTagManagerImages({ activeId, sessionReady }: UseTagManagerIma
     setViewFilter,
     setSort,
     missingTags,
-    /** True while the current page key has data (placeholder data included). */
-    imagesReady: imagesQuery.isSuccess,
     imagesError: imagesQuery.isError,
     retryImages: () => { void imagesQuery.refetch() },
   }

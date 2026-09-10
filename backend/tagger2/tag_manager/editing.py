@@ -573,6 +573,12 @@ class SessionEditor:
         session = require_session(self.store, session_id)
         require_writable_root(self.allowlist, session)
         with self._locks.exclusive(session_id):
+            # Re-check under the lock: delete_session serializes through the
+            # same lock, so the session row can vanish while this request
+            # waited between the fetch above and the acquisition.  The stale
+            # mapping must never drive the write span (it would journal into
+            # a deleted session and write sidecars for it).
+            session = require_session(self.store, session_id)
             return self._save_image_locked(session, image_id, edit)
 
     def _save_image_locked(
@@ -608,6 +614,17 @@ class SessionEditor:
         rendered = _render_edit(
             edit.content, _original_content_for_merge(before_text, kind)
         )
+        # Re-verify the optimistic-concurrency stamp immediately before the
+        # write: an external writer can land a change between the validation
+        # above and this write, and the write must only ever land on the
+        # bytes this save actually read.
+        if stat_mtime(sidecar_path) != current_mtime:
+            raise TagManagerError(
+                "sidecar changed since it was loaded",
+                code="sidecar_conflict",
+                status_code=409,
+                retryable=True,
+            )
         atomic_write_bytes(sidecar_path, rendered.encode("utf-8"))
         # Journal before the index refresh: if anything below fails, the entry
         # already covers the written sidecar, so undo can restore a consistent
@@ -671,6 +688,10 @@ class SessionEditor:
         session = require_session(self.store, session_id)
         require_writable_root(self.allowlist, session)
         with self._locks.exclusive(session_id):
+            # Same lock-window re-check as save_image: a concurrent
+            # delete_session between the fetch above and the acquisition must
+            # surface as 404, not as writes into a deleted session.
+            session = require_session(self.store, session_id)
             targets = self._resolve_targets(session_id, request)
             if not targets:
                 return {"affected": 0, "journal_id": None}
@@ -736,9 +757,18 @@ class SessionEditor:
         self, session_id: str, request: BatchOperationRequest
     ) -> list[dict[str, Any]]:
         if request.image_ids is not None:
+            # One chunked query instead of a lookup per id: a 2000-image batch
+            # would otherwise open one connection (and pay one index probe)
+            # per id before touching a single sidecar.
+            found = self.store.get_images(session_id, request.image_ids)
             targets = []
+            seen: set[int] = set()
             for image_id in request.image_ids:
-                image = self.store.get_image(session_id, image_id)
+                key = int(image_id)
+                if key in seen:
+                    continue  # belt-and-braces: the contract already deduped
+                seen.add(key)
+                image = found.get(key)
                 if image is None:
                     raise TagManagerError(
                         f"image {image_id} not found",
@@ -775,10 +805,21 @@ class SessionEditor:
         )
         if content.kind == "raw_e621_json":
             return None  # the index row is stale; never edit a read-only file
+        indexed_kind = str(image["sidecar_kind"])
+        if content.kind == "none" and indexed_kind != "none":
+            # The indexed sidecar vanished (or blanked) after the scan.  Never
+            # resurrect it as a degraded fresh document, and never trust the
+            # mtime comparison alone: an index row without a stamp would
+            # otherwise pass and write over the deletion.
+            raise TagManagerError(
+                "sidecar changed since it was indexed",
+                code="sidecar_conflict",
+                status_code=409,
+                retryable=True,
+            )
         # The sidecar on disk is authoritative for the format: a stale index
         # row must not render one format over another (e.g. tag_txt rendering
         # over a tags_json document the scan has not seen yet).
-        indexed_kind = str(image["sidecar_kind"])
         if content.kind != "none":
             effective_kind = content.kind
         elif indexed_kind in {"tag_txt", "tags_json", "standard_json"}:
@@ -825,6 +866,17 @@ class SessionEditor:
 
         if after_text == (before_text or ""):
             return None
+        # Re-verify against the stamp observed while reading: an external
+        # writer can land a change between the indexed-stamp check above and
+        # this write, and the write must only land on the bytes the batch
+        # actually parsed.
+        if stat_mtime(sidecar_path) != live_mtime:
+            raise TagManagerError(
+                "sidecar changed while the batch was running",
+                code="sidecar_conflict",
+                status_code=409,
+                retryable=True,
+            )
         atomic_write_bytes(sidecar_path, after_text.encode("utf-8"))
         change = {
             "image_id": int(image["id"]),
@@ -861,6 +913,9 @@ class SessionEditor:
     def undo(self, session_id: str) -> dict[str, Any]:
         require_session(self.store, session_id)
         with self._locks.exclusive(session_id):
+            # Lock-window re-check: a concurrent delete must surface as 404
+            # before any journal lookup, not as a misleading undo_empty.
+            require_session(self.store, session_id)
             entry = self.store.latest_journal_entry(session_id, undone=False)
             if entry is None:
                 raise TagManagerError(
@@ -877,6 +932,8 @@ class SessionEditor:
     def redo(self, session_id: str) -> dict[str, Any]:
         require_session(self.store, session_id)
         with self._locks.exclusive(session_id):
+            # Lock-window re-check, same as undo.
+            require_session(self.store, session_id)
             entry = self.store.latest_journal_entry(session_id, undone=True)
             if entry is None:
                 raise TagManagerError(

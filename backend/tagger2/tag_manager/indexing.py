@@ -46,6 +46,12 @@ logger = logging.getLogger("tagger2.tag_manager")
 
 SCAN_CHUNK = 500
 
+# Seconds an index scan waits for the session write lock before giving up and
+# recording error/session_busy on the session row.  A module constant so the
+# observability contract (a rescan that lost the lock race is visible to
+# clients polling the session) stays testable without a 10 s wait.
+INDEX_LOCK_TIMEOUT_SECONDS = 10.0
+
 # One indexed row as the incremental rescan baseline:
 # relative_path -> (image mtime, sidecar mtime, sidecar kind).
 IndexedRowState = tuple[float, float | None, str]
@@ -288,7 +294,7 @@ class SessionIndexer:
         # A bounded wait instead of a silent skip: a rescan that lost the race
         # against a short write still happens, while a stuck lock fails loudly
         # in the log rather than reporting a refresh that never ran.
-        if not lock.acquire(timeout=10):
+        if not lock.acquire(timeout=INDEX_LOCK_TIMEOUT_SECONDS):
             logger.warning(
                 "tag manager index busy for %s: another write or scan is"
                 " still holding the session lock",
@@ -389,12 +395,30 @@ class IndexScheduler:
         future.add_done_callback(functools.partial(self.finish, session_id))
 
     def discard(self, session_id: str) -> None:
-        """Drop the session's scan slot, cancelling a queued (not started) scan."""
+        """Drop the session's scan slot, cancelling a queued (not started) scan.
+
+        Safe to call from any thread: delete_session runs on a worker thread
+        once the API offloads it, and ``asyncio.Future.cancel`` is not
+        thread-safe, so the cancel is marshalled onto the loop that owns the
+        future.
+        """
 
         with self._guard:
             future = self._futures.pop(session_id, None)
-        if future is not None:
+        if future is None:
+            return
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        if running is not None and running is future.get_loop():
             future.cancel()
+            return
+        try:
+            future.get_loop().call_soon_threadsafe(future.cancel)
+        except RuntimeError:
+            # The owning loop is already closed: nothing can run the scan.
+            pass
 
     def finish(self, session_id: str, future: asyncio.Future[None]) -> None:
         """Forget a finished scan future and log any exception it escaped.
@@ -520,6 +544,7 @@ def _index_row(
 
 
 __all__ = [
+    "INDEX_LOCK_TIMEOUT_SECONDS",
     "SCAN_CHUNK",
     "CategoryResolver",
     "IndexScheduler",

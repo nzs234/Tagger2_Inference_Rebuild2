@@ -53,10 +53,21 @@ interface HarnessState {
   batchBodies: Array<Record<string, unknown>>
   undoCalls: number
   redoCalls: number
+  deleteCalls: number
   tagDbQueries: string[]
   imageQueries: string[]
   detail: TagManagerImageDetail
   patchConflict: boolean
+  /** When set, every PATCH fails with this envelope instead of succeeding. */
+  patchError: { code: string; message: string } | null
+  /** When set, PATCH responses hold until `release` is called (edit-during-save). */
+  patchGate: { release: () => void; hold: Promise<void> } | null
+  /** When set, the images list request fails. */
+  imagesError: boolean
+  /** When set, image detail GETs fail. */
+  detailError: boolean
+  /** Current sidecar mtime served by GET detail; a successful PATCH rewrites it. */
+  sidecarMtime: number
   thumbnailCalls: number[]
   /** When set, the next undo request fails with this error envelope. */
   undoError: { code: string; message: string } | null
@@ -74,9 +85,33 @@ function renderPage() {
   )
 }
 
+/** Manual release gate for holding a mutation response open mid-test. */
+function deferred(): { release: () => void; hold: Promise<void> } {
+  let release: () => void = () => {}
+  const hold = new Promise<void>((resolve) => {
+    release = resolve
+  })
+  return { release, hold }
+}
+
+/** Text of the heading stats ("<n> 图片 · <n> 已选"); the numbers sit inside
+ * <strong> children, so text-level queries cannot match them. */
+function headingStatsText(): string {
+  return (document.querySelector('.heading-stats') as HTMLElement | null)?.textContent ?? ''
+}
+
 function setupFetch(state: HarnessState) {
   const json = (body: unknown, status = 200) =>
     new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } })
+
+  const patchResult = async (imageId: number) => {
+    if (state.patchError) return json({ code: state.patchError.code, message: state.patchError.message }, 500)
+    if (state.patchConflict) return json({ code: 'sidecar_conflict', message: 'sidecar 在编辑期间被外部修改' }, 409)
+    // A real backend rewrites the sidecar and reports the new mtime; the next
+    // consecutive save must send exactly this value.
+    state.sidecarMtime += 5
+    return json({ image_id: imageId, journal_id: `j-${imageId}`, sidecar_kind: 'tag_txt', sidecar_mtime: state.sidecarMtime })
+  }
 
   return vi.spyOn(globalThis, 'fetch').mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = new URL(String(input), 'http://localhost')
@@ -98,12 +133,19 @@ function setupFetch(state: HarnessState) {
       if (method === 'POST') {
         const body = JSON.parse(init?.body as string) as Record<string, unknown>
         state.createBodies.push(body)
-        state.sessions = [{ ...session, name: String(body.name ?? 'cats') }]
-        return json(state.sessions[0], 202)
+        const created: TagManagerSession = {
+          ...session,
+          id: 'ds-2',
+          name: String(body.name ?? 'cats_v2'),
+          relative_path: String(body.relative_path ?? 'cats_v2'),
+          status: 'indexing',
+          image_count: 0,
+        }
+        state.sessions = [...state.sessions, created]
+        return json(created, 202)
       }
       return json({ items: state.sessions })
     }
-    if (/\/tag-manager\/datasets\/ds-1$/.test(path)) return json(state.sessions[0] ?? session)
     if (/\/tag-manager\/datasets\/ds-1\/refresh$/.test(path)) return json({ ...session, status: 'indexing' }, 202)
     if (/\/tag-manager\/datasets\/ds-1\/batch$/.test(path)) {
       state.batchBodies.push(JSON.parse(init?.body as string) as Record<string, unknown>)
@@ -121,21 +163,34 @@ function setupFetch(state: HarnessState) {
     if (/\/tag-manager\/datasets\/ds-1\/tags\/stats$/.test(path)) {
       return json({ items: [{ tag: 'solo', category: 'general', count: 3 }] })
     }
-    const thumbnailMatch = /\/tag-manager\/datasets\/ds-1\/images\/(\d+)\/thumbnail$/.exec(path)
+    const datasetMatch = /\/tag-manager\/datasets\/([^/]+)$/.exec(path)
+    if (datasetMatch) {
+      if (method === 'DELETE') {
+        state.deleteCalls += 1
+        state.sessions = state.sessions.filter((item) => item.id !== datasetMatch[1])
+        return json({ ok: true })
+      }
+      const found = state.sessions.find((item) => item.id === datasetMatch[1])
+      return json(found ?? session)
+    }
+    const thumbnailMatch = /\/tag-manager\/datasets\/[^/]+\/images\/(\d+)\/thumbnail$/.exec(path)
     if (thumbnailMatch) {
       state.thumbnailCalls.push(Number(thumbnailMatch[1]))
       return json({})
     }
-    const detailMatch = /\/tag-manager\/datasets\/ds-1\/images\/(\d+)$/.exec(path)
+    const detailMatch = /\/tag-manager\/datasets\/[^/]+\/images\/(\d+)$/.exec(path)
     if (detailMatch) {
       const imageId = Number(detailMatch[1])
       if (method === 'PATCH') {
         state.patchBodies.push(JSON.parse(init?.body as string) as Record<string, unknown>)
-        if (state.patchConflict) {
-          return json({ code: 'sidecar_conflict', message: 'sidecar 在编辑期间被外部修改' }, 409)
+        if (state.patchGate) {
+          const gate = state.patchGate
+          await gate.hold
+          return patchResult(imageId)
         }
-        return json({ image_id: imageId, journal_id: `j-${imageId}`, sidecar_kind: 'tag_txt' })
+        return patchResult(imageId)
       }
+      if (state.detailError) return json({ code: 'image_not_found', message: 'image missing' }, 500)
       // Every image shares the tag_txt detail shape; the drawer is keyed by
       // image id so navigating refetches the detail under a new key.
       const knownSummaries = [
@@ -143,10 +198,11 @@ function setupFetch(state: HarnessState) {
         ...(state.pagedPages ? [...state.pagedPages.first, ...state.pagedPages.second] : []),
       ]
       const summary = knownSummaries.find((item) => item.id === imageId) ?? imageItems[0]
-      return json({ ...state.detail, ...summary, tags: [{ tag: 'solo', category: 'general' }] })
+      return json({ ...state.detail, ...summary, tags: [{ tag: 'solo', category: 'general' }], sidecar_mtime: state.sidecarMtime })
     }
-    if (/\/tag-manager\/datasets\/ds-1\/images$/.test(path)) {
+    if (/\/tag-manager\/datasets\/[^/]+\/images$/.test(path)) {
       state.imageQueries.push(url.search)
+      if (state.imagesError) return json({ code: 'request_failed', message: 'list failed' }, 500)
       if (state.pagedPages) {
         const offset = Number(url.searchParams.get('offset') ?? '0')
         const items = offset === 0 ? state.pagedPages.first : state.pagedPages.second
@@ -169,10 +225,16 @@ describe('TagManager page', () => {
       batchBodies: [],
       undoCalls: 0,
       redoCalls: 0,
+      deleteCalls: 0,
       tagDbQueries: [],
       imageQueries: [],
       detail: { ...detail },
       patchConflict: false,
+      patchError: null,
+      patchGate: null,
+      imagesError: false,
+      detailError: false,
+      sidecarMtime: 1_725_148_800,
       thumbnailCalls: [],
       undoError: null,
       pagedPages: null,
@@ -215,8 +277,9 @@ describe('TagManager page', () => {
       recursive: true,
       name: 'cats_v2',
     })
+    // The created session gets its own id (ds-2) and becomes the active one.
     await waitFor(() => {
-      expect(screen.getByRole('combobox', { name: '现有会话' })).toHaveValue('ds-1')
+      expect(screen.getByRole('combobox', { name: '现有会话' })).toHaveValue('ds-2')
     })
   })
 
@@ -532,6 +595,7 @@ describe('TagManager page', () => {
     const dialog = await screen.findByRole('dialog', { name: 'a.png' })
     fireEvent.click(screen.getByRole('button', { name: '移除 solo' }))
     state.patchConflict = true
+    state.sidecarMtime = 1_999_999_999
     state.detail = {
       ...detail,
       content: { kind: 'tag_txt', tags: ['solo', 'long_hair', '1girl'] },
@@ -774,5 +838,280 @@ describe('TagManager page', () => {
 
     fireEvent.click(screen.getByRole('button', { name: '撤销' }))
     expect(await screen.findByText('Unknown backend failure')).toBeInTheDocument()
+  })
+
+  it('extends the selection with shift-click and toggles with ctrl-click', async () => {
+    setupFetch(state)
+    renderPage()
+    await screen.findByAltText('a.png')
+
+    // Plain click sets the range anchor, shift-click extends to the range.
+    fireEvent.click(screen.getByTitle('a.png'))
+    fireEvent.click(screen.getByTitle('c.png'), { shiftKey: true })
+    expect(screen.getByText('选中图片（3）')).toBeInTheDocument()
+    expect(screen.getByRole('checkbox', { name: '选择 b.png' })).toBeChecked()
+
+    // ctrl-click toggles one card out of the range without touching the rest.
+    fireEvent.click(screen.getByTitle('b.png'), { ctrlKey: true })
+    expect(screen.getByText('选中图片（2）')).toBeInTheDocument()
+    expect(screen.getByRole('checkbox', { name: '选择 b.png' })).not.toBeChecked()
+    expect(screen.getByRole('checkbox', { name: '选择 a.png' })).toBeChecked()
+  })
+
+  it('keeps the selection across pages and shift-clicks plainly after a page flip', async () => {
+    const pageTwo: TagManagerImageSummary[] = [
+      summary(101, 'd.png', 'tag_txt', 2),
+      summary(102, 'e.png', 'tags_json', 3),
+      summary(103, 'f.png', 'standard_json', 1),
+    ]
+    state.pagedPages = { first: imageItems, second: pageTwo, total: 61 }
+    setupFetch(state)
+    renderPage()
+    await screen.findByAltText('a.png')
+
+    // The anchor is a.png; the page flip drops it (page composition changed)
+    // but the selection itself persists across pages.
+    fireEvent.click(screen.getByTitle('a.png'))
+    fireEvent.click(screen.getByRole('button', { name: '下一页' }))
+    await screen.findByAltText('d.png')
+
+    // A stale-anchor shift-click must be a plain toggle, never a wrong range.
+    fireEvent.click(screen.getByTitle('f.png'), { shiftKey: true })
+    expect(screen.getByText('选中图片（2）')).toBeInTheDocument()
+    expect(screen.getByRole('checkbox', { name: '选择 d.png' })).not.toBeChecked()
+    expect(screen.getByRole('checkbox', { name: '选择 e.png' })).not.toBeChecked()
+    expect(screen.getByRole('checkbox', { name: '选择 f.png' })).toBeChecked()
+  })
+
+  it('clears the grid selection after a batch operation completes', async () => {
+    setupFetch(state)
+    renderPage()
+    await screen.findByAltText('a.png')
+
+    fireEvent.click(screen.getByRole('checkbox', { name: '选择 a.png' }))
+    expect(screen.getByText('选中图片（1）')).toBeInTheDocument()
+    const tagInput = screen.getByRole('combobox', { name: '批量标签' })
+    fireEvent.change(tagInput, { target: { value: '1g' } })
+    await screen.findByRole('option', { name: /1girl/ })
+    fireEvent.keyDown(tagInput, { key: 'Enter' })
+    fireEvent.click(screen.getByRole('button', { name: '执行' }))
+    fireEvent.click(screen.getByRole('button', { name: '确认执行' }))
+
+    await waitFor(() => expect(state.batchBodies).toHaveLength(1))
+    await waitFor(() => expect(screen.getByText('选中图片（0）')).toBeInTheDocument())
+    expect(screen.getByRole('checkbox', { name: '选择 a.png' })).not.toBeChecked()
+  })
+
+  it('clears the grid selection after undo rewrites session data', async () => {
+    setupFetch(state)
+    renderPage()
+    await screen.findByAltText('a.png')
+
+    fireEvent.click(screen.getByRole('checkbox', { name: '选择 a.png' }))
+    expect(screen.getByText('选中图片（1）')).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: '撤销' }))
+
+    await waitFor(() => expect(state.undoCalls).toBe(1))
+    await waitFor(() => expect(screen.getByText('选中图片（0）')).toBeInTheDocument())
+  })
+
+  it('clears the selection and the editor when a newly created session takes over', async () => {
+    setupFetch(state)
+    renderPage()
+    await screen.findByAltText('a.png')
+
+    fireEvent.click(screen.getByRole('checkbox', { name: '选择 a.png' }))
+    fireEvent.click(screen.getByRole('button', { name: '编辑 a.png' }))
+    await screen.findByRole('dialog', { name: 'a.png' })
+
+    const pathInput = screen.getByLabelText('相对路径')
+    fireEvent.change(pathInput, { target: { value: 'cats_v2' } })
+    const openButton = screen.getByRole('button', { name: '打开' })
+    await waitFor(() => expect(openButton).toBeEnabled())
+    fireEvent.click(openButton)
+
+    await waitFor(() => expect(state.createBodies).toHaveLength(1))
+    // The editor closes and the selection is dropped: session-scoped state
+    // must not leak into the created (auto-selected) session.
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: 'a.png' })).not.toBeInTheDocument())
+    await waitFor(() => expect(headingStatsText()).toContain('0 已选'))
+    await waitFor(() => expect(screen.getByRole('combobox', { name: '现有会话' })).toHaveValue('ds-2'))
+  })
+
+  it('falls back to the next session after a deletion and drops editor and selection', async () => {
+    state.sessions = [session, { ...session, id: 'ds-2', name: 'dogs', relative_path: 'dogs' }]
+    setupFetch(state)
+    renderPage()
+    await screen.findByAltText('a.png')
+
+    fireEvent.click(screen.getByRole('checkbox', { name: '选择 a.png' }))
+    fireEvent.click(screen.getByRole('button', { name: '编辑 a.png' }))
+    await screen.findByRole('dialog', { name: 'a.png' })
+
+    fireEvent.click(screen.getByRole('button', { name: '删除会话' }))
+    const confirm = screen.getByRole('alertdialog')
+    fireEvent.click(within(confirm).getByRole('button', { name: '删除会话' }))
+
+    await waitFor(() => expect(state.deleteCalls).toBe(1))
+    // Auto-switch: the first remaining session becomes active with clean state.
+    await waitFor(() => expect(screen.getByRole('combobox', { name: '现有会话' })).toHaveValue('ds-2'))
+    expect(screen.queryByRole('dialog', { name: 'a.png' })).not.toBeInTheDocument()
+    expect(headingStatsText()).toContain('0 已选')
+  })
+
+  it('retries the image list after a load failure', async () => {
+    state.imagesError = true
+    setupFetch(state)
+    renderPage()
+
+    expect(await screen.findByText('图片列表加载失败')).toBeInTheDocument()
+    state.imagesError = false
+    fireEvent.click(screen.getByRole('button', { name: '重试' }))
+    await screen.findByAltText('a.png')
+    expect(screen.getByAltText('b.png')).toBeInTheDocument()
+  })
+
+  it('retries the image detail after a load failure', async () => {
+    state.detailError = true
+    setupFetch(state)
+    renderPage()
+    await screen.findByAltText('a.png')
+
+    fireEvent.click(screen.getByRole('button', { name: '编辑 a.png' }))
+    const failed = await screen.findByRole('dialog', { name: '图片内容加载失败' })
+    expect(failed).toBeInTheDocument()
+
+    state.detailError = false
+    fireEvent.click(screen.getByRole('button', { name: '重试' }))
+    await screen.findByRole('dialog', { name: 'a.png' })
+  })
+
+  it('renders raw_e621_json strictly read-only: no removal, save disabled', async () => {
+    state.detail = { ...detail, content: { kind: 'raw_e621_json', tags: ['solo', 'long_hair'], read_only: true } }
+    setupFetch(state)
+    renderPage()
+    await screen.findByAltText('a.png')
+
+    fireEvent.dblClick(screen.getByTitle('a.png'))
+    const dialog = await screen.findByRole('dialog', { name: 'a.png' })
+    expect(within(dialog).getByText(/只能查看/)).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: '移除 solo' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('combobox', { name: '添加标签' })).not.toBeInTheDocument()
+    expect(within(dialog).getByRole('button', { name: '保存' })).toBeDisabled()
+    expect(within(dialog).getByRole('button', { name: '保存并下一张' })).toBeDisabled()
+    expect(state.patchBodies).toHaveLength(0)
+  })
+
+  it('keeps save disabled for a sidecar-less image until a draft is created', async () => {
+    state.detail = { ...detail, content: { kind: 'none' } }
+    setupFetch(state)
+    renderPage()
+    await screen.findByAltText('b.png')
+
+    fireEvent.dblClick(screen.getByTitle('b.png'))
+    const dialog = await screen.findByRole('dialog', { name: 'b.png' })
+    expect(within(dialog).getByText('暂无 sidecar')).toBeInTheDocument()
+    expect(within(dialog).getByRole('button', { name: '保存' })).toBeDisabled()
+
+    fireEvent.click(within(dialog).getByRole('radio', { name: /tag_txt/ }))
+    fireEvent.click(within(dialog).getByRole('button', { name: '创建' }))
+    expect(within(dialog).getByRole('button', { name: '保存' })).toBeEnabled()
+  })
+
+  it('keeps the draft dirty after a failed save and retries successfully', async () => {
+    setupFetch(state)
+    renderPage()
+    await screen.findByAltText('a.png')
+
+    fireEvent.dblClick(screen.getByTitle('a.png'))
+    const dialog = await screen.findByRole('dialog', { name: 'a.png' })
+    fireEvent.click(screen.getByRole('button', { name: '移除 solo' }))
+    state.patchError = { code: 'storage_failed', message: 'disk on fire' }
+    fireEvent.click(within(dialog).getByRole('button', { name: '保存' }))
+    expect(await screen.findByText('disk on fire')).toBeInTheDocument()
+
+    // The draft and the dirty marker survive the failure untouched.
+    expect(screen.getByRole('button', { name: '移除 long_hair' })).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: '移除 solo' })).not.toBeInTheDocument()
+    expect(within(dialog).getByText(/有未保存更改/)).toBeInTheDocument()
+    expect(within(dialog).getByRole('button', { name: '保存' })).toBeEnabled()
+
+    // The retry sends the full draft with the still-unconsumed mtime.
+    state.patchError = null
+    fireEvent.click(within(dialog).getByRole('button', { name: '保存' }))
+    await waitFor(() => expect(state.patchBodies).toHaveLength(2))
+    expect(state.patchBodies[1]).toEqual({
+      content: { kind: 'tag_txt', tags: ['long_hair'] },
+      expected_sidecar_mtime: 1_725_148_800,
+    })
+    expect(within(dialog).queryByText(/有未保存更改/)).not.toBeInTheDocument()
+  })
+
+  it('keeps edits made during a pending save dirty and saves them on the next attempt', async () => {
+    setupFetch(state)
+    renderPage()
+    await screen.findByAltText('a.png')
+
+    fireEvent.dblClick(screen.getByTitle('a.png'))
+    const dialog = await screen.findByRole('dialog', { name: 'a.png' })
+    fireEvent.click(screen.getByRole('button', { name: '移除 solo' }))
+    const gate = deferred()
+    state.patchGate = gate
+    fireEvent.click(within(dialog).getByRole('button', { name: '保存' }))
+    await waitFor(() => expect(state.patchBodies).toHaveLength(1))
+
+    // The user keeps editing while the first save is in flight.
+    fireEvent.click(screen.getByRole('button', { name: '移除 long_hair' }))
+    expect(within(dialog).getByRole('button', { name: '保存' })).toBeDisabled()
+    gate.release()
+    await waitFor(() => expect(within(dialog).getByRole('button', { name: '保存' })).toBeEnabled())
+
+    // The baseline is the saved draft, so the mid-flight edit stays dirty…
+    expect(within(dialog).getByText(/有未保存更改/)).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: '移除 solo' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: '移除 long_hair' })).not.toBeInTheDocument()
+
+    // …and the follow-up save writes exactly the continued draft with the
+    // mtime reported by the first save (no stale-mtime regression).
+    fireEvent.click(within(dialog).getByRole('button', { name: '保存' }))
+    await waitFor(() => expect(state.patchBodies).toHaveLength(2))
+    expect(state.patchBodies[0]).toEqual({
+      content: { kind: 'tag_txt', tags: ['long_hair'] },
+      expected_sidecar_mtime: 1_725_148_800,
+    })
+    expect(state.patchBodies[1]).toEqual({
+      content: { kind: 'tag_txt', tags: [] },
+      expected_sidecar_mtime: 1_725_148_805,
+    })
+    expect(within(dialog).queryByText(/有未保存更改/)).not.toBeInTheDocument()
+  })
+
+  it('sends the updated sidecar_mtime on consecutive saves of the same image', async () => {
+    setupFetch(state)
+    renderPage()
+    await screen.findByAltText('a.png')
+
+    fireEvent.dblClick(screen.getByTitle('a.png'))
+    const dialog = await screen.findByRole('dialog', { name: 'a.png' })
+    fireEvent.click(screen.getByRole('button', { name: '移除 solo' }))
+    fireEvent.click(within(dialog).getByRole('button', { name: '保存' }))
+    await waitFor(() => expect(state.patchBodies).toHaveLength(1))
+    expect(state.patchBodies[0]).toMatchObject({ expected_sidecar_mtime: 1_725_148_800 })
+
+    // Continue editing after the refetch and save again: the second request
+    // must carry the mtime from the first PATCH response, not the original.
+    const addInput = screen.getByRole('combobox', { name: '添加标签' })
+    fireEvent.change(addInput, { target: { value: 'hakurei' } })
+    const suggestion = await screen.findByRole('option', { name: /hakurei_reimu/ })
+    fireEvent.mouseDown(within(suggestion).getByRole('button'))
+    await waitFor(() => expect(screen.getByRole('button', { name: '移除 hakurei_reimu' })).toBeInTheDocument())
+
+    fireEvent.click(within(dialog).getByRole('button', { name: '保存' }))
+    await waitFor(() => expect(state.patchBodies).toHaveLength(2))
+    expect(state.patchBodies[1]).toEqual({
+      content: { kind: 'tag_txt', tags: ['long_hair', 'hakurei_reimu'] },
+      expected_sidecar_mtime: 1_725_148_805,
+    })
+    expect(within(dialog).queryByText(/有未保存更改/)).not.toBeInTheDocument()
   })
 })

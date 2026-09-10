@@ -94,7 +94,9 @@ export function BatchBar({ profile, filter, selectedIds, filteredTotal, submitti
         <input aria-label="替换为" value={replacement} disabled={disabled} spellCheck={false} onChange={(event) => setReplacement(event.target.value)} placeholder="replacement" />
       </Field>}
       {overLimit && <p className="tm-batch-warning" role="alert">
-        当前过滤结果有 {filteredTotal} 张，超过单批 {MAX_BATCH_IMAGES} 张的上限。请先缩小过滤范围（例如排除部分标签）再执行。
+        {scope === 'selected'
+          ? `已选中 ${selectedIds.length} 张图片，超过单批 ${MAX_BATCH_IMAGES} 张的上限。请减少选中数量（或取消部分勾选）后再执行。`
+          : `当前过滤结果有 ${filteredTotal} 张，超过单批 ${MAX_BATCH_IMAGES} 张的上限。请先缩小过滤范围（例如排除部分标签）再执行。`}
       </p>}
       <label className="toggle standalone">
         <input aria-label="使用正则表达式" type="checkbox" checked={useRegex} disabled={disabled} onChange={(event) => setUseRegex(event.target.checked)} />

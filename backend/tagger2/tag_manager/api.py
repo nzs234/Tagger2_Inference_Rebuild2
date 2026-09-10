@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Sequence
 
 from fastapi import APIRouter, HTTPException, Query, Response
@@ -91,8 +92,12 @@ def create_tag_manager_router(service: TagManagerService) -> APIRouter:
 
     @router.post("/datasets", status_code=202)
     async def create_dataset(request: CreateDatasetRequest):
+        # The blocking session insert runs on a worker thread, but the scan
+        # scheduling must stay on the event loop thread: IndexScheduler binds
+        # the scan future to the running loop (calling it from a worker
+        # thread would run the whole scan inline instead of answering 202).
         try:
-            session = service.create_session(request)
+            session = await asyncio.to_thread(service.create_session, request)
         except TagManagerError as exc:
             raise _error(exc) from exc
         service.schedule_index(str(session["id"]))
@@ -100,25 +105,35 @@ def create_tag_manager_router(service: TagManagerService) -> APIRouter:
 
     @router.get("/datasets")
     async def list_datasets():
-        return {"items": service.list_sessions()}
+        return {"items": await asyncio.to_thread(service.list_sessions)}
 
     @router.get("/datasets/{session_id}")
     async def get_dataset(session_id: str):
         try:
-            return service.get_session(session_id)
+            return await asyncio.to_thread(service.get_session, session_id)
         except TagManagerError as exc:
             raise _error(exc) from exc
 
     @router.delete("/datasets/{session_id}", status_code=204)
     async def delete_dataset(session_id: str):
+        # The delete takes the session write lock and drops queued scans;
+        # IndexScheduler.discard marshals the asyncio cancel back onto the
+        # loop that owns the future, so cancelling from this worker thread
+        # stays event-loop safe.
         try:
-            service.delete_session(session_id)
+            await asyncio.to_thread(service.delete_session, session_id)
         except TagManagerError as exc:
             raise _error(exc) from exc
         return Response(status_code=204)
 
     @router.post("/datasets/{session_id}/refresh", status_code=202)
     async def refresh_dataset(session_id: str):
+        # Unlike the other mutating routes this one stays on the event loop
+        # thread on purpose: refresh_session only probes the write lock and
+        # queues the scan, and IndexScheduler.schedule must observe the
+        # running loop (offloading it would execute the whole scan inline
+        # inside a worker thread before the 202 could be answered).  Its own
+        # database reads are single indexed lookups.
         try:
             return service.refresh_session(session_id)
         except TagManagerError as exc:
@@ -167,8 +182,13 @@ def create_tag_manager_router(service: TagManagerService) -> APIRouter:
                 detail={"code": "validation_error", "message": "请求参数校验失败", "fields": fields},
             ) from exc
         try:
-            return service.list_images(
-                session_id, image_filter=image_filter, sort=sort, offset=offset, limit=limit
+            return await asyncio.to_thread(
+                service.list_images,
+                session_id,
+                image_filter=image_filter,
+                sort=sort,
+                offset=offset,
+                limit=limit,
             )
         except TagManagerError as exc:
             raise _error(exc) from exc
@@ -176,35 +196,35 @@ def create_tag_manager_router(service: TagManagerService) -> APIRouter:
     @router.get("/datasets/{session_id}/images/{image_id}")
     async def get_image(session_id: str, image_id: int):
         try:
-            return service.get_image(session_id, image_id)
+            return await asyncio.to_thread(service.get_image, session_id, image_id)
         except TagManagerError as exc:
             raise _error(exc) from exc
 
     @router.patch("/datasets/{session_id}/images/{image_id}")
     async def save_image(session_id: str, image_id: int, edit: ImageEditRequest):
         try:
-            return service.save_image(session_id, image_id, edit)
+            return await asyncio.to_thread(service.save_image, session_id, image_id, edit)
         except TagManagerError as exc:
             raise _error(exc) from exc
 
     @router.post("/datasets/{session_id}/batch")
     async def batch_operation(session_id: str, request: BatchOperationRequest):
         try:
-            return service.batch_operation(session_id, request)
+            return await asyncio.to_thread(service.batch_operation, session_id, request)
         except TagManagerError as exc:
             raise _error(exc) from exc
 
     @router.post("/datasets/{session_id}/undo")
     async def undo(session_id: str):
         try:
-            return service.undo(session_id)
+            return await asyncio.to_thread(service.undo, session_id)
         except TagManagerError as exc:
             raise _error(exc) from exc
 
     @router.post("/datasets/{session_id}/redo")
     async def redo(session_id: str):
         try:
-            return service.redo(session_id)
+            return await asyncio.to_thread(service.redo, session_id)
         except TagManagerError as exc:
             raise _error(exc) from exc
 
@@ -215,9 +235,10 @@ def create_tag_manager_router(service: TagManagerService) -> APIRouter:
         min_count: int = Query(default=1, ge=1),
     ):
         try:
-            return {
-                "items": service.tag_stats(session_id, limit=limit, min_count=min_count)
-            }
+            items = await asyncio.to_thread(
+                service.tag_stats, session_id, limit=limit, min_count=min_count
+            )
+            return {"items": items}
         except TagManagerError as exc:
             raise _error(exc) from exc
 
@@ -227,8 +248,6 @@ def create_tag_manager_router(service: TagManagerService) -> APIRouter:
         image_id: int,
         size: int = Query(default=256, ge=32, le=512),
     ):
-        import asyncio
-
         try:
             path = await asyncio.to_thread(
                 service.thumbnail, session_id, image_id, size=size
@@ -249,19 +268,21 @@ def create_tag_manager_router(service: TagManagerService) -> APIRouter:
         resource_id: str | None = Query(default=None, max_length=128),
     ):
         try:
-            return service.autocomplete(
-                profile, query, limit=limit, resource_id=resource_id
+            # ensure_loaded may open a full snapshot database: keep it off
+            # the event loop.
+            return await asyncio.to_thread(
+                service.autocomplete, profile, query, limit=limit, resource_id=resource_id
             )
         except TagManagerError as exc:
             raise _error(exc) from exc
 
     @router.get("/tag-db/info")
     async def tag_db_info():
-        return service.tag_db_info()
+        return await asyncio.to_thread(service.tag_db_info)
 
     @router.post("/translations/lookup")
     async def lookup_translations(request: TranslationLookupRequest):
-        return service.lookup_translations(request)
+        return await asyncio.to_thread(service.lookup_translations, request)
 
     @router.post("/translations/translate")
     async def translate_tags(request: TagTranslateRequest):

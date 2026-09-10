@@ -1144,6 +1144,8 @@ small { font-size: 12px; }
 .tm-suggest-list { position: absolute; top: calc(100% + 4px); left: 0; right: 0; z-index: 30; max-height: 262px; overflow-y: auto; margin: 0; padding: 5px; border: 1px solid var(--line-strong); border-radius: 9px; background: var(--surface-elevated); box-shadow: var(--shadow-hover); list-style: none; }
 .tm-suggest-item { width: 100%; min-height: 33px; display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 8px; padding: 3px 7px; border: 0; border-radius: 6px; background: transparent; cursor: pointer; text-align: left; }
 .tm-suggest-item:hover { background: var(--surface-3); }
+/* Visible active state for the aria-activedescendant option (keyboard users). */
+.tm-suggest-list li.tm-suggest-active .tm-suggest-item { background: var(--surface-3); }
 .tm-suggest-name { overflow: hidden; color: var(--ink); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
 .tm-suggest-item small { color: var(--subtle); font-size: 9px; }
 

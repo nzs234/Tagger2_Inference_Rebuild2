@@ -14,8 +14,9 @@ from fastapi.testclient import TestClient
 from PIL import Image
 
 from tagger2.security import PathAllowlist
-from tagger2.tag_manager import indexing
+from tagger2.tag_manager import editing, indexing
 from tagger2.tag_manager.api import create_tag_manager_router
+from tagger2.tag_manager.editing import MAX_BATCH_IMAGES
 from tagger2.tag_manager.contracts import (
     BatchOperationRequest,
     CreateDatasetRequest,
@@ -1321,3 +1322,553 @@ def test_incremental_rescan_picks_up_added_and_removed_images(workspace):
         for item in service.list_images(session_id)["items"]
     }
     assert added_tags["added.png"] == {"fresh"}
+# -- 1.10.5 review regressions: lock-window races, mtime guards, limits -------
+
+
+def test_save_after_concurrent_delete_rechecks_session_under_lock(workspace, monkeypatch):
+    """delete_session serializes through the same lock and can win the race
+    between save_image's pre-lock session fetch and the lock acquisition: the
+    write span must re-check and 404, never write or journal into a deleted
+    session."""
+
+    service, store, session, dataset = workspace
+    session_id = str(session["id"])
+    a_id = _image_ids_by_name(service, session_id)["a.png"]
+    real_require = editing.require_session
+    deleted = {"done": False}
+
+    def require_and_delete(store_arg, sid):
+        fetched = real_require(store_arg, sid)
+        if not deleted["done"]:
+            deleted["done"] = True
+            service.delete_session(sid)  # wins the race before the lock
+        return fetched
+
+    monkeypatch.setattr(editing, "require_session", require_and_delete)
+
+    with pytest.raises(TagManagerError) as excinfo:
+        service.save_image(
+            session_id, a_id, ImageEditRequest(content=TagTxtContent(tags=["solo"]))
+        )
+    assert excinfo.value.code == "dataset_not_found"
+    assert excinfo.value.status_code == 404
+    assert (dataset / "a.txt").read_text(encoding="utf-8") == "solo, wolf\n"
+    assert store.journal_entries(session_id) == []
+
+
+def test_batch_after_concurrent_delete_rechecks_session_under_lock(workspace, monkeypatch):
+    """Same lock-window race for batch_operation: no sidecar is touched after
+    the session disappeared."""
+
+    service, store, session, dataset = workspace
+    session_id = str(session["id"])
+    a_id = _image_ids_by_name(service, session_id)["a.png"]
+    real_require = editing.require_session
+    deleted = {"done": False}
+
+    def require_and_delete(store_arg, sid):
+        fetched = real_require(store_arg, sid)
+        if not deleted["done"]:
+            deleted["done"] = True
+            service.delete_session(sid)
+        return fetched
+
+    monkeypatch.setattr(editing, "require_session", require_and_delete)
+
+    with pytest.raises(TagManagerError) as excinfo:
+        service.batch_operation(
+            session_id,
+            BatchOperationRequest(op="add", tags=["fresh"], image_ids=[a_id]),
+        )
+    assert excinfo.value.code == "dataset_not_found"
+    assert "fresh" not in (dataset / "a.txt").read_text(encoding="utf-8")
+    assert store.journal_entries(session_id) == []
+
+
+def test_delete_session_rejects_while_write_in_flight(workspace):
+    """A delete during an in-flight write is refused with session_busy instead
+    of yanking the dataset out from under the writer."""
+
+    service, _store, session, _dataset = workspace
+    session_id = str(session["id"])
+    lock = service._session_lock(session_id)
+    assert lock.acquire(blocking=False)
+    try:
+        with pytest.raises(TagManagerError) as excinfo:
+            service.delete_session(session_id)
+        assert excinfo.value.code == "session_busy"
+        assert excinfo.value.retryable
+        assert service.get_session(session_id)["id"] == session_id
+    finally:
+        lock.release()
+
+
+def test_index_timeout_is_observable_on_the_session_row(workspace, monkeypatch, caplog):
+    """A rescan that loses the lock race times out, logs loudly and records
+    error/session_busy on the session row instead of silently skipping."""
+
+    service, _store, session, _dataset = workspace
+    session_id = str(session["id"])
+    monkeypatch.setattr(indexing, "INDEX_LOCK_TIMEOUT_SECONDS", 0.05)
+    lock = service._session_lock(session_id)
+    assert lock.acquire(blocking=False)
+    try:
+        with caplog.at_level(logging.WARNING, logger="tagger2.tag_manager"):
+            service.index_session(session_id)  # must return, never raise
+        assert "index busy" in caplog.text
+        row = service.get_session(session_id)
+        assert row["status"] == "error"
+        assert row["error"] == "session_busy"
+    finally:
+        lock.release()
+
+    # Once the lock is free, a normal rescan recovers the session.
+    service.index_session(session_id)
+    recovered = service.get_session(session_id)
+    assert recovered["status"] == "ready"
+    assert recovered["error"] is None
+
+
+def test_batch_external_sidecar_change_conflicts_and_keeps_partial_journal(workspace):
+    """A sidecar modified externally after the scan aborts the batch with a
+    conflict; targets applied before it stay recoverable via the partial
+    journal entry, and the external content is never clobbered."""
+
+    service, store, session, dataset = workspace
+    session_id = str(session["id"])
+    ids = _image_ids_by_name(service, session_id)
+    a_id, b_id = ids["a.png"], ids["b.png"]
+
+    (dataset / "b.json").write_text(
+        json.dumps({**STANDARD_JSON, "tags": ["wolf", "night"]}), encoding="utf-8"
+    )
+    os.utime(dataset / "b.json", (1_000_000_000, 1_000_000_000))
+
+    with pytest.raises(TagManagerError) as excinfo:
+        service.batch_operation(
+            session_id,
+            BatchOperationRequest(op="add", tags=["fresh"], image_ids=[a_id, b_id]),
+        )
+    assert excinfo.value.code == "sidecar_conflict"
+
+    # a was applied before b aborted and is journalled as a partial entry.
+    assert "fresh" in (dataset / "a.txt").read_text(encoding="utf-8")
+    entry = store.latest_journal_entry(session_id, undone=False)
+    assert entry["spec"]["partial"] is True
+    assert [change["image_id"] for change in entry["changes"]] == [a_id]
+
+    # b's externally changed content survived untouched.
+    assert "night" in json.loads((dataset / "b.json").read_text(encoding="utf-8"))["tags"]
+
+    assert service.undo(session_id)["reverted"] == 1
+    assert "fresh" not in (dataset / "a.txt").read_text(encoding="utf-8")
+
+
+def test_batch_externally_deleted_standard_json_is_never_degraded(workspace):
+    """A standard JSON deleted after the scan must not be resurrected as a
+    degraded batch-only document -- including when the index row carries no
+    mtime stamp to compare."""
+
+    service, store, session, dataset = workspace
+    session_id = str(session["id"])
+    b_id = _image_ids_by_name(service, session_id)["b.png"]
+    (dataset / "b.json").unlink()
+
+    with pytest.raises(TagManagerError) as excinfo:
+        service.batch_operation(
+            session_id,
+            BatchOperationRequest(op="add", tags=["fresh"], image_ids=[b_id]),
+        )
+    assert excinfo.value.code == "sidecar_conflict"
+    assert not (dataset / "b.json").exists()
+
+    # The degradation hole: a standard_json row without a sidecar_mtime must
+    # not pass the mtime guard and write a fresh batch-only document either.
+    store.set_image_tags(
+        b_id, [("wolf", "general")], sidecar_kind="standard_json", sidecar_mtime=None
+    )
+    with pytest.raises(TagManagerError) as excinfo:
+        service.batch_operation(
+            session_id,
+            BatchOperationRequest(op="add", tags=["fresh"], image_ids=[b_id]),
+        )
+    assert excinfo.value.code == "sidecar_conflict"
+    assert not (dataset / "b.json").exists()
+
+
+def test_batch_reverifies_sidecar_mtime_immediately_before_write(workspace, monkeypatch):
+    """An external change landing between the indexed-stamp check and the
+    write is caught by the final re-verification, not clobbered."""
+
+    service, store, session, dataset = workspace
+    session_id = str(session["id"])
+    a_id = _image_ids_by_name(service, session_id)["a.png"]
+
+    real_stat = editing.stat_mtime
+    calls = {"n": 0}
+
+    def counting_stat(path):
+        calls["n"] += 1
+        value = real_stat(Path(path))
+        if calls["n"] == 3:
+            # The pre-write re-verification observes a changed file.
+            return None if value is None else value + 1.0
+        return value
+
+    monkeypatch.setattr(editing, "stat_mtime", counting_stat)
+
+    with pytest.raises(TagManagerError) as excinfo:
+        service.batch_operation(
+            session_id,
+            BatchOperationRequest(op="add", tags=["fresh"], image_ids=[a_id]),
+        )
+    assert excinfo.value.code == "sidecar_conflict"
+    assert (dataset / "a.txt").read_text(encoding="utf-8") == "solo, wolf\n"
+    assert store.journal_entries(session_id) == []
+
+
+def test_save_reverifies_sidecar_mtime_immediately_before_write(workspace, monkeypatch):
+    """The single save carries the same final guard: a change that lands after
+    the optimistic-concurrency validation but before the write still 409s."""
+
+    service, store, session, dataset = workspace
+    session_id = str(session["id"])
+    a_id = _image_ids_by_name(service, session_id)["a.png"]
+
+    real_stat = editing.stat_mtime
+    calls = {"n": 0}
+
+    def counting_stat(path):
+        calls["n"] += 1
+        value = real_stat(Path(path))
+        if calls["n"] == 2:
+            # The pre-write re-verification observes a changed file.
+            return None if value is None else value + 1.0
+        return value
+
+    monkeypatch.setattr(editing, "stat_mtime", counting_stat)
+
+    with pytest.raises(TagManagerError) as excinfo:
+        service.save_image(
+            session_id, a_id, ImageEditRequest(content=TagTxtContent(tags=["solo"]))
+        )
+    assert excinfo.value.code == "sidecar_conflict"
+    assert (dataset / "a.txt").read_text(encoding="utf-8") == "solo, wolf\n"
+    assert store.journal_entries(session_id) == []
+
+
+def test_batch_limit_rejects_above_max_for_both_target_shapes(workspace):
+    """Batches above MAX_BATCH_IMAGES are rejected with 413 before any file is
+    touched, whether the targets come from a filter or an id list."""
+
+    service, store, session, _dataset = workspace
+    session_id = str(session["id"])
+    store.upsert_images(
+        session_id,
+        [
+            {
+                "relative_path": f"bulk/img_{i}.png",
+                "file_name": f"img_{i}.png",
+                "image_format": "png",
+                "sidecar_kind": "none",
+                "sidecar_path": None,
+                "mtime": 100.0 + i,
+                "sidecar_mtime": None,
+                "width": 8,
+                "height": 8,
+                "tag_count": 0,
+            }
+            for i in range(MAX_BATCH_IMAGES + 50)
+        ],
+    )
+
+    with pytest.raises(TagManagerError) as excinfo:
+        service.batch_operation(
+            session_id,
+            BatchOperationRequest(
+                op="add", tags=["fresh"], image_ids=None, filter=ImageFilter(sidecar="any")
+            ),
+        )
+    assert excinfo.value.code == "batch_too_large"
+    assert excinfo.value.status_code == 413
+
+    ids = [int(item["id"]) for item in store.list_images(session_id, limit=MAX_BATCH_IMAGES + 50)[0]]
+    with pytest.raises(TagManagerError) as excinfo:
+        service.batch_operation(
+            session_id,
+            BatchOperationRequest(op="add", tags=["fresh"], image_ids=ids),
+        )
+    assert excinfo.value.code == "batch_too_large"
+    assert excinfo.value.status_code == 413
+    assert store.journal_entries(session_id) == []
+
+
+def test_save_result_reports_disk_sidecar_mtime(workspace):
+    """The save response carries the fresh sidecar mtime the client must echo
+    back for its next optimistic-concurrency check."""
+
+    service, _store, session, dataset = workspace
+    session_id = str(session["id"])
+    a_id = _image_ids_by_name(service, session_id)["a.png"]
+
+    result = service.save_image(
+        session_id,
+        a_id,
+        ImageEditRequest(content=TagTxtContent(tags=["solo", "wolf", "rex"])),
+    )
+    assert result["sidecar_mtime"] == (dataset / "a.txt").stat().st_mtime
+
+    # The reported value round-trips: saving with it succeeds, a stale one
+    # conflicts.
+    result2 = service.save_image(
+        session_id,
+        a_id,
+        ImageEditRequest(
+            content=TagTxtContent(tags=["solo"]),
+            expected_sidecar_mtime=result["sidecar_mtime"],
+        ),
+    )
+    assert result2["sidecar_mtime"] == (dataset / "a.txt").stat().st_mtime
+
+    with pytest.raises(TagManagerError) as excinfo:
+        service.save_image(
+            session_id,
+            a_id,
+            ImageEditRequest(
+                content=TagTxtContent(tags=["solo"]),
+                expected_sidecar_mtime=result2["sidecar_mtime"] + 1.0,
+            ),
+        )
+    assert excinfo.value.code == "sidecar_conflict"
+
+
+def test_batch_resolves_image_ids_without_per_id_queries(workspace, monkeypatch):
+    """Batch target resolution fetches all ids in one chunked query instead of
+    one lookup (and connection) per id."""
+
+    service, _store, session, _dataset = workspace
+    session_id = str(session["id"])
+    ids = list(_image_ids_by_name(service, session_id).values())
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("batch target resolution must not query per id")
+
+    monkeypatch.setattr(TagManagerStore, "get_image", forbidden)
+
+    result = service.batch_operation(
+        session_id, BatchOperationRequest(op="add", tags=["fresh"], image_ids=ids)
+    )
+    assert result["affected"] == len(ids)
+
+
+def test_batch_missing_image_id_reports_404(workspace):
+    """A missing id still fails the whole batch with image_not_found."""
+
+    service, _store, session, dataset = workspace
+    session_id = str(session["id"])
+    a_id = _image_ids_by_name(service, session_id)["a.png"]
+
+    with pytest.raises(TagManagerError) as excinfo:
+        service.batch_operation(
+            session_id,
+            BatchOperationRequest(op="add", tags=["fresh"], image_ids=[a_id, 987_654]),
+        )
+    assert excinfo.value.code == "image_not_found"
+    assert excinfo.value.status_code == 404
+    assert "fresh" not in (dataset / "a.txt").read_text(encoding="utf-8")
+
+
+def test_tag_filters_match_unicode_casefolded_spellings(workspace):
+    """The SQL filter side folds through the registered CASEFOLD function and
+    matches the Python normalization for non-ASCII tags (LOWER() folds ASCII
+    only, so a filter typed with one spelling missed the other)."""
+
+    service, _store, session, dataset = workspace
+    session_id = str(session["id"])
+    _make_image(dataset, "u1.png")
+    _make_image(dataset, "u2.png")
+    (dataset / "u1.txt").write_text("W\u00d6LFE, solo\n", encoding="utf-8")
+    (dataset / "u2.txt").write_text("w\u00f6lfe, duo\n", encoding="utf-8")
+    service.index_session(session_id)
+
+    found = service.list_images(
+        session_id, image_filter=ImageFilter(include_tags=["W\u00d6LFE"])
+    )
+    assert {item["file_name"] for item in found["items"]} == {"u1.png", "u2.png"}
+
+    stats = service.tag_stats(session_id)
+    counts = {entry["tag"]: entry["count"] for entry in stats}
+    assert counts.get("W\u00d6LFE", counts.get("w\u00f6lfe")) == 2
+    assert not ("W\u00d6LFE" in counts and "w\u00f6lfe" in counts)
+
+
+def test_api_endpoints_answer_through_the_thread_offload(workspace):
+    """The blocking routes keep their envelopes after the to_thread offload."""
+
+    service, _store, session, _dataset = workspace
+    app = FastAPI()
+    app.include_router(create_tag_manager_router(service))
+    client = TestClient(app)
+    sid = str(session["id"])
+
+    listed = client.get("/api/v1/tag-manager/datasets")
+    assert listed.status_code == 200
+    assert len(listed.json()["items"]) == 1
+
+    images = client.get(f"/api/v1/tag-manager/datasets/{sid}/images")
+    assert images.status_code == 200
+    a = next(item for item in images.json()["items"] if item["file_name"] == "a.png")
+
+    detail = client.get(f"/api/v1/tag-manager/datasets/{sid}/images/{a['id']}")
+    assert detail.status_code == 200
+    saved = client.patch(
+        f"/api/v1/tag-manager/datasets/{sid}/images/{a['id']}",
+        json={
+            "content": {"kind": "tag_txt", "tags": ["solo", "wolf", "rex"]},
+            "expected_sidecar_mtime": detail.json()["sidecar_mtime"],
+        },
+    )
+    assert saved.status_code == 200
+    assert saved.json()["sidecar_kind"] == "tag_txt"
+    assert saved.json()["sidecar_mtime"] is not None
+
+    batch = client.post(
+        f"/api/v1/tag-manager/datasets/{sid}/batch",
+        json={"op": "add", "tags": ["night"], "image_ids": [int(a["id"])]},
+    )
+    assert batch.status_code == 200
+    assert batch.json()["affected"] == 1
+
+    undone = client.post(f"/api/v1/tag-manager/datasets/{sid}/undo")
+    assert undone.status_code == 200
+    assert undone.json()["reverted"] == 1
+
+    missing = client.get("/api/v1/tag-manager/datasets/nope")
+    assert missing.status_code == 404
+    assert missing.json()["detail"]["code"] == "dataset_not_found"
+
+
+def test_api_batch_runs_off_the_event_loop_thread(workspace):
+    """The batch route executes the blocking service call on a worker thread,
+    never on the event loop."""
+
+    service, _store, session, _dataset = workspace
+    app = FastAPI()
+    app.include_router(create_tag_manager_router(service))
+    client = TestClient(app)
+    sid = str(session["id"])
+    a_id = _image_ids_by_name(service, sid)["a.png"]
+    seen: dict[str, bool] = {}
+    original = service.batch_operation
+
+    def batch_spy(session_id_arg, request):
+        try:
+            asyncio.get_running_loop()
+            seen["off_loop"] = False
+        except RuntimeError:
+            seen["off_loop"] = True
+        return original(session_id_arg, request)
+
+    service.batch_operation = batch_spy
+
+    response = client.post(
+        f"/api/v1/tag-manager/datasets/{sid}/batch",
+        json={"op": "add", "tags": ["night"], "image_ids": [a_id]},
+    )
+    assert response.status_code == 200
+    assert response.json()["affected"] == 1
+    assert seen["off_loop"] is True
+
+
+def test_api_create_and_refresh_schedule_on_the_event_loop_thread(tmp_path):
+    """create/refresh keep their event-loop semantics: the scan is queued via
+    the running loop (never inline in a worker thread) and the 202 answers
+    while the session becomes ready asynchronously."""
+
+    dataset = tmp_path / "dataset"
+    dataset.mkdir()
+    _make_image(dataset, "a.png")
+    (dataset / "a.txt").write_text("solo, wolf\n", encoding="utf-8")
+    allowlist = PathAllowlist()
+    allowlist.register(dataset, root_id="loop-root", kind="input", writable=True)
+    service = TagManagerService(
+        store=TagManagerStore(":memory:"),
+        allowlist=allowlist,
+        thumbnails=FakeThumbnails(),
+        tag_database=FakeTagDatabase(),
+    )
+    seen = {"on_loop": 0, "inline": 0}
+    original_schedule = service.schedule_index
+
+    def schedule_spy(session_id):
+        try:
+            asyncio.get_running_loop()
+            seen["on_loop"] += 1
+        except RuntimeError:
+            seen["inline"] += 1
+        original_schedule(session_id)
+
+    service.schedule_index = schedule_spy
+
+    app = FastAPI()
+    app.include_router(create_tag_manager_router(service))
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/v1/tag-manager/datasets",
+            json={"root_id": "loop-root", "relative_path": "", "profile": "e621"},
+        )
+        assert created.status_code == 202
+        sid = created.json()["id"]
+        deadline = time.monotonic() + 10.0
+        status = ""
+        while time.monotonic() < deadline:
+            status = client.get(f"/api/v1/tag-manager/datasets/{sid}").json()["status"]
+            if status == "ready":
+                break
+            time.sleep(0.02)
+        assert status == "ready"
+
+        _make_image(dataset, "later.png")
+        (dataset / "later.txt").write_text("fresh\n", encoding="utf-8")
+        refreshed = client.post(f"/api/v1/tag-manager/datasets/{sid}/refresh")
+        assert refreshed.status_code == 202
+        deadline = time.monotonic() + 10.0
+        names = set()
+        while time.monotonic() < deadline:
+            payload = client.get(f"/api/v1/tag-manager/datasets/{sid}/images").json()
+            names = {item["file_name"] for item in payload["items"]}
+            if "later.png" in names:
+                break
+            time.sleep(0.02)
+        assert "later.png" in names
+
+    assert seen["on_loop"] == 2
+    assert seen["inline"] == 0
+
+
+def test_delete_session_from_worker_thread_cancels_queued_scan(workspace):
+    """delete_session off the loop thread (the API now runs it via to_thread)
+    still cancels a queued scan: the asyncio cancel is marshalled onto the
+    loop that owns the future."""
+
+    service, _store, session, _dataset = workspace
+    session_id = str(session["id"])
+    block = threading.Event()
+
+    async def drive():
+        loop = asyncio.get_running_loop()
+        # Saturate the default executor so the scheduled scan stays queued.
+        occupied = [loop.run_in_executor(None, block.wait) for _ in range(64)]
+        service.schedule_index(session_id)
+        future = service._index_futures[session_id]
+        worker = threading.Thread(target=service.delete_session, args=(session_id,))
+        worker.start()
+        worker.join()
+        deadline = time.monotonic() + 5.0
+        while not future.cancelled() and time.monotonic() < deadline:
+            await asyncio.sleep(0.01)
+        assert future.cancelled(), "a queued scan must be cancelled on delete"
+        block.set()
+        await asyncio.gather(*occupied)
+
+    asyncio.run(drive())

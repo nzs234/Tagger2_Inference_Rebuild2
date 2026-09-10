@@ -7,9 +7,9 @@ into the dedicated store ``data/tag_wiki/tag_wiki_danbooru.sqlite3``.
 
 Safe to re-run: the first run performs a full walk, later runs only fetch
 pages updated since the last run, and imports are incremental (unchanged
-pages are skipped, deleted pages are purged). Embeddings and Chinese
-summaries are NOT built here; the vector index is a separate step once the
-danbooru profile is wired into the app.
+pages are skipped, deleted pages are purged). Chinese summaries are NOT
+built here; the browse catalog is a separate step
+(``scripts/build_tag_wiki_catalog.py``) once the import finishes.
 
 Usage::
 
@@ -47,7 +47,6 @@ def _print_state(store: WikiStore, state: dict[str, Any]) -> None:
             {
                 "pages": store.page_count(),
                 "chunks": store.chunk_count(),
-                "embedded_chunks": store.embedded_chunk_count(),
                 "source": store.get_meta("source"),
                 "imported_at": store.get_meta("imported_at"),
             },

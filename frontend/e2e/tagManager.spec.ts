@@ -2,9 +2,11 @@ import { expect, test, type Page } from '@playwright/test'
 import type { TagManagerImageDetail, TagManagerImageSummary, TagManagerSession } from '../src/lib/tagManager'
 
 // ---------------------------------------------------------------------------
-// Tag Manager e2e — desktop project only. The batch bar and the editor drawer
-// cover the grid at the 375px mobile viewport, which makes long interaction
-// chains flaky there, so every test below is skipped for mobile.
+// Tag Manager e2e. The long interaction chains are desktop-only (the batch
+// bar and the editor drawer cover the grid at the 375px mobile viewport,
+// which makes long chains flaky there); the mobile project additionally runs
+// a compact select/edit/save smoke and the filtered batch payload check, so
+// the mobile build is actually exercised instead of silently skipped.
 //
 // All API traffic is mocked through a single `page.route('**/api/v1/**')`
 // handler (same pattern as e2e/app.spec.ts). Network assertions use the
@@ -102,6 +104,9 @@ async function mockTagManagerApi(page: Page): Promise<RecordedApi> {
     redoCalls: 0,
     thumbnailIds: [],
   }
+  // Per-image sidecar mtime: every successful PATCH rewrites the sidecar and
+  // the next GET reports the fresh value, mirroring the real backend.
+  const mtimes: Record<number, number> = {}
   await page.route('**/api/v1/**', async (route) => {
     const request = route.request()
     const url = new URL(request.url())
@@ -159,9 +164,10 @@ async function mockTagManagerApi(page: Page): Promise<RecordedApi> {
       const imageId = Number(detailMatch[1])
       if (method === 'PATCH') {
         recorded.patchBodies.push(request.postDataJSON() as Record<string, unknown>)
-        return json({ image_id: imageId, journal_id: 100 + imageId, sidecar_kind: 'tag_txt' })
+        mtimes[imageId] = (mtimes[imageId] ?? SIDECAR_MTIME) + 5
+        return json({ image_id: imageId, journal_id: 100 + imageId, sidecar_kind: 'tag_txt', sidecar_mtime: mtimes[imageId] })
       }
-      return json(detailFor(imageId))
+      return json({ ...detailFor(imageId), sidecar_mtime: mtimes[imageId] ?? SIDECAR_MTIME })
     }
     if (/\/tag-manager\/datasets\/ds-1\/images$/.test(pathname)) {
       recorded.imageQueries.push(url.search)
@@ -177,6 +183,14 @@ async function mockTagManagerApi(page: Page): Promise<RecordedApi> {
 
 async function openTagManager(page: Page) {
   await page.goto('/')
+  await page.locator('.page h1').waitFor({ state: 'visible' })
+  // At the mobile viewport the sidebar is off-canvas: open it first (same
+  // pattern as e2e/app.spec.ts navigate()).
+  const width = page.viewportSize()?.width ?? 1440
+  const sidebarOpen = await page.locator('.sidebar').evaluate((element) => element.classList.contains('sidebar-open'))
+  if (width <= 980 && !sidebarOpen) {
+    await page.getByRole('button', { name: '打开导航' }).click()
+  }
   await page.locator('.sidebar').getByRole('button', { name: '标签管理' }).click()
   await expect(page.getByRole('heading', { name: '标签管理', level: 1 })).toBeVisible()
 }
@@ -185,13 +199,18 @@ function cardBody(page: Page, fileName: string) {
   return page.locator(`.tm-card-body[title="${fileName}"]`)
 }
 
-test.beforeEach(async ({ page }, testInfo) => {
-  test.skip(testInfo.project.name !== 'desktop', 'tag manager e2e runs on the desktop project only')
+test.beforeEach(async ({ page }) => {
   // Fresh view state: drop the persisted active session, filter and preferences.
   await page.addInitScript(() => localStorage.clear())
 })
 
+/** Long interaction chains stay desktop-only; see the file header. */
+function requireDesktop() {
+  test.skip(test.info().project.name !== 'desktop', 'long interaction chain: desktop project only')
+}
+
 test('main chain: filter, select, batch replace, edit, save-and-next, undo', async ({ page }) => {
+  requireDesktop()
   const recorded = await mockTagManagerApi(page)
   await openTagManager(page)
 
@@ -297,6 +316,7 @@ test('main chain: filter, select, batch replace, edit, save-and-next, undo', asy
 })
 
 test('editor warns before closing with unsaved changes and cancel keeps the draft', async ({ page }) => {
+  requireDesktop()
   const recorded = await mockTagManagerApi(page)
   await openTagManager(page)
   await expect(page.locator('img.tm-thumb[alt="a.png"]')).toBeVisible()
@@ -323,6 +343,7 @@ test('editor warns before closing with unsaved changes and cancel keeps the draf
 })
 
 test('grid keyboard: arrows move focus, space selects, enter opens the editor', async ({ page }) => {
+  requireDesktop()
   await mockTagManagerApi(page)
   await openTagManager(page)
   await expect(page.locator('img.tm-thumb[alt="a.png"]')).toBeVisible()
@@ -343,6 +364,7 @@ test('grid keyboard: arrows move focus, space selects, enter opens the editor', 
 })
 
 test('sidecar-less image creates a tag_txt sidecar and saves it', async ({ page }) => {
+  requireDesktop()
   const recorded = await mockTagManagerApi(page)
   await openTagManager(page)
   await expect(page.locator('img.tm-thumb[alt="b.png"]')).toBeVisible()
@@ -369,4 +391,95 @@ test('sidecar-less image creates a tag_txt sidecar and saves it', async ({ page 
     content: { kind: 'tag_txt', tags: ['hakurei_reimu'] },
     expected_sidecar_mtime: SIDECAR_MTIME,
   })
+})
+
+// Runs on BOTH projects: this compact chain is the mobile project's proof of
+// life (selection, drawer editing and saving at the 375px viewport), and on
+// desktop it doubles as a cross-viewport sanity check. It uses the card body
+// as the interaction target: at the mobile viewport the sticky topbar covers
+// the card's top edge, where the small corner checkbox lives.
+test('mobile smoke: select, edit, save (runs on desktop and mobile)', async ({ page }) => {
+  const recorded = await mockTagManagerApi(page)
+  await openTagManager(page)
+  const smokeCard = cardBody(page, 'a.png')
+  await smokeCard.scrollIntoViewIfNeeded()
+  await expect(page.locator('img.tm-thumb[alt="a.png"]')).toBeVisible()
+
+  // --- Selection: a plain card click toggles it ---
+  await smokeCard.click()
+  await expect(page.locator('.heading-stats')).toContainText('1 已选')
+
+  // --- Edit in the drawer: double click opens it at any viewport ---
+  await smokeCard.dblclick()
+  const editor = page.getByRole('dialog', { name: 'a.png' })
+  await expect(editor).toBeVisible()
+  await editor.getByRole('button', { name: '移除 solo' }).click()
+  await expect(editor.getByRole('button', { name: '移除 solo' })).toHaveCount(0)
+
+  // --- Save hits PATCH with the draft and the current mtime ---
+  await editor.getByRole('button', { name: '保存', exact: true }).click()
+  await expect.poll(() => recorded.patchBodies).toHaveLength(1)
+  expect(recorded.patchBodies[0]).toEqual({
+    content: { kind: 'tag_txt', tags: ['long_hair'] },
+    expected_sidecar_mtime: SIDECAR_MTIME,
+  })
+  await expect(page.getByText('标签已保存', { exact: true })).toBeVisible()
+  // The drawer stays open on the saved state (no remount, no dirty marker).
+  await expect(editor).toBeVisible()
+  await expect(editor).not.toContainText('有未保存更改')
+
+  await editor.locator('.tm-drawer-footer').getByRole('button', { name: '关闭' }).click()
+  await expect(page.getByRole('dialog', { name: 'a.png' })).toHaveCount(0)
+  // The double click that opened the editor toggled the selection twice, so
+  // the card is still selected after the drawer closes.
+  await expect(page.locator('.heading-stats')).toContainText('1 已选')
+})
+
+// Runs on BOTH projects: proves the batch bar sends a filtered-scope payload
+// carrying the active include filter (and no explicit image ids).
+test('filtered batch sends the filter scope payload (runs on desktop and mobile)', async ({ page }) => {
+  const recorded = await mockTagManagerApi(page)
+  await openTagManager(page)
+  await expect(page.locator('img.tm-thumb[alt="a.png"]')).toBeVisible()
+
+  // Filter the grid first: the batch must inherit this filter on the wire.
+  const includeInput = page.getByRole('combobox', { name: '包含标签' })
+  await includeInput.fill('1g')
+  await expect(page.getByRole('option', { name: /1girl/ })).toBeVisible()
+  await includeInput.press('Enter')
+  await expect(page.getByRole('button', { name: '移除筛选 1girl' })).toBeVisible()
+  await expect.poll(() => recorded.imageQueries.at(-1)).toContain('include_tags=1girl')
+
+  // No selection: the scope follows the filtered result.
+  const filteredScope = page.getByRole('button', { name: '当前过滤结果（3）' })
+  await expect(filteredScope).toHaveAttribute('aria-pressed', 'true')
+  await filteredScope.click()
+
+  const batchTagInput = page.getByRole('combobox', { name: '批量标签' })
+  await batchTagInput.fill('1g')
+  await expect(page.getByRole('option', { name: /1girl/ })).toBeVisible()
+  await batchTagInput.press('Enter')
+  await expect(page.getByRole('button', { name: '移除 1girl' })).toBeVisible()
+
+  await page.getByRole('button', { name: '执行', exact: true }).click()
+  const confirm = page.getByRole('alertdialog', { name: '对 3 张图片执行「添加」？' })
+  await expect(confirm).toBeVisible()
+  await expect(confirm).toContainText('当前过滤结果的全部 3 张图片')
+  await confirm.getByRole('button', { name: '确认执行' }).click()
+
+  await expect.poll(() => recorded.batchBodies).toHaveLength(1)
+  expect(recorded.batchBodies[0]).toEqual({
+    op: 'add',
+    tags: ['1girl'],
+    use_regex: false,
+    filter: {
+      include_tags: ['1girl'],
+      exclude_tags: [],
+      include_mode: 'all',
+      kind: 'any',
+      sidecar: 'any',
+    },
+  })
+  expect(recorded.batchBodies[0].image_ids).toBeUndefined()
+  await expect(page.getByText('批量操作完成，影响 2 张图片')).toBeVisible()
 })

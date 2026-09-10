@@ -174,7 +174,7 @@ try {
       "frontend_build",
       "playwright",
       "release_catalog_check",
-      "release_bootstrap_smoke",
+      "release_tag_manager_smoke",
       "release_health_smoke",
       "release_image_capability_smoke"
     )
@@ -290,11 +290,11 @@ try {
     $resourceFiles | Copy-Item -Destination $destinationCategory -Force
   }
 
-  # Ship the fully built wiki databases (pages, chunks, embeddings and the
-  # generated Chinese summaries) so end users never rebuild the corpus.
+  # Ship the fully built wiki databases (pages, chunks, summaries and the
+  # high-frequency tag catalog) so end users never rebuild the corpus.
   # VACUUM INTO produces self-contained, compact copies even when the app
-  # currently holds the databases open; the embedding model itself stays
-  # external (model-class, downloaded on first use).
+  # currently holds the databases open; no model files are needed because the
+  # embedding/vector stack was retired before this release.
   $wikiDbStage = Join-Path $stage "data\tag_wiki"
   New-Item -ItemType Directory -Force -Path $wikiDbStage | Out-Null
   & $gatePython (Join-Path $root "scripts\snapshot_wiki_databases.py") `
@@ -460,6 +460,11 @@ try {
       if ($LASTEXITCODE -ne 0) { throw "Release smoke test failed with exit code $LASTEXITCODE" }
       & $python -c "from fastapi.testclient import TestClient; from tagger2.main import app; c=TestClient(app); results=[(p, c.get('/api/v1/tag-wiki/catalog/categories', params={'profile': p})) for p in ('e621','danbooru')]; failed=[(p, r.status_code) for p, r in results if r.status_code != 200 or not r.json().get('categories') or r.json().get('tag_count', 0) <= 0]; assert not failed, failed; print('release smoke: tag-wiki catalog serves both profiles')"
       if ($LASTEXITCODE -ne 0) { throw "Release catalog smoke test failed with exit code $LASTEXITCODE" }
+      # Read-only tag-manager dataset endpoint: must boot the session store in
+      # the extracted package and answer 200 with its session list (empty in a
+      # fresh package).
+      & $python -c "from fastapi.testclient import TestClient; from tagger2.main import app; c=TestClient(app); tm=c.get('/api/v1/tag-manager/datasets'); assert tm.status_code == 200, (tm.status_code, tm.text); assert isinstance(tm.json().get('items'), list), tm.text; print('release smoke: tag-manager dataset list 200')"
+      if ($LASTEXITCODE -ne 0) { throw "Tag manager smoke test failed with exit code $LASTEXITCODE" }
     } finally {
       Pop-Location
       Remove-Item Env:PYTHONPATH -ErrorAction SilentlyContinue

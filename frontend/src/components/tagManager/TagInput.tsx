@@ -1,5 +1,5 @@
 import { LoaderCircle } from 'lucide-react'
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useId, useRef, useState } from 'react'
 import {
   formatPostCount,
   formatTagForDisplay,
@@ -13,8 +13,9 @@ import { usePreferences } from '../../store/app'
 
 /**
  * Debounced tag-database autocomplete input. Enter commits the first
- * suggestion; clicking a suggestion commits that entry. When the lookup has
- * no matches the raw text is committed without a category.
+ * suggestion (Alt/Option+Enter behaves the same); clicking a suggestion
+ * commits that entry. When the lookup has no matches the raw text is committed
+ * without a category.
  */
 export function TagInput({ profile, label, placeholder, disabled, onAdd }: {
   profile: TagManagerProfile
@@ -31,11 +32,18 @@ export function TagInput({ profile, label, placeholder, disabled, onAdd }: {
   const [loading, setLoading] = useState(false)
   const [activeIndex, setActiveIndex] = useState(-1)
   const requestId = useRef(0)
+  // Stable combobox/listbox ids: deriving them from the (Chinese, potentially
+  // duplicated) label made the aria wiring fragile; useId is always unique.
+  const listId = useId()
+  const optionId = (index: number) => `${listId}-suggestion-${index}`
 
   useEffect(() => {
     const rawQuery = text.trim()
     const query = toWriteStyle(rawQuery, 'underscore')
     if (!query || disabled) {
+      // Bump the request id so a lookup that is already in flight for the
+      // previous text cannot land after the reset and reopen the dropdown.
+      requestId.current += 1
       setSuggestions([])
       setOpen(false)
       setLoading(false)
@@ -82,10 +90,12 @@ export function TagInput({ profile, label, placeholder, disabled, onAdd }: {
       autoComplete="off"
       role="combobox"
       aria-expanded={open}
-      aria-controls={`${label}-suggestions`}
+      aria-controls={listId}
       onChange={(event) => setText(event.target.value)}
-      aria-activedescendant={open && activeIndex >= 0 ? `${label}-suggestion-${activeIndex}` : undefined}
+      aria-activedescendant={open && activeIndex >= 0 ? optionId(activeIndex) : undefined}
       onKeyDown={(event) => {
+        // An IME confirm Enter (zh-CN input) must not commit the draft tag.
+        if (event.key === 'Enter' && event.nativeEvent.isComposing) return
         if (event.key === 'ArrowDown' && open && suggestions.length > 0) {
           event.preventDefault()
           setActiveIndex((index) => (index + 1) % suggestions.length)
@@ -93,6 +103,8 @@ export function TagInput({ profile, label, placeholder, disabled, onAdd }: {
           event.preventDefault()
           setActiveIndex((index) => (index - 1 + suggestions.length) % suggestions.length)
         } else if (event.key === 'Enter') {
+          // Alt/Option+Enter must stay usable for keyboard users (and macOS
+          // muscle memory), so it commits exactly like plain Enter.
           event.preventDefault()
           const selected = open && activeIndex >= 0 ? suggestions[activeIndex] : undefined
           commit(selected ? selected.name : text, selected?.category)
@@ -104,7 +116,7 @@ export function TagInput({ profile, label, placeholder, disabled, onAdd }: {
       }}
     />
     {loading && <LoaderCircle className="spin tm-autocomplete-spinner" size={13} aria-hidden="true" />}
-    {open && suggestions.length > 0 && <ul id={`${label}-suggestions`} className="tm-suggest-list" role="listbox" aria-label={`${label}建议`}>
+    {open && suggestions.length > 0 && <ul id={listId} className="tm-suggest-list" role="listbox" aria-label={`${label}建议`}>
       {suggestions.map((entry, index) => {
         const displayTag = formatTagForDisplay(entry.name, tagStyle)
         const showTranslation = bilingual && Boolean(entry.translation)
@@ -115,7 +127,13 @@ export function TagInput({ profile, label, placeholder, disabled, onAdd }: {
             : displayTag
 
         return (
-          <li key={entry.name} id={`${label}-suggestion-${index}`} role="option" aria-selected={index === activeIndex}>
+          <li
+            key={entry.name}
+            id={optionId(index)}
+            role="option"
+            aria-selected={index === activeIndex}
+            className={index === activeIndex ? 'tm-suggest-active' : undefined}
+          >
             <button
               type="button"
               className="tm-suggest-item"

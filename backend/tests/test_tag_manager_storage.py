@@ -5,6 +5,7 @@ or a mock connection) so they exercise the exact pragmas and transaction
 handling a scan pays for in production.
 """
 
+import contextlib
 import sqlite3
 from pathlib import Path
 
@@ -78,3 +79,63 @@ def test_upsert_rows_rolls_back_the_whole_chunk_on_constraint_error(tmp_path: Pa
         "solo",
         "wolf",
     }
+def test_get_images_chunks_the_id_query_and_skips_missing(tmp_path: Path, monkeypatch) -> None:
+    """Batch id resolution reads every id in chunked IN () queries -- never
+    one connection and one query per id -- and simply skips missing ids."""
+
+    store = TagManagerStore(tmp_path / "tag_manager.sqlite3")
+    store.create_session(_session_entry())
+    store.upsert_rows(
+        "sess-1", [_scan_row(f"bulk/img_{i}.png", [("solo", "general")]) for i in range(1100)]
+    )
+    ids = [int(item["id"]) for item in store.list_images("sess-1", limit=2000)[0]]
+
+    opened = {"n": 0}
+    original = store.connection
+
+    @contextlib.contextmanager
+    def counting_connection():
+        opened["n"] += 1
+        with original() as conn:
+            yield conn
+
+    monkeypatch.setattr(store, "connection", counting_connection)
+
+    # 1100 ids fit in three 500-row chunked queries.
+    fetched = store.get_images("sess-1", ids)
+    assert set(fetched) == set(ids)
+    assert opened["n"] == 3
+
+    # Duplicates collapse and missing ids are absent from the result.
+    again = store.get_images("sess-1", [ids[0], ids[0], 987_654])
+    assert set(again) == {ids[0]}
+    assert again[ids[0]]["relative_path"] == "bulk/img_0.png"
+
+
+def test_tag_filter_key_folds_non_ascii_like_python(tmp_path: Path) -> None:
+    """SQLite's built-in LOWER() folds ASCII only; the registered CASEFOLD
+    keeps the SQL side of the tag normalization in lockstep with
+    ``canonical_tag_key`` for non-ASCII tags."""
+
+    store = TagManagerStore(tmp_path / "tag_manager.sqlite3")
+    store.create_session(_session_entry())
+    store.upsert_rows(
+        "sess-1",
+        [
+            _scan_row("a.png", [("W\u00d6LFE", "general")]),
+            _scan_row("b.png", [("w\u00f6lfe", "general")]),
+        ],
+    )
+
+    items, total = store.list_images("sess-1", include_tags=["W\u00d6LFE"])
+    assert total == 2
+    assert {item["file_name"] for item in items} == {"a.png", "b.png"}
+
+    # Excluding one spelling excludes the image carrying the other too.
+    items, total = store.list_images("sess-1", exclude_tags=["w\u00f6lfe"])
+    assert total == 0
+
+    # Stats group both spellings onto one casefolded key.
+    stats = store.tag_stats("sess-1")
+    assert len(stats) == 1
+    assert stats[0]["count"] == 2
